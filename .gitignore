@@ -1,0 +1,23 @@
+# 本机文件：git 更新流程(updater.py)要求这些永不入库——更新永远不碰配置和数据
+config.yaml
+cloud_settings.json
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# 日志/编辑器
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code 会话数据
+.claude/

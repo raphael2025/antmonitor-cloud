@@ -1,0 +1,97 @@
+# 配置模板：复制为 config.yaml 后填写(config.yaml 不入 git, 更新永不覆盖)
+# 云端总览配置 —— 汇聚各场地本地监控系统的数据
+#
+# 两种接入方式(可混用)：
+# ① 推送(推荐, 默认)：各场地本地监控 config.yaml 配 cloud 段(url=本服务地址,
+#    token=下面 ingest.token, site_name, site_type)，每分钟主动推上来。
+#    场地在 NAT 后面也不需要端口映射；场地第一次上报自动出现在面板上。
+# ② 拉取：下面 sites 里配场地(需要云端能访问到场地8800)，本服务每分钟去拉。
+
+ingest:
+  # 场地上报共用密钥(各场地 cloud.token 填这个)。留空且 tokens 也空 = 关闭上报接口。
+  # ⚠ 保持 CHANGE_ME 开头的模板值 = 视为未配置(拒绝上报)，上线必须换：python auth.py token
+  token: "CHANGE_ME_ingest"
+  # 每场地专属密钥(推荐逐步启用)：key=场地 site_id(场地启动日志/cloud_site_id.txt 可查)。
+  # 配了的场地必须用自己的钥匙(共享钥匙对它无效)——一个场地被攻破只作废一把，不能冒充其它场地。
+  tokens: {}
+  #  st-3fa2b1c4d5e6: "该场地专属token"
+  auto_register: true     # 新场地首次上报自动出现在面板。全部场地都发了专属钥匙后建议改 false
+                          # (之后只收 tokens 里登记过的 site_id，共享钥匙泄露也注册不了假场地)
+  max_sites: 200          # 场地总数上限，防钥匙泄露后被灌假场地
+  rate_per_min: 120       # 每个来源IP每分钟上报次数上限(正常每场地约1次/分钟)
+
+public_api:
+  # Agent 只读取数密钥(/api/public/*，给 AI agent/外部脚本做情况汇报用)。留空=关闭该组接口。
+  # 与 ingest.token 分开：这把只能"读汇总"，那把只能"写上报"，泄露互不影响。
+  token: "CHANGE_ME_public"   # 生成同上; 留空或 CHANGE_ME 开头=关闭Agent取数API
+
+sites: []
+  # 拉取模式才需要配置(推送模式留空即可)。type: air=风冷 | hydro=水冷 | mixed=混合
+  # id 可选：场地稳定标识(缺省用 name；配了 id 以后 name 可随便改不丢数据)
+  # - name: "示例风冷场地"
+  #   id: "pull-demo-a"
+  #   type: air
+  #   url: "http://1.2.3.4:8800"
+  #   token: "填该场地的 public_api.token"
+
+alerts:                   # 云端告警通知：场地失联/监控停滞/恢复 + 算力骤降(本地报不了的事)
+  enabled: true
+  cooldown: 1800          # 同场地同类告警冷却(秒)；恢复通知不受限
+  hashrate_drop_pct: 30   # 当前10分钟均值比 45~90 分钟前基线跌超此百分比→告警；0=关
+  offline_threshold: 0    # 单场地掉线台数(total-online)达到此值→告警；0=关
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+  webhook:                # 企业微信/钉钉群机器人(kind: wecom|dingtalk 同构) 或 raw 自定义
+    enabled: false
+    url: ""
+    kind: wecom
+    # allow_internal: true  # 默认拒绝发往本机/169.254 元数据等内部地址(防会话被盗后借它打内网)；
+                            # 接收端确实在本机时才打开。此开关网页改不了，只认配置文件
+  email:                  # SMTP 邮件通知(任意邮箱服务商：企业邮箱/QQ邮箱/Gmail等，填SMTP信息即可)
+    enabled: false
+    smtp_host: ""          # 如 smtp.exmail.qq.com / smtp.gmail.com
+    smtp_port: 465         # 465=SSL(推荐，下面 use_ssl 保持true) | 587=STARTTLS(use_ssl改false)
+    use_ssl: true
+    use_starttls: true     # 仅 use_ssl=false 时生效(587端口通常需要)
+    username: ""           # 登录账号，通常=发件邮箱
+    password: ""           # 登录密码/授权码(QQ邮箱等第三方登录需要"授权码"而非邮箱密码)
+    from_addr: ""          # 留空=用 username
+    to: []                 # 收件人，可多个: ["boss@x.com", "ops@x.com"]
+    subject_prefix: "[矿场云端]"
+
+poll:
+  interval: 60            # 场地摘要拉取间隔(秒)
+  customer_interval: 600  # 客户报表拉取间隔(秒)
+  customer_hours: 24      # 客户报表统计周期(小时)
+  timeout: 10             # 单场地 HTTP 超时(秒)
+  fail_offline: 3         # 连续失败 N 次判定「场地不可达」
+  stalled_after_s: 1200   # 场地本地扫描龄期超过此秒数视为「监控停滞」(本地默认5分钟扫一轮)
+
+db:
+  path: "cloud_overview.db"
+  retention_days: 30      # 分钟级快照保留天数(10场地×30天≈43万行，SQLite 轻松)
+
+update:                   # git 更新器(git clone 部署时可用；docker 部署改用镜像更新)
+  auto: false             # true=检测到新版本自动拉取+重启(需 systemd/NSSM 守护进程接管重启)
+  branch: ""              # 跟踪分支；留空=当前分支。生产建议专用 release 分支
+  check_interval: 3600    # 自动检测间隔(秒)
+
+server:
+  host: "0.0.0.0"         # 前置 nginx 同机反代时改 "127.0.0.1"：8900 不对外，只能经 nginx(https)访问
+  port: 8900
+  trust_proxy: false      # 前置 nginx 反代后必须改 true(登录锁定/限速改按 X-Forwarded-For 真实IP计)；
+                          # 没有反代时保持 false(该头可伪造)
+  # trusted_proxies: ["127.0.0.1/32"]   # 只信这些地址转发来的 X-Forwarded-For；默认=本机+内网网段
+  max_body_bytes: 2097152 # 请求体上限(2MB)，超过直接 413
+
+auth:
+  enabled: true
+  secure_cookie: false    # 可保持 false：通过 https 访问时会自动加 Secure(需 nginx 传 X-Forwarded-Proto)
+  # ⚠️ 下面是出厂默认口令 admin888 / viewer888 —— 默认口令禁止登录！
+  #    在服务器上运行 `python auth.py passwd admin`(交互输入新密码，立即生效，不用改本文件/不用重启)。
+  #    登录后也可在网页「🔒 账号安全」里自己改。
+  users:
+    - {username: admin,  password: "pbkdf2$200000$1645b5fd54ae6e2df8e5b9fb322c0e96$5f7cd2fe6cb3cd872e482a92b71d819ef248d211ac1effbfb7dfa5839ebf1820",  role: admin}
+    - {username: viewer, password: "pbkdf2$200000$60ccffd24dee35b544568d753ffae856$a96d50a22c87762e32bb4dd8804cd7ceda5335a17afa6cba1279de724e27a2fc", role: viewer}

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title data-i18n="doc.title">AntMonitor Cloud</title>
+  <link rel="stylesheet" href="/web/style.css">
+  <!-- Chart.js 放本地(web/vendor)：不依赖外部 CDN(国内常被墙/被劫持即 XSS)，配合 CSP script-src 'self' -->
+  <script src="/web/vendor/chart.umd.min.js"></script>
+  <script src="/web/i18n/i18n.js"></script>
+  <script src="/web/i18n/zh.js"></script>
+  <script src="/web/i18n/en.js"></script>
+  <script src="/web/i18n/ru.js"></script>
+  <script src="/web/i18n/es.js"></script>
+  <script src="/web/i18n/de.js"></script>
+  <script src="/web/i18n/ar.js"></script>
+</head>
+<body>
+  <div id="staleBanner" class="stale-banner hidden"></div>
+
+  <div id="loginOverlay" class="login-overlay hidden">
+    <div class="login-box">
+      <div class="lang-row">
+        <label for="langSelectLogin" data-i18n="lang.label">语言</label>
+        <select id="langSelectLogin" class="lang-select" aria-label="Language">
+          <option value="zh">中文</option><option value="en">English</option><option value="ru">Русский</option>
+          <option value="es">Español</option><option value="de">Deutsch</option><option value="ar">العربية</option>
+        </select>
+      </div>
+      <h2 data-i18n="login.h2">☁ AntMonitor Cloud · 登录</h2>
+      <input id="loginUser" data-i18n-placeholder="login.user_ph" placeholder="用户名" autocomplete="username">
+      <input id="loginPass" type="password" data-i18n-placeholder="login.pass_ph" placeholder="密码" autocomplete="current-password">
+      <div id="loginErr" class="login-err"></div>
+      <button id="loginBtn" class="primary" data-i18n="login.btn">登录</button>
+    </div>
+  </div>
+
+  <header>
+    <h1 data-i18n="header.title">☁ AntMonitor Cloud</h1>
+    <div class="actions">
+      <select id="langSelect" class="lang-select" aria-label="Language">
+        <option value="zh">中文</option><option value="en">English</option><option value="ru">Русский</option>
+        <option value="es">Español</option><option value="de">Deutsch</option><option value="ar">العربية</option>
+      </select>
+      <span id="lastUpdate" class="muted" data-i18n="header.loading">加载中…</span>
+      <button id="btnUpdate" class="hidden primary" data-i18n-title="header.update_title" title="发现新版本，点击更新并重启"></button>
+      <button id="btnNotifySettings" class="hidden" title="配置告警通知渠道(Telegram/Webhook/邮件)" data-i18n="header.notify" data-i18n-title="header.notify_title" title="配置告警通知渠道(Telegram/Webhook/邮件)">⚙ 通知设置</button>
+      <button id="btnSecurity" class="hidden" title="修改密码；管理员可看安全自检、操作记录、强制下线" data-i18n="header.security" data-i18n-title="header.security_title" title="修改密码；管理员可看安全自检、操作记录、强制下线">🔒 账号安全</button>
+      <span id="userBadge" class="badge"></span>
+      <button id="btnLogout" title="退出登录" data-i18n="header.logout" data-i18n-title="header.logout_title" title="退出登录">退出</button>
+    </div>
+  </header>
+
+  <!-- 安全自检高危提示(仅 admin 可见，点击打开安全中心) -->
+  <div id="secBanner" class="sec-banner hidden"></div>
+
+  <!-- 全网汇总 KPI -->
+  <section class="cards">
+    <div class="card"><div class="num" id="kSites">–</div><div class="lbl" data-i18n="kpi.sites">场地 在线 / 总数</div></div>
+    <div class="card"><div class="num" id="kMachines">–</div><div class="lbl" data-i18n="kpi.machines">矿机 在线 / 总数</div></div>
+    <div class="card"><div class="num" id="kOnlinePct">–</div><div class="lbl" data-i18n="kpi.online_pct">全网在线率</div></div>
+    <div class="card"><div class="num" id="kHashrate">–</div><div class="lbl" data-i18n="kpi.hashrate">全网总算力</div></div>
+    <div class="card"><div class="num" id="kPower">–</div><div class="lbl" data-i18n="kpi.power">全网总功耗</div></div>
+    <div class="card alert"><div class="num" id="kAlerts">–</div><div class="lbl" data-i18n="kpi.alerts">活跃告警</div></div>
+    <div class="card alert"><div class="num" id="kContainers">–</div><div class="lbl" data-i18n="kpi.containers">集装箱 (故障/离线)</div></div>
+    <div class="card"><div class="num" id="kCustomers">–</div><div class="lbl" data-i18n="kpi.customers">客户数</div></div>
+  </section>
+
+  <!-- 场地卡片：风冷 / 水冷 -->
+  <section class="sitegroup" id="grpAir">
+    <h2><span data-i18n="grp.air">❄ 风冷场地</span> <span class="badge" id="cntAir">0</span></h2>
+    <div class="sitegrid" id="gridAir"></div>
+  </section>
+  <section class="sitegroup" id="grpHydro">
+    <h2><span data-i18n="grp.hydro">💧 水冷场地</span> <span class="badge" id="cntHydro">0</span></h2>
+    <div class="sitegrid" id="gridHydro"></div>
+  </section>
+  <section class="sitegroup" id="grpMixed">
+    <h2><span data-i18n="grp.mixed">🌀 混合场地</span> <span class="badge" id="cntMixed">0</span></h2>
+    <div class="sitegrid" id="gridMixed"></div>
+  </section>
+
+  <!-- 各场地算力趋势 -->
+  <section class="panel chartpanel">
+    <div class="panel-head">
+      <h2 data-i18n="trend.title">各场地算力趋势</h2>
+      <select id="trendRange">
+        <option value="6" data-i18n="trend.h6">近 6 小时</option>
+        <option value="24" selected data-i18n="trend.h24">近 24 小时</option>
+        <option value="72" data-i18n="trend.d3">近 3 天</option>
+        <option value="168" data-i18n="trend.d7">近 7 天</option>
+      </select>
+    </div>
+    <div class="chartwrap"><canvas id="trendChart"></canvas></div>
+  </section>
+
+  <!-- 客户 -->
+  <section class="grid2">
+    <div class="panel">
+      <h2 data-i18n="cust.summary">客户汇总（跨场地）</h2>
+      <div class="tablewrap"><table class="mini" id="tblWorkers">
+        <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.site">场地</th><th data-i18n="th.count">台数</th><th data-i18n="th.deliv24">24h 交付算力</th><th data-i18n="th.kwh24">24h 耗电</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+    <div class="panel">
+      <h2 data-i18n="cust.detail">客户明细（按场地）</h2>
+      <div class="tablewrap"><table class="mini" id="tblCustomers">
+        <thead><tr><th data-i18n="th.site">场地</th><th data-i18n="th.cust">客户</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="th.deliv">交付算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- 场地详情弹窗 -->
+  <div id="siteModal" class="modal hidden">
+    <div class="modal-box wide">
+      <div class="modal-head">
+        <span id="siteTitle">场地</span>
+        <span style="flex:1"></span>
+        <select id="siteRange">
+          <option value="6" data-i18n="trend.h6">近 6 小时</option>
+          <option value="24" selected data-i18n="trend.h24">近 24 小时</option>
+          <option value="72" data-i18n="trend.d3">近 3 天</option>
+          <option value="168" data-i18n="trend.d7">近 7 天</option>
+        </select>
+        <button id="siteClose">×</button>
+      </div>
+      <div id="siteMeta" class="muted sitemeta"></div>
+      <div id="siteAlerts" class="alertsummary"></div>
+      <div class="grid3">
+        <div class="chartbox"><h3>算力</h3><div class="cwrap"><canvas id="chHr"></canvas></div></div>
+        <div class="chartbox"><h3>在线台数</h3><div class="cwrap"><canvas id="chOnline"></canvas></div></div>
+        <div class="chartbox"><h3>功耗</h3><div class="cwrap"><canvas id="chPower"></canvas></div></div>
+      </div>
+      <h3 class="subhead">客户（该场地，24h）</h3>
+      <div class="tablewrap"><table class="mini" id="tblSiteCustomers">
+        <thead><tr><th>客户 / 矿工名</th><th>台数</th><th>可用率</th><th>交付算力</th><th>耗电</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <h3 class="subhead">近 14 天日报（耗电为估算，精确对账以场地本地为准）</h3>
+      <div class="tablewrap"><table class="mini" id="tblDaily">
+        <thead><tr><th>日期</th><th>平均算力</th><th>峰值算力</th><th>平均在线</th><th>在线率</th><th>耗电(估)</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+  </div>
+
+  <!-- 通知设置弹窗(仅 admin) -->
+  <div id="notifyModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span>⚙ 通知设置</span>
+        <span style="flex:1"></span>
+        <button id="notifyClose">×</button>
+      </div>
+      <div id="notifyMsg" class="notifymsg muted"></div>
+
+      <h3>总开关</h3>
+      <div class="formrow">
+        <label><input type="checkbox" id="nfEnabled"> 启用告警通知</label>
+        <label>冷却<input type="number" id="nfCooldown" min="0" max="86400">秒</label>
+        <label>算力骤降阈值<input type="number" id="nfDropPct" min="0" max="100">%</label>
+        <label>掉线告警阈值<input type="number" id="nfOfflineThreshold" min="0">台(0=关)</label>
+      </div>
+
+      <h3>Telegram <span id="bgTelegram" class="chbadge"></span></h3>
+      <div class="formrow">
+        <label><input type="checkbox" id="tgEnabled"> 启用</label>
+        <label>Bot Token <input type="password" id="tgToken" class="wide" autocomplete="off"></label>
+        <label>Chat ID <input type="text" id="tgChatId" autocomplete="off"></label>
+      </div>
+
+      <h3>Webhook(企业微信/钉钉/自定义) <span id="bgWebhook" class="chbadge"></span></h3>
+      <div class="formrow">
+        <label><input type="checkbox" id="whEnabled"> 启用</label>
+        <label>URL <input type="password" id="whUrl" class="wide" autocomplete="off"></label>
+        <label>类型
+          <select id="whKind">
+            <option value="wecom">企业微信</option>
+            <option value="dingtalk">钉钉</option>
+            <option value="raw">raw(自定义)</option>
+          </select>
+        </label>
+      </div>
+
+      <h3>邮件(SMTP) <span id="bgEmail" class="chbadge"></span></h3>
+      <div class="formrow">
+        <label><input type="checkbox" id="emEnabled"> 启用</label>
+        <label>SMTP 主机 <input type="text" id="emHost" autocomplete="off"></label>
+        <label>端口 <input type="number" id="emPort" min="1" max="65535"></label>
+        <label><input type="checkbox" id="emSsl"> SSL</label>
+        <label><input type="checkbox" id="emStarttls"> STARTTLS</label>
+      </div>
+      <div class="formrow">
+        <label>用户名 <input type="text" id="emUser" autocomplete="off"></label>
+        <label>密码 <input type="password" id="emPass" autocomplete="off"></label>
+        <label>发件人 <input type="text" id="emFrom" autocomplete="off"></label>
+        <label>主题前缀 <input type="text" id="emSubject" autocomplete="off"></label>
+      </div>
+      <div class="formrow">
+        <label class="wide">收件人(逗号分隔多个) <input type="text" id="emTo" class="wide" autocomplete="off"></label>
+      </div>
+
+      <div class="formrow notifyactions">
+        <button id="nfSave" class="primary">保存</button>
+        <button id="nfTest">发送测试通知</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 账号安全弹窗：改密码(所有人) + 安全自检/会话/审计(仅 admin) -->
+  <div id="secModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span>🔒 账号安全</span>
+        <span style="flex:1"></span>
+        <button id="secClose">×</button>
+      </div>
+
+      <h3>修改我的密码</h3>
+      <div class="formrow">
+        <label>原密码 <input type="password" id="pwOld" autocomplete="current-password"></label>
+        <label>新密码 <input type="password" id="pwNew" autocomplete="new-password" placeholder="至少10位"></label>
+        <label>确认新密码 <input type="password" id="pwNew2" autocomplete="new-password"></label>
+        <button id="pwSave" class="primary">修改</button>
+      </div>
+      <div id="pwMsg" class="notifymsg muted"></div>
+
+      <div id="secAdmin" class="hidden">
+        <h3>安全自检</h3>
+        <div id="secChecks"></div>
+
+        <h3 class="subhead">在线会话</h3>
+        <div class="formrow">
+          <span id="secSessions" class="muted"></span>
+          <button id="secRevoke" title="怀疑密码或电脑泄露时用：除你自己外所有人需重新登录">强制其它所有会话下线</button>
+        </div>
+
+        <h3 class="subhead">最近操作记录（登录/改设置/更新等，保留180天）</h3>
+        <div class="tablewrap"><table class="mini" id="tblAudit">
+          <thead><tr><th>时间</th><th>用户</th><th>来源IP</th><th>操作</th><th>详情</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>

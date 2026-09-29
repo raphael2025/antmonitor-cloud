@@ -1,0 +1,52 @@
+# 本地测试配置(配合 tools/mock_site.py 使用, 见 docs/DEVELOPMENT.md §10)
+# 用法: CO_CONFIG=tools/test_config.yaml python server.py
+# 快节奏: 5秒拉一轮, 15秒判不可达; 测试库落在 tools/co_test.db(用完可删)
+
+ingest:
+  token: "ingest-test-tok"
+  tokens: {}
+
+public_api:
+  token: "agent-test-tok"
+
+alerts:
+  enabled: true
+  cooldown: 60
+  hashrate_drop_pct: 30
+  telegram: {enabled: false, bot_token: "", chat_id: ""}
+  webhook: {enabled: false, url: "", kind: raw}
+
+sites:
+  - name: "测试风冷一场"
+    type: air
+    url: "http://127.0.0.1:8801"
+    token: "tokA"
+  - name: "测试水冷二场"
+    type: hydro
+    url: "http://127.0.0.1:8802"
+    token: "tokB"
+
+poll:
+  interval: 5
+  push_interval: 60
+  customer_interval: 15
+  customer_hours: 24
+  timeout: 5
+  fail_offline: 3
+  stalled_after_s: 1200
+
+db:
+  path: "co_test.db"      # 相对 tools/ 目录
+  retention_days: 30
+
+server:
+  host: "127.0.0.1"
+  port: 8900
+
+auth:
+  enabled: true
+  secure_cookie: false
+  allow_default_password: true   # 仅本地测试！生产绝不能开(默认口令禁止登录)
+  users:   # 测试口令 admin888 / viewer888
+    - {username: admin,  password: "pbkdf2$200000$1645b5fd54ae6e2df8e5b9fb322c0e96$5f7cd2fe6cb3cd872e482a92b71d819ef248d211ac1effbfb7dfa5839ebf1820",  role: admin}
+    - {username: viewer, password: "pbkdf2$200000$60ccffd24dee35b544568d753ffae856$a96d50a22c87762e32bb4dd8804cd7ceda5335a17afa6cba1279de724e27a2fc", role: viewer}

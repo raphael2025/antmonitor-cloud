@@ -15,6 +15,7 @@ import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 
 import yaml
 from fastapi import Body, FastAPI, HTTPException, Request, Response
@@ -193,8 +194,21 @@ def all_sites():
 def _find_site(key):
     """按 id 精确找，找不到再按显示名兜底(方便人肉 curl)。"""
     ss = all_sites()
-    return (next((s for s in ss if s["id"] == key), None)
-            or next((s for s in ss if s["name"] == key), None))
+    exact = next((s for s in ss if s["id"] == key), None)
+    if exact:
+        return exact
+    matches = [s for s in ss if s["name"] == key]
+    if len(matches) > 1:
+        raise HTTPException(409, "存在同名场地，请使用场地 ID")
+    return matches[0] if matches else None
+
+
+def _managed_site(key):
+    """修改操作仅接受稳定 ID，不能因重名或拼错 ID 操作另一场地。"""
+    site = next((s for s in all_sites() if s["id"] == key), None)
+    if not site:
+        raise HTTPException(404, "无此场地")
+    return site
 
 
 # ---------- 数据接口(登录后只读) ----------
@@ -214,6 +228,9 @@ def _site_entry(scfg, latest, last_ok, cust_counts, now):
         fails = st.get("fails", 0)
         err = (cur or {}).get("error") or st.get("last_err") or None
     d = {"id": sid, "name": scfg["name"], "type": scfg.get("type", "air"), "mode": mode,
+         "reported_name": scfg.get("reported_name", scfg["name"]),
+         "name_override": scfg.get("name_override", ""),
+         "duplicate_name": bool(scfg.get("duplicate_name")),
          "state": state,                                   # ok|alert|stalled|unreachable|pending
          "fails": fails, "error": err,
          "data_ts": snap["ts"] if snap else None,
@@ -463,6 +480,8 @@ def _check_ingest_token(request: Request, site_id):
     got = _bearer(request)
     if not expected or not got or not hmac.compare_digest(got.encode(), expected.encode()):
         raise HTTPException(401, "上报 token 错误")
+    if db.site_management(CONN).get(site_id, {}).get("deleted_ts"):
+        raise HTTPException(410, "场地已删除，请管理员恢复后再上报")
     if not db.site_exists(CONN, site_id):
         # 新场地自动注册：可关(ingest.auto_register:false → 只收 ingest.tokens 里登记过的)；
         # 总数封顶，防共享钥匙泄露后被灌几万个假场地把面板刷爆
@@ -485,6 +504,15 @@ def _ingest_identity(body):
 _num = validate.num
 
 
+@contextmanager
+def _ingest_write(sid):
+    try:
+        with db.site_write(CONN, sid):
+            yield
+    except db.SiteDeletedError as e:
+        raise HTTPException(410, str(e)) from e
+
+
 @app.post("/api/ingest/summary")
 def api_ingest_summary(request: Request, body: dict = Body(...)):
     """场地摘要上报(本地 cloud_report.py 每分钟推一次)。ts 用云端时间，不信任场地时钟。
@@ -493,14 +521,15 @@ def api_ingest_summary(request: Request, body: dict = Body(...)):
     _check_ingest_token(request, sid)
     site_type = body.get("type") if body.get("type") in ("air", "hydro", "mixed") else "air"
     now = int(time.time())
-    db.upsert_site(CONN, sid, name, site_type, now)
     snap = validate.snapshot_fields(body)
     snap.update({"ts": now, "site_id": sid, "ok": 1, "error": None,
                  "scan_age_s": (_num(body.get("scan_age_s"), int, None, hi=10**7)
                                 if body.get("scan_age_s") is not None else None)})
-    db.insert_snapshot(CONN, snap)
-    if "alert_summary" in body:   # 字段缺失(旧版场地端)不动已存数据；显式空列表=清空
-        db.replace_alert_summary(CONN, sid, _clean_alert_summary(body.get("alert_summary")))
+    with _ingest_write(sid):
+        db.upsert_site(CONN, sid, name, site_type, now)
+        db.insert_snapshot(CONN, snap)
+        if "alert_summary" in body:   # 字段缺失(旧版场地端)不动已存数据；显式空列表=清空
+            db.replace_alert_summary(CONN, sid, _clean_alert_summary(body.get("alert_summary")))
     return {"ok": True, "ts": now}
 
 
@@ -543,8 +572,9 @@ def api_ingest_customers(request: Request, body: dict = Body(...)):
         raise HTTPException(400, "customers 非法")
     rows = validate.customers(rows)   # 数值列只进数字、文本去控制符截长(防存储型XSS/500)
     now = int(time.time())
-    db.upsert_site(CONN, sid, name if body.get("site") else None, None, now)
-    db.replace_customers(CONN, sid, rows, _num(body.get("hours"), int, 24, hi=24 * 90) or 24)
+    with _ingest_write(sid):
+        db.upsert_site(CONN, sid, name if body.get("site") else None, None, now)
+        db.replace_customers(CONN, sid, rows, _num(body.get("hours"), int, 24, hi=24 * 90) or 24)
     return {"ok": True, "ts": now, "count": len(rows)}
 
 
@@ -554,12 +584,48 @@ def api_delete_site(request: Request, key: str):
     sess = _require_login(request)
     if sess.get("role") != "admin":
         raise HTTPException(403, "需要 admin")
-    scfg = _find_site(key)
+    scfg = _managed_site(key)
     if scfg and scfg.get("mode") == "pull":
         raise HTTPException(400, "该场地在 config.yaml 的 sites 里(拉取模式)，请改配置文件")
-    sid = scfg["id"] if scfg else key
-    db.delete_site(CONN, sid)
+    sid = scfg["id"]
+    db.delete_site(CONN, sid, scfg["name"])
     _audit(request, sess["user"], "site_delete", sid)
+    return {"ok": True}
+
+
+@app.patch("/api/site/{key}")
+def api_rename_site(request: Request, key: str, body: dict = Body(...)):
+    sess = _require_admin(request)
+    scfg = _managed_site(key)
+    raw = body.get("name")
+    if not isinstance(raw, str) or (raw and not validate.site_key(raw)):
+        raise HTTPException(400, "场地名非法(1-64字符)，空字符串表示跟随本地名称")
+    name = validate.site_key(raw) if raw.strip() else ""
+    effective = name or scfg["reported_name"]
+    if any(s["id"] != key and s["name"] == effective for s in all_sites()):
+        raise HTTPException(409, "已有同名场地，请使用不同的名称或先删除旧场地")
+    try:
+        db.rename_site(CONN, key, name)
+    except db.SiteDeletedError as e:
+        raise HTTPException(410, str(e)) from e
+    _audit(request, sess["user"], "site_rename", key)
+    return {"ok": True, "name": effective}
+
+
+@app.get("/api/sites/deleted")
+def api_deleted_sites(request: Request):
+    _require_admin(request)
+    return {"ok": True, "sites": [
+        {"id": sid, "name": m.get("deleted_name") or sid, "deleted_ts": m["deleted_ts"]}
+        for sid, m in db.site_management(CONN).items() if m.get("deleted_ts")]}
+
+
+@app.post("/api/site/{key}/restore")
+def api_restore_site(request: Request, key: str):
+    sess = _require_admin(request)
+    if not db.restore_site(CONN, key):
+        raise HTTPException(404, "无此已删除场地")
+    _audit(request, sess["user"], "site_restore", key)
     return {"ok": True}
 
 

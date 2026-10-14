@@ -119,6 +119,8 @@ function setUser(user, role) {
   curRole = role;
   $("userBadge").textContent = user ? `${user} · ${role}` : "";
   $("btnNotifySettings").classList.toggle("hidden", role !== "admin");
+  $("btnDeletedSites").classList.toggle("hidden", role !== "admin");
+  $("siteManage").classList.toggle("hidden", role !== "admin");
   $("btnSecurity").classList.toggle("hidden", !authOn);
   if (role === "admin") loadSecurity(false).catch(() => {});
 }
@@ -239,6 +241,7 @@ function siteCard(s, color) {
       ${contRow}
     </div>
     ${err}
+    ${s.duplicate_name ? `<div class="site-warning">${esc(t("site.duplicate"))} · ${esc(s.id)}</div>` : ""}
     <div class="foot"><span>${t("card.updated", { ago: fmtAgo(s.data_age_s) })}</span><span>${t("card.click_trend")}</span></div>
   </div>`;
 }
@@ -299,7 +302,76 @@ async function refresh() {
 
 // ---- 场地详情(按稳定 site_id 寻址，界面只显示名字) ----
 let curSite = null;
-function openSite(id) { curSite = id; $("siteModal").classList.remove("hidden"); loadSite().catch(() => {}); }
+let curSiteData = null;
+function openSite(id) {
+  curSite = id; curSiteData = null;
+  $("siteManageMsg").textContent = "";
+  $("siteName").value = "";
+  setSiteBusy(true);
+  $("siteModal").classList.remove("hidden");
+  loadSite().catch(() => { $("siteManageMsg").textContent = t("site.load_error"); });
+}
+function setSiteBusy(busy) {
+  $("siteManage").querySelectorAll("button, input").forEach((el) => { el.disabled = busy; });
+}
+
+async function saveSiteName(name) {
+  if (curRole !== "admin" || !curSiteData) return;
+  const id = curSiteData.id;
+  setSiteBusy(true);
+  $("siteManageMsg").textContent = "";
+  try {
+    const r = await send("PATCH", `/api/site/${encodeURIComponent(id)}`, { name });
+    if (!r.ok) throw new Error(await errText(r));
+    await refresh();
+    if (curSite === id) await loadSite();
+  } catch (e) { $("siteManageMsg").textContent = e.message; }
+  finally { setSiteBusy(false); }
+}
+$("siteManage").onsubmit = (e) => { e.preventDefault(); saveSiteName($("siteName").value.trim()); };
+$("siteFollowName").onclick = () => saveSiteName("");
+$("siteDelete").onclick = async () => {
+  if (curRole !== "admin" || !curSiteData || curSiteData.mode !== "push") return;
+  const s = curSiteData;
+  if (!confirm(t("site.delete_confirm", { name: s.name, id: s.id, ago: fmtAgo(s.data_age_s) }))) return;
+  setSiteBusy(true);
+  try {
+    const r = await send("DELETE", `/api/site/${encodeURIComponent(s.id)}`);
+    if (!r.ok) throw new Error(await errText(r));
+    if (curSite === s.id) { $("siteModal").classList.add("hidden"); curSite = null; curSiteData = null; }
+    await refresh();
+  } catch (e) { $("siteManageMsg").textContent = e.message; }
+  finally { setSiteBusy(false); }
+};
+
+async function loadDeletedSites() {
+  const d = await api("/api/sites/deleted");
+  $("deletedSitesList").innerHTML = d.sites.map((s) => `<div class="deleted-site">
+    <div class="identity">${esc(s.name)}<div class="muted">${esc(s.id)} · ${fmtFull(s.deleted_ts)}</div></div>
+    <button data-restore-site="${esc(s.id)}">${esc(t("site.restore"))}</button></div>`).join("")
+    || `<p class="muted">${esc(t("site.deleted_empty"))}</p>`;
+}
+$("btnDeletedSites").onclick = async () => {
+  $("deletedSitesMsg").textContent = "";
+  $("deletedSitesModal").classList.remove("hidden");
+  try { await loadDeletedSites(); } catch (e) { $("deletedSitesMsg").textContent = e.message; }
+};
+$("deletedSitesClose").onclick = () => $("deletedSitesModal").classList.add("hidden");
+$("deletedSitesModal").addEventListener("click", (e) => {
+  if (e.target === $("deletedSitesModal")) $("deletedSitesModal").classList.add("hidden");
+});
+$("deletedSitesList").addEventListener("click", async (e) => {
+  const button = e.target.closest("[data-restore-site]");
+  if (!button || curRole !== "admin") return;
+  button.disabled = true;
+  $("deletedSitesMsg").textContent = "";
+  try {
+    const r = await send("POST", `/api/site/${encodeURIComponent(button.dataset.restoreSite)}/restore`);
+    if (!r.ok) throw new Error(await errText(r));
+    await loadDeletedSites();
+    await refresh();
+  } catch (err) { $("deletedSitesMsg").textContent = err.message; button.disabled = false; }
+});
 // 事件委托：卡片每30s重建DOM，绑在document上点击永远有效
 document.addEventListener("click", (e) => {
   const card = e.target.closest(".site[data-site-id]");
@@ -336,9 +408,20 @@ function renderSiteAlerts(groups) {
 }
 
 async function loadSite() {
+  const id = curSite;
+  if (!id) return;
   const hours = Number($("siteRange").value);
-  const d = await api(`/api/site/${encodeURIComponent(curSite)}?hours=${hours}`);
+  const d = await api(`/api/site/${encodeURIComponent(id)}?hours=${hours}`);
+  if (curSite !== id) return;
   const s = d.site, st = STATE[s.state] || STATE.pending, tp = TYPE[s.type] || TYPE.air;
+  curSiteData = s;
+  $("siteName").value = s.name;
+  $("siteIdentity").textContent = t("site.identity", { id: s.id, name: s.reported_name });
+  $("siteDuplicate").classList.toggle("hidden", !s.duplicate_name);
+  $("siteManage").classList.toggle("hidden", curRole !== "admin");
+  setSiteBusy(false);
+  $("siteDelete").disabled = s.mode !== "push";
+  $("siteDelete").title = s.mode === "pull" ? t("site.pull_delete") : "";
   $("siteTitle").innerHTML = `${esc(s.name)} <span class="pill ${tp.cls}">${tp.txt()}</span> <span class="pill ${st.cls}">${st.txt(s)}</span>`;
   $("siteMeta").innerHTML =
     t("site.meta", { data: fmtAgo(s.data_age_s), scan: fmtAgo(s.scan_age_s) }) +
@@ -508,6 +591,7 @@ const AUDIT_ACTION = {
   password_change: () => t("audit.password_change"), password_fail: () => t("audit.password_fail"),
   settings_save: () => t("audit.settings_save"), notify_test: () => t("audit.notify_test"),
   update_apply: () => t("audit.update_apply"), site_delete: () => t("audit.site_delete"),
+  site_rename: () => t("audit.site_rename"), site_restore: () => t("audit.site_restore"),
   sessions_revoke: () => t("audit.sessions_revoke"),
 };
 const LEVEL_TXT = { high: () => t("sec.level_high"), warn: () => t("sec.level_warn"), info: () => t("sec.level_info") };
@@ -604,5 +688,6 @@ function startLoops() {
     if (!$("loginOverlay").classList.contains("hidden")) return;
     refresh().catch(() => {});
     if (curSite && !$("siteModal").classList.contains("hidden")) loadSite().catch(() => {});
+    if (!$("deletedSitesModal").classList.contains("hidden")) loadDeletedSites().catch(() => {});
   });
 })();

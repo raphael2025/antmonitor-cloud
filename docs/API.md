@@ -101,7 +101,7 @@ curl -X POST https://overview.example.com/api/ingest/summary \
 
 ### 鉴权
 
-> **所有 POST/DELETE（含登录）必须带请求头 `X-CO-CSRF: 1`**（任意非空值），否则 `403`。
+> **所有 POST/PUT/PATCH/DELETE（含登录）必须带请求头 `X-CO-CSRF: 1`**（任意非空值），否则 `403`。
 > 这是防跨站请求伪造：别的网站没法让浏览器带上自定义头。网页前端已自动带；
 > 用 curl 调写接口时记得加 `-H "X-CO-CSRF: 1"`。场地上报 `/api/ingest/*` 不受此限。
 
@@ -218,6 +218,9 @@ curl -X POST https://overview.example.com/api/ingest/summary \
 
 删除该场地的注册信息、全部快照、客户/日汇总/通知数据（场地下线后清理）。
 改名**不需要**删除——场地按 `site_id` 识别，改 `site_name` 自动更新标签。
+- 删除必须使用准确的 `site_id`，不按显示名匹配（同名场地的数据不受影响）；不存在的 ID 返回 `404`。
+- 删除时持久化停收标记，旧终端后续摘要/客户上报返回 `410`，重启云端也不会自动复活。
+- 重新安装本地端会生成新 ID；若仍用原名称，页面提示重名并显示 ID，管理员可核对最后上报时间后删除旧记录。
 - 场地在 `config.yaml > sites`（拉取模式）里 → `400`（请改配置文件）
 - 非 admin → `403`
 
@@ -227,6 +230,14 @@ curl -c ck.txt -X POST https://云端/api/login -H "Content-Type: application/js
      -H "X-CO-CSRF: 1" -d '{"username":"admin","password":"..."}'
 curl -b ck.txt -H "X-CO-CSRF: 1" -X DELETE "https://云端/api/site/st-xxxxxxxxxxxx"
 ```
+
+#### 场地名称和恢复管理（仅 admin）
+
+- `PATCH /api/site/{site_id}`，JSON `{"name":"云海二期（新环境）"}`：设置云端显示名，后续上报不会覆盖；`{"name":""}` 恢复跟随本地名称。非法名称返回 `400`，与其他场地的当前显示名重复返回 `409`。
+- `GET /api/sites/deleted`：返回已删除场地的 ID、名称和删除时间。
+- `POST /api/site/{site_id}/restore`：移除停收标记；下次本地上报后重新出现。只恢复接收上报，**不恢复已删除的历史数据**。
+- `/api/overview` 和场地详情中的 `reported_name` 是本地上报名，`name_override` 是云端覆盖名，`duplicate_name` 表示与其他 ID 的当前显示名重复。
+- 管理操作均有权限及 CSRF 检查，并写入审计记录。姓名兜底查询遇到重名返回 `409`，请改用 ID。
 
 ### 7. `GET /api/settings` — 当前告警通知设置（仅 admin）
 

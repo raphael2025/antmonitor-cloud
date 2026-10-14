@@ -60,7 +60,22 @@ class Collector:
             if r["id"] not in seen:
                 pulls.append({"id": r["id"], "name": r["name"] or r["id"],
                               "type": r["type"] or "air", "mode": "push"})
-        return pulls
+        management = db.site_management(self.conn)
+        out = []
+        for s in pulls:
+            m = management.get(s["id"], {})
+            if m.get("deleted_ts"):
+                continue
+            s["reported_name"] = s["name"]
+            s["name_override"] = m.get("name_override") or ""
+            s["name"] = s["name_override"] or s["name"]
+            out.append(s)
+        names = {}
+        for s in out:
+            names[s["name"]] = names.get(s["name"], 0) + 1
+        for s in out:
+            s["duplicate_name"] = names[s["name"]] > 1
+        return out
 
     # ---- 生命周期 ----
     def start(self):

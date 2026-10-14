@@ -15,9 +15,10 @@ import datetime
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 import time
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots(
@@ -67,6 +68,14 @@ CREATE TABLE IF NOT EXISTS sites(
   type TEXT DEFAULT 'air',             -- air=风冷 | hydro=水冷(以最近一次上报/配置为准)
   created_ts INTEGER,
   last_push_ts INTEGER
+);
+
+-- 云端显示名及删除标记与上报数据分开；旧终端重报不会复活已删除场地。
+CREATE TABLE IF NOT EXISTS site_management(
+  site_id TEXT PRIMARY KEY,
+  name_override TEXT,
+  deleted_name TEXT,
+  deleted_ts INTEGER NOT NULL DEFAULT 0
 );
 
 -- 日级汇总(UTC+8 切日, 永久保留)。power_kwh 为 Σ(功率×名义间隔) 估算，精确对账在场地本地。
@@ -243,8 +252,9 @@ def get_alert_summary(conn, site_id):
 
 def customers(conn, site_id=None):
     """客户明细，带场地显示名(site_name, 场地未注册时回退 site_id)。"""
-    q = ("SELECT c.*, COALESCE(s.name, c.site_id) AS site_name FROM site_customers c"
-         " LEFT JOIN sites s ON s.id = c.site_id")
+    q = ("SELECT c.*, COALESCE(NULLIF(m.name_override, ''), s.name, c.site_id) AS site_name"
+         " FROM site_customers c LEFT JOIN sites s ON s.id = c.site_id"
+         " LEFT JOIN site_management m ON m.site_id = c.site_id")
     if site_id:
         rows = conn.execute(q + " WHERE c.site_id=? ORDER BY c.machines DESC", (site_id,)).fetchall()
     else:
@@ -259,6 +269,42 @@ def customer_count_by_site(conn):
 
 
 # ---- 场地注册 ----
+class SiteDeletedError(ValueError):
+    pass
+
+
+def site_management(conn):
+    return {r["site_id"]: dict(r) for r in conn.execute("SELECT * FROM site_management")}
+
+
+@contextmanager
+def site_write(conn, site_id):
+    """串行化删除和整轮上报，防止已通过鉴权的在途上报复活被删场地。"""
+    with _lock:
+        row = conn.execute("SELECT deleted_ts FROM site_management WHERE site_id=?",
+                           (site_id,)).fetchone()
+        if row and row["deleted_ts"]:
+            raise SiteDeletedError("场地已删除，请管理员恢复后再上报")
+        yield
+
+
+def rename_site(conn, site_id, name):
+    with site_write(conn, site_id), conn:
+        conn.execute("INSERT INTO site_management(site_id, name_override) VALUES(?,?) "
+                     "ON CONFLICT(site_id) DO UPDATE SET name_override=excluded.name_override",
+                     (site_id, name or None))
+
+
+def restore_site(conn, site_id):
+    with _lock, conn:
+        row = conn.execute("SELECT deleted_ts FROM site_management WHERE site_id=?",
+                           (site_id,)).fetchone()
+        if not row or not row["deleted_ts"]:
+            return False
+        conn.execute("UPDATE site_management SET deleted_ts=0 WHERE site_id=?", (site_id,))
+        return True
+
+
 def upsert_site(conn, site_id, name, site_type, now):
     """场地上报/登记。name/site_type 传 None 表示不更新该字段。"""
     sets = ["last_push_ts=excluded.last_push_ts"]
@@ -266,7 +312,7 @@ def upsert_site(conn, site_id, name, site_type, now):
         sets.append("name=excluded.name")
     if site_type:
         sets.append("type=excluded.type")
-    with _lock:
+    with site_write(conn, site_id):
         conn.execute(
             "INSERT INTO sites(id, name, type, created_ts, last_push_ts) VALUES(?,?,?,?,?) "
             f"ON CONFLICT(id) DO UPDATE SET {', '.join(sets)}",
@@ -280,14 +326,17 @@ def push_sites(conn):
     return [dict(r) for r in rows]
 
 
-def delete_site(conn, site_id):
+def delete_site(conn, site_id, name=None):
     """删除场地及其全部数据(场地下线后清理)。"""
-    with _lock:
+    with _lock, conn:
+        conn.execute("INSERT INTO site_management(site_id, deleted_name, deleted_ts) "
+                     "VALUES(?,?,?) ON CONFLICT(site_id) DO UPDATE SET "
+                     "deleted_name=excluded.deleted_name, deleted_ts=excluded.deleted_ts",
+                     (site_id, name or site_id, int(time.time())))
         for t in ("sites", "snapshots", "site_customers", "site_alert_summary",
                   "daily", "notify_log"):
             conn.execute(f"DELETE FROM {t} WHERE {'id' if t == 'sites' else 'site_id'}=?",
                          (site_id,))
-        conn.commit()
 
 
 # ---- 清理(分批, 短锁) ----

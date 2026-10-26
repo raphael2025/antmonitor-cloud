@@ -26,7 +26,7 @@ def _token_checks(cfg):
     per = icfg.get("tokens") or {}
     if shared and is_placeholder(shared):
         out.append(("high", "ingest.token 仍是模板占位值(CHANGE_ME…)，已自动视为未配置——"
-                             "共享钥匙上报被拒绝。用 `python auth.py token` 生成新值"))
+                             "共享钥匙上报被拒绝。在网页「🔌 场地接入」里生成，或 `python auth.py token` 生成后写进配置"))
     elif shared and len(str(shared)) < TOKEN_MIN_LEN:
         out.append(("warn", f"ingest.token 太短(<{TOKEN_MIN_LEN}位)，建议用 `python auth.py token` 生成"))
     bad = [k for k, v in per.items() if is_placeholder(v) or len(str(v)) < TOKEN_MIN_LEN]
@@ -34,7 +34,7 @@ def _token_checks(cfg):
         out.append(("warn", f"ingest.tokens 里这些场地的专属钥匙太短或是占位值: {', '.join(map(str, bad))}"))
     if shared and not is_placeholder(shared) and not per:
         out.append(("info", "所有场地共用一把 ingest.token：任一场地机器被攻破，对方就能冒充所有场地上报。"
-                            "建议逐步给每个场地发专属钥匙(ingest.tokens)"))
+                            "建议在「🔌 场地接入」里给每个场地生成专属接入码"))
     pub = (cfg.get("public_api") or {}).get("token")
     if pub and is_placeholder(pub):
         out.append(("high", "public_api.token 仍是模板占位值，已自动视为未配置(Agent 取数接口关闭)"))

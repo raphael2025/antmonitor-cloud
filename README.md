@@ -58,17 +58,20 @@
 
 ## 三分钟上手
 
+一行命令装好（不用先 git clone，没装 git/Python 也行），二选一：
+
 ```bash
-git clone https://github.com/raphael2025/antmonitor-cloud.git
-cd antmonitor-cloud
-pip install -r requirements.txt
-cp config.example.yaml config.yaml
-python auth.py passwd admin    # 设强密码
-python server.py               # 默认 :8900，公网请挂 HTTPS
+# 有域名（推荐）：域名 A 记录指向服务器，安全组放行 80/443，自动申请 HTTPS 证书
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- --domain overview.example.com
+
+# 没有域名：公网 IP + 自签证书（场地端按证书指纹认云端），安全组放行 8900
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash
 ```
 
-然后在各场地 AntMonitor 设置里打开「云端上报」，填本服务地址与 token。  
-第一次推送后，场地会自动出现在面板上。
+装完会显示面板地址、admin 密码（直接回车会自动生成）和（无域名时）证书指纹。再跑一次同样的命令 = 更新。
+
+**接入场地不用敲命令**：admin 登录 → 右上「🔌 场地接入」→ 输入密码 → 复制**接入码**（共享或给新场地单独生成）→
+到场地端面板「☁ 云端上报」粘贴即可。云端地址、证书指纹、token 都在这个页面里看，查看/更换 token 需要再输一次密码并留操作记录。
 
 完整「简介 · 部署 · 使用」→ [选语言阅读](docs/guide/README.md)
 

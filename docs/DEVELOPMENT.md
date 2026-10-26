@@ -144,6 +144,7 @@ pending ──首条数据──▶ ok ⇄ alert(告警/箱故障)
 |---|---|---|
 | `ingest.token` | — | 场地上报共享密钥；与 tokens 都空 = 上报接口整体 404(关闭) |
 | `ingest.tokens` | `{}` | 每场地专属密钥 `{site_id: token}`；配了的场地必须用自己的钥匙 |
+| (网页覆盖层) | — | 「🔌 场地接入」生成/更换的 token 存 `cloud_settings.json > ingest`，`appconfig.apply_settings` 叠加进 CFG：`token` 键存在即覆盖共享 token(空=停用)，`tokens` 按场地合并；`connect.public_url` 覆盖 `server.public_url` |
 | `sites[]` | `[]` | 拉取模式场地：`{name, id?, type: air\|hydro, url, token}`；纯推送留空 |
 | `alerts.enabled` | true | 告警评估总开关(通道都没配时自然不发) |
 | `alerts.cooldown` | 1800 | 同场地同类告警冷却(秒)；恢复通知不受限 |
@@ -161,6 +162,9 @@ pending ──首条数据──▶ ok ⇄ alert(告警/箱故障)
 | `db.path` | cloud_overview.db | 相对路径时相对 config.yaml 所在目录 |
 | `db.retention_days` | 30 | 快照保留天数 |
 | `server.host/port` | 0.0.0.0 / 8900 | 监听地址 |
+| `server.public_url` | "" | 各场地应填的云端地址(场地接入页显示/接入码里用)；空=按当前访问地址猜 |
+| `server.tls_cert/tls_key` | "" | 填了就由 uvicorn 直接跑 HTTPS(一键安装 IP 模式) |
+| `server.tls_self_signed` | false | 自签证书：场地接入页显示 SHA-256 指纹，接入码带上指纹(场地端钉指纹认云端) |
 | `auth.enabled` | true | 关=免登录匿名 viewer（内网演示可用，公网必须开） |
 | `auth.secure_cookie` | false | 走 HTTPS 后改 true |
 | `auth.users[]` | admin/viewer | `{username, password(pbkdf2哈希), role: admin\|viewer}`；`python auth.py passwd 用户名` 改密码(写 cloud_settings.json 覆盖层，立即生效) |

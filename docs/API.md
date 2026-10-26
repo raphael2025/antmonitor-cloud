@@ -87,6 +87,17 @@
 ```
 **响应**：`{"ok": true, "ts": ..., "count": 1}`
 
+### 3. `POST /api/ingest/ping` — 测试连接（只校验，不写数据）
+
+场地端「🔌 测试连接」用。鉴权与上面两个接口完全相同（Bearer token + site_id），但不注册场地、不写任何数据。
+
+```json
+// 请求
+{"site_id": "st-3fa2b1c4d5e6", "site": "内蒙一场"}
+// 响应
+{"ok": true, "ts": 1782660000, "registered": true, "site_name": "内蒙一场"}
+```
+
 ### curl 示例
 
 ```bash
@@ -289,6 +300,19 @@ curl -b ck.txt -X POST https://云端/api/settings -H "Content-Type: application
 ```
 
 ---
+
+### 10. 场地接入（仅 admin，网页「🔌 场地接入」用）
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/connect` | 云端地址 `public_url`(及来源 config/guess)、模式 `mode`(domain/ip/self_signed/http/unset)、证书指纹 `fingerprint`(自签时)、共享 token 是否设置+末4位、各场地专属 token 状态、`auto_register`、`warnings`。**不含任何 token 明文** |
+| `POST /api/connect/reveal` | `{"password", "target": "shared"\|<site_id>}` → `{token, code}`。需再输登录密码 |
+| `POST /api/connect/token` | `{"password", "target", "action": "rotate"\|"revoke"}` 更换/撤销；`{"password", "action": "new_site"}` 预分配新场地 ID + 专属 token → `{target, token, code}` |
+| `POST /api/connect/settings` | `{"password", "public_url"?, "auto_register"?}` 改云端地址 / 自动注册开关，返回同 `GET /api/connect` |
+
+- 密码错误返回 403 并计入来源 IP 的登录失败次数（8 次锁 5 分钟，429）；每次查看/更换都写审计（`token_reveal` / `token_rotate` / `token_revoke` / `token_new_site` / `connect_settings`）。
+- 网页生成的 token 存 `cloud_settings.json`（0600），立即生效，无需重启；`config.yaml` 里的 token 只能被覆盖，不能被网页删除（撤销返回 409）。
+- **接入码**：`AMC1-` + base64url(JSON `{"u": 云端地址, "t": token, "f": 证书指纹?, "s": 场地ID?}`)，场地端面板「填入」或安装参数 `--connect-code` 使用。
 
 ## 三、Agent 公共 API（`GET /api/public/*`，只读）
 

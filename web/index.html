@@ -44,6 +44,7 @@
       </select>
       <span id="lastUpdate" class="muted" data-i18n="header.loading">加载中…</span>
       <button id="btnUpdate" class="hidden primary" data-i18n-title="header.update_title" title="发现新版本，点击更新并重启"></button>
+      <button id="btnConnect" class="hidden" data-i18n="header.connect" data-i18n-title="header.connect_title" title="各场地接入云端要填的地址、上报 token、证书指纹">🔌 场地接入</button>
       <button id="btnNotifySettings" class="hidden" title="配置告警通知渠道(Telegram/Webhook/邮件)" data-i18n="header.notify" data-i18n-title="header.notify_title" title="配置告警通知渠道(Telegram/Webhook/邮件)">⚙ 通知设置</button>
       <button id="btnSecurity" class="hidden" title="修改密码；管理员可看安全自检、操作记录、强制下线" data-i18n="header.security" data-i18n-title="header.security_title" title="修改密码；管理员可看安全自检、操作记录、强制下线">🔒 账号安全</button>
       <span id="userBadge" class="badge"></span>
@@ -231,6 +232,63 @@
         <button id="nfSave" class="primary">保存</button>
         <button id="nfTest">发送测试通知</button>
       </div>
+    </div>
+  </div>
+
+  <!-- 场地接入弹窗(仅 admin)：云端地址 / 证书指纹 / 上报 token / 接入码 -->
+  <div id="connectModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span data-i18n="conn.title">🔌 场地接入</span>
+        <span style="flex:1"></span>
+        <button id="connectClose">×</button>
+      </div>
+      <div class="muted" data-i18n="conn.intro">场地端面板「⚙ 网段 → ☁ 云端上报」要填：云端地址、上报 token，以及云端没有域名时的证书指纹。最省事：复制下面的「接入码」，到场地端粘贴后点「填入」。</div>
+      <div id="connWarn" class="conn-warn"></div>
+
+      <h3 data-i18n="conn.addr">云端地址（各场地填这个）</h3>
+      <div class="formrow">
+        <input type="text" id="connUrl" class="wide" spellcheck="false" autocomplete="off" placeholder="https://overview.example.com  /  https://1.2.3.4:8900">
+        <span id="connMode" class="chbadge"></span>
+        <button id="connUrlSave" data-i18n="conn.save_url">保存地址</button>
+      </div>
+      <div class="formrow hidden" id="connFpRow">
+        <label data-i18n="conn.fp">证书指纹(SHA-256)</label>
+        <code id="connFp" class="conn-mono"></code>
+        <button id="connFpCopy" data-i18n="conn.copy">复制</button>
+      </div>
+      <div class="muted hidden" id="connFpHelp" data-i18n="conn.fp_help">没有域名，云端用的是自签证书：场地端必须填这个指纹，按指纹认云端(防冒充/中间人)。浏览器提示"不安全"时，核对证书指纹与此一致再继续。</div>
+
+      <h3 data-i18n="conn.pw">管理员密码（查看或更换 token 前验证）</h3>
+      <div class="formrow">
+        <input type="password" id="connPw" autocomplete="current-password" data-i18n-placeholder="conn.pw_ph" placeholder="输入你的登录密码">
+      </div>
+
+      <h3 data-i18n="conn.shared">共享上报 token（所有场地通用）</h3>
+      <div class="formrow">
+        <span id="connShared" class="muted"></span>
+        <button id="connSharedShow" data-i18n="conn.show">查看 / 接入码</button>
+        <button id="connSharedRotate" data-i18n="conn.rotate">更换</button>
+        <button id="connSharedRevoke" class="danger" data-i18n="conn.disable">停用</button>
+      </div>
+
+      <h3 data-i18n="conn.per">场地专属 token（推荐：一个场地泄露不影响其它场地）</h3>
+      <div class="formrow">
+        <button id="connNewSite" class="primary" data-i18n="conn.new_site">＋ 新场地：生成专属接入码</button>
+        <label><input type="checkbox" id="connAutoReg"> <span data-i18n="conn.auto_reg">允许新场地用共享 token 自动注册</span></label>
+      </div>
+      <div class="tablewrap"><table class="mini" id="tblConnSites">
+        <thead><tr><th data-i18n="conn.col_site">场地</th><th>ID</th><th data-i18n="conn.col_token">专属 token</th><th data-i18n="conn.col_ops">操作</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+
+      <div id="connResult" class="conn-result hidden">
+        <div class="conn-warn" data-i18n="conn.secret_warn">⚠ 下面含上报 token：只发给场地负责人，别贴群里、别截图外传。2 分钟后自动隐藏。</div>
+        <div id="connResultFor" class="muted"></div>
+        <div class="formrow"><label data-i18n="conn.code">接入码</label><input type="text" id="connCode" class="wide" readonly><button id="connCodeCopy" data-i18n="conn.copy">复制</button></div>
+        <div class="formrow"><label>token</label><input type="text" id="connTok" class="wide" readonly><button id="connTokCopy" data-i18n="conn.copy">复制</button></div>
+      </div>
+      <div id="connMsg" class="notifymsg muted" role="status"></div>
     </div>
   </div>
 

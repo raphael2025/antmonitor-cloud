@@ -119,6 +119,7 @@ function setUser(user, role) {
   curRole = role;
   $("userBadge").textContent = user ? `${user} · ${role}` : "";
   $("btnNotifySettings").classList.toggle("hidden", role !== "admin");
+  $("btnConnect").classList.toggle("hidden", role !== "admin");
   $("btnDeletedSites").classList.toggle("hidden", role !== "admin");
   $("siteManage").classList.toggle("hidden", role !== "admin");
   $("btnSecurity").classList.toggle("hidden", !authOn);
@@ -593,6 +594,9 @@ const AUDIT_ACTION = {
   update_apply: () => t("audit.update_apply"), site_delete: () => t("audit.site_delete"),
   site_rename: () => t("audit.site_rename"), site_restore: () => t("audit.site_restore"),
   sessions_revoke: () => t("audit.sessions_revoke"),
+  token_reveal: () => t("audit.token_reveal"), token_rotate: () => t("audit.token_rotate"),
+  token_revoke: () => t("audit.token_revoke"), token_new_site: () => t("audit.token_new_site"),
+  connect_settings: () => t("audit.connect_settings"), connect_pw_fail: () => t("audit.connect_pw_fail"),
 };
 const LEVEL_TXT = { high: () => t("sec.level_high"), warn: () => t("sec.level_warn"), info: () => t("sec.level_info") };
 
@@ -649,6 +653,130 @@ $("secRevoke").onclick = async () => {
   alert(t("pw.revoke_ok", { n: int0(d.revoked) }));
   loadSecurity(true).catch(() => {});
 };
+
+// ---- 场地接入：云端地址 / 证书指纹 / 上报 token / 接入码(仅 admin) ----
+let _connHideTimer = null;
+function connMsg(text, bad) {
+  const el = $("connMsg");
+  el.textContent = text || "";
+  el.style.color = bad ? "#ff9b9b" : "";
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); connMsg(t("conn.copied")); return; } catch (e) {}
+  const ta = document.createElement("textarea");   // 非安全上下文/老浏览器兜底
+  ta.value = text; document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); connMsg(t("conn.copied")); } catch (e) { connMsg(t("conn.copy_manual"), true); }
+  ta.remove();
+}
+function hideConnResult() {
+  $("connResult").classList.add("hidden");
+  $("connCode").value = ""; $("connTok").value = "";
+  if (_connHideTimer) { clearTimeout(_connHideTimer); _connHideTimer = null; }
+}
+function showConnResult(label, d) {
+  $("connResultFor").textContent = label;
+  $("connCode").value = d.code || "";
+  $("connTok").value = d.token || "";
+  $("connResult").classList.remove("hidden");
+  if (_connHideTimer) clearTimeout(_connHideTimer);
+  _connHideTimer = setTimeout(hideConnResult, 120000);
+}
+const MODE_TXT = {
+  domain: ["ok", "conn.mode_domain"], ip: ["ok", "conn.mode_ip"], self_signed: ["ok", "conn.mode_selfsigned"],
+  http: ["fail", "conn.mode_http"], unset: ["off", "conn.mode_unset"],
+};
+function renderConnect(d) {
+  $("connUrl").value = d.public_url || "";
+  const m = MODE_TXT[d.mode] || MODE_TXT.unset;
+  $("connMode").className = "chbadge " + m[0];
+  $("connMode").textContent = t(m[1]);
+  $("connFpRow").classList.toggle("hidden", !d.fingerprint);
+  $("connFpHelp").classList.toggle("hidden", !d.fingerprint);
+  $("connFp").textContent = d.fingerprint || "";
+  $("connWarn").textContent = (d.warnings || []).join("\n");
+  $("connShared").textContent = d.shared.set
+    ? t("conn.shared_set", { hint: d.shared.hint || "****" }) + (d.shared.from_config ? " · config.yaml" : "")
+    : t("conn.shared_unset");
+  $("connShared").dataset.set = d.shared.set ? "1" : "";
+  $("connSharedShow").disabled = !d.shared.set;
+  $("connSharedRevoke").disabled = !d.shared.set;
+  $("connSharedRotate").textContent = d.shared.set ? t("conn.rotate") : t("conn.generate");
+  $("connAutoReg").checked = !!d.auto_register;
+  $("tblConnSites").querySelector("tbody").innerHTML = (d.sites || []).map((x) => {
+    const id = esc(x.id);
+    const name = x.name ? esc(x.name) : `<span class="muted">${t(x.registered ? "conn.no_name" : "conn.waiting")}</span>`;
+    const tok = x.own_token ? `…${esc(x.hint || "****")}${x.from_config ? " · config.yaml" : ""}`
+      : x.revoked ? `<span class="muted">${t("conn.revoked_label")}</span>`
+      : `<span class="muted">${t("conn.use_shared")}</span>`;
+    const ops = x.own_token
+      ? `<button data-act="reveal" data-id="${id}">${t("conn.show")}</button>`
+        + `<button data-act="rotate" data-id="${id}">${t("conn.rotate")}</button>`
+        + (x.from_config ? "" : `<button class="danger" data-act="revoke" data-id="${id}">${t("conn.revoke")}</button>`)
+      : (x.mode === "pull" ? "" : `<button data-act="rotate" data-id="${id}">${t("conn.make_own")}</button>`);
+    return `<tr><td>${name}</td><td class="conn-mono">${id}</td><td>${tok}</td><td>${ops}</td></tr>`;
+  }).join("") || `<tr><td colspan="4" class="muted">${t("empty.none")}</td></tr>`;
+}
+async function loadConnect() {
+  const d = await api("/api/connect");
+  renderConnect(d);
+  return d;
+}
+async function openConnect() {
+  hideConnResult(); connMsg("");
+  $("connPw").value = "";
+  $("connectModal").classList.remove("hidden");
+  try { await loadConnect(); } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); }
+}
+async function connPost(path, body) {
+  const pw = $("connPw").value;
+  if (!pw) { connMsg(t("conn.need_pw"), true); $("connPw").focus(); return null; }
+  const r = await send("POST", path, Object.assign({ password: pw }, body));
+  if (!r.ok) { connMsg("✗ " + await errText(r), true); return null; }
+  connMsg("");
+  return r.json();
+}
+async function connAction(act, target) {
+  if (act === "reveal") {
+    const d = await connPost("/api/connect/reveal", { target });
+    if (d) showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: target }), d);
+    return;
+  }
+  if (act === "revoke" && !confirm(target === "shared" ? t("conn.confirm_disable") : t("conn.confirm_revoke", { id: target }))) return;
+  if (act === "rotate" && target === "shared" && $("connShared").dataset.set === "1"
+      && !confirm(t("conn.confirm_rotate"))) return;
+  const d = await connPost("/api/connect/token", { target, action: act });
+  if (!d) return;
+  if (d.token) showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: d.target }), d);
+  else connMsg(t("conn.revoked"));
+  loadConnect().catch(() => {});
+}
+$("btnConnect").onclick = openConnect;
+$("connectClose").onclick = () => { hideConnResult(); $("connPw").value = ""; $("connectModal").classList.add("hidden"); };
+$("connSharedShow").onclick = () => connAction("reveal", "shared");
+$("connSharedRotate").onclick = () => connAction("rotate", "shared");
+$("connSharedRevoke").onclick = () => connAction("revoke", "shared");
+$("connNewSite").onclick = async () => {
+  const d = await connPost("/api/connect/token", { action: "new_site" });
+  if (!d) return;
+  showConnResult(t("conn.for_new_site", { id: d.target }), d);
+  loadConnect().catch(() => {});
+};
+$("tblConnSites").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-act]");
+  if (b) connAction(b.dataset.act, b.dataset.id);
+});
+$("connUrlSave").onclick = async () => {
+  const d = await connPost("/api/connect/settings", { public_url: $("connUrl").value.trim() });
+  if (d) { renderConnect(d); connMsg(t("conn.saved")); }
+};
+$("connAutoReg").onchange = async () => {
+  const want = $("connAutoReg").checked;
+  const d = await connPost("/api/connect/settings", { auto_register: want });
+  if (d) { renderConnect(d); connMsg(t("conn.saved")); } else $("connAutoReg").checked = !want;
+};
+$("connCodeCopy").onclick = () => copyText($("connCode").value);
+$("connTokCopy").onclick = () => copyText($("connTok").value);
+$("connFpCopy").onclick = () => copyText($("connFp").textContent);
 
 // ---- 启动 ----
 let _loops = false;

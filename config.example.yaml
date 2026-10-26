@@ -85,6 +85,14 @@ server:
                           # 没有反代时保持 false(该头可伪造)
   # trusted_proxies: ["127.0.0.1/32"]   # 只信这些地址转发来的 X-Forwarded-For；默认=本机+内网网段
   max_body_bytes: 2097152 # 请求体上限(2MB)，超过直接 413
+  # 各场地填的云端地址(网页「🔌 场地接入」显示/可改)。一键安装会自动填：
+  #   有域名: https://overview.example.com      没有域名: https://公网IP:8900
+  public_url: ""
+  # 服务自己跑 HTTPS(没有域名、不用 nginx/caddy 时)：一键安装的 IP 模式会生成自签证书并填好。
+  # tls_self_signed: true 表示是自签证书，场地端要按「场地接入」里显示的证书指纹认云端
+  tls_cert: ""
+  tls_key: ""
+  tls_self_signed: false
 
 auth:
   enabled: true

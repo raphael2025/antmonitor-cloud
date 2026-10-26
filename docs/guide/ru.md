@@ -12,16 +12,21 @@
 
 ## Установка
 
+Одной командой (Ubuntu/Debian/CentOS):
+
 ```bash
-git clone https://github.com/raphael2025/antmonitor-cloud.git
-cd antmonitor-cloud
-pip install -r requirements.txt
-cp config.example.yaml config.yaml
-python auth.py passwd admin
-python server.py
+# с доменом (рекомендуется; A-запись на сервер, открыть 80/443)
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- --domain overview.example.com
+# без домена (публичный IP + самоподписанный сертификат, открыть 8900)
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash
 ```
 
-На площадке включите cloud report и укажите URL + token.
+С доменом Caddy сам получает HTTPS-сертификат; без домена сервис работает по `https://IP:8900`, а площадки
+проверяют **отпечаток сертификата**. Повторный запуск = обновление; `… -s -- info` показывает адрес и отпечаток.
+
+**Подключение площадок — в браузере:** admin → «🔌 Подключение площадок» → введите пароль → скопируйте
+код подключения (общий или «＋ Новая площадка») → вставьте его в панели площадки (☁ Отправка в облако) → «Применить» → сохранить.
+Просмотр и смена токенов требуют пароль и пишутся в журнал. Подробнее: [DEPLOY](../DEPLOY.md).
 
 ## Использование
 

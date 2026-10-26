@@ -24,7 +24,10 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 # 与 server.py 的 CFG_PATH 用同一条环境变量/默认值逻辑，确保 settings 文件
 # 落在 config.yaml 同一目录（测试用 CO_CONFIG=tools/test_config.yaml 时也一致）。
 _CFG_PATH = os.environ.get("CO_CONFIG") or os.path.join(BASE, "config.yaml")
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(_CFG_PATH)), "cloud_settings.json")
+# CO_SETTINGS 可把它放到别处：Docker 部署 config.yaml 只读挂载，这个文件得放进数据卷，
+# 否则容器一重建，网页改的密码 / 生成的场地 token 全丢
+SETTINGS_FILE = (os.environ.get("CO_SETTINGS")
+                 or os.path.join(os.path.dirname(os.path.abspath(_CFG_PATH)), "cloud_settings.json"))
 
 # 可重入锁：保护 cloud_settings.json 的"读-改-写"整体过程。
 # 两个管理员同时保存面板设置时，若各自先 load 再 save，后写的会把先写的改动
@@ -33,15 +36,29 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(_CFG_PATH)), "cloud
 _LOCK = threading.RLock()
 
 
+class SettingsError(RuntimeError):
+    """cloud_settings.json 存在但读不了/解析不了：绝不能当成空文件再整份覆盖写回去。"""
+
+
+def _read_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return {}
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SettingsError(f"{SETTINGS_FILE} 读取失败({e})。常见原因：用 sudo 跑过 auth.py，"
+                            f"文件变成 root 所有——chown 回服务账号后重试") from e
+    return d if isinstance(d, dict) else {}
+
+
 def load_settings():
     with _LOCK:
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (OSError, ValueError) as e:
-                print(f"[appconfig] cloud_settings.json 读取失败，忽略: {e}")
-        return {}
+        try:
+            return _read_settings()
+        except SettingsError as e:
+            print(f"[appconfig] ⚠ {e}")   # 读路径降级为空(服务照常起)；写路径见 update_settings
+            return {}
 
 
 def update_settings(patch):
@@ -52,23 +69,29 @@ def update_settings(patch):
     调用方需自己把完整的合并结果传进来(参见 server.py 的 POST /api/settings)。
     """
     with _LOCK:
-        merged = {**load_settings(), **(patch or {})}
+        merged = {**_read_settings(), **(patch or {})}   # 读失败直接抛错，不覆盖原文件
         _atomic_json(SETTINGS_FILE, merged)
         return merged
 
 
 def _atomic_json(path, data):
-    """先写 .tmp 再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。
-    .tmp 以 0600 创建(文件里有通知密钥和口令哈希，同机其它用户不可读)。"""
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """先写临时文件再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。
+    临时文件用 mkstemp 新建(随机名 + O_EXCL，0600)：固定名的 .tmp 可能被服务账号预先换成
+    符号链接，root 跑 `sudo python auth.py passwd` 时就会顺着它截断改写系统文件。
+    os.replace 是 rename，目标是符号链接也只替换链接本身。"""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(os.path.abspath(path)))
     try:
-        os.chmod(tmp, 0o600)   # 已存在的旧 .tmp 不受 O_CREAT 的 mode 影响，补一刀
-    except OSError:
-        pass
-    os.replace(tmp, path)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---- 口令覆盖层(网页/命令行改密码) ----
@@ -93,7 +116,7 @@ def password_overrides():
 
 def set_password_override(username, pw_hash):
     with _LOCK:
-        cur = load_settings().get("passwords")
+        cur = _read_settings().get("passwords")
         cur = dict(cur) if isinstance(cur, dict) else {}
         cur[str(username)] = str(pw_hash)
         update_settings({"passwords": cur})
@@ -101,17 +124,39 @@ def set_password_override(username, pw_hash):
 
 
 def apply_settings(cfg, s):
-    """把 cloud_settings.json 里保存的 alerts 深合并进运行中的 cfg["alerts"]（原地修改）。
+    """把 cloud_settings.json 里保存的 alerts / ingest / connect 叠加进运行中的 cfg（原地修改）。
 
     必须原地改嵌套字典、不能整段替换 cfg["alerts"] = xxx —— collector.py 里
     Notifier 持有的是同一个 dict 对象引用，替换成新对象会导致它继续读旧值
     (server.py/collector.py 里对这条约束有详细说明)。
+
+    ingest(网页「场地接入」管理的上报 token)：
+      token 键存在就覆盖 config.yaml 的共享 token(空串=停用共享 token)；
+      tokens 按场地合并(网页生成的专属 token 覆盖同名的 config.yaml 项)；
+      auto_register 覆盖同名开关。
+    connect.public_url：各场地填的云端地址(覆盖 server.public_url)。
     """
-    a = s.get("alerts") if isinstance(s, dict) else None
-    if not isinstance(a, dict):
+    if not isinstance(s, dict):
         return cfg
-    dst = cfg.setdefault("alerts", {})
-    _merge_inplace(dst, a)
+    a = s.get("alerts")
+    if isinstance(a, dict):
+        _merge_inplace(cfg.setdefault("alerts", {}), a)
+    ing = s.get("ingest")
+    if isinstance(ing, dict):
+        dst = cfg.get("ingest")
+        if not isinstance(dst, dict):
+            dst = cfg["ingest"] = {}
+        if "token" in ing:
+            dst["token"] = str(ing.get("token") or "")
+        if not isinstance(dst.get("tokens"), dict):
+            dst["tokens"] = {}
+        if isinstance(ing.get("tokens"), dict):
+            dst["tokens"].update({str(k): str(v) for k, v in ing["tokens"].items()})
+        if "auto_register" in ing:
+            dst["auto_register"] = bool(ing["auto_register"])
+    con = s.get("connect")
+    if isinstance(con, dict) and "public_url" in con:
+        cfg.setdefault("server", {})["public_url"] = str(con.get("public_url") or "")
     return cfg
 
 

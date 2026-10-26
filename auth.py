@@ -14,6 +14,7 @@
 
 命令行：
   python auth.py passwd <用户名>   交互输入新密码(不进 shell 历史)，写入 cloud_settings.json，立即生效
+  python auth.py passwd <用户名> --stdin   从标准输入读一行作新密码(一键安装脚本用)
   python auth.py hash              交互输入密码，打印哈希(粘到 config.yaml 的 password)
   python auth.py token             生成一个随机 token(ingest.token / public_api.token 用)
   python auth.py <明文密码>         旧用法：直接打印哈希
@@ -152,6 +153,21 @@ def login(cfg, username, password, src=None):
     return token, None
 
 
+def confirm_password(cfg, username, password, src=None):
+    """敏感操作(查看/更换上报 token)前再输一次密码：会话被盗(电脑没锁屏、Cookie 泄露)
+    也拿不到 token。失败计入同一套来源限流，不能拿这个接口在线爆破。
+    返回 None=通过，"locked"/"bad"=拒绝。"""
+    now = time.time()
+    if locked(src):
+        return "locked"
+    u = _users(cfg).get(username)
+    stored = u.get("password", "") if u else _DUMMY_HASH
+    if not _verify_password(stored, password) or not u:
+        _record_fail(src, now)
+        return "bad"
+    return None
+
+
 def locked(src):
     """该来源是否在锁定期内(供登录前快速拒绝返回 429)。"""
     if not src:
@@ -275,7 +291,15 @@ def _cli(argv):
         if name not in _users(cfg):
             print(f"✗ config.yaml 的 auth.users 里没有用户 {name}(新增用户请直接编辑 config.yaml)")
             return 1
-        h = hash_password(_ask_new_password(name))
+        if "--stdin" in argv[3:]:
+            pw = sys.stdin.readline().rstrip("\r\n")
+            err = password_problem(pw, name)
+            if err:
+                print("✗", err)
+                return 1
+        else:
+            pw = _ask_new_password(name)
+        h = hash_password(pw)
         appconfig.set_password_override(name, h)
         print(f"✓ 已更新用户 {name} 的密码(写入 {appconfig.SETTINGS_FILE})，"
               f"运行中的服务立即生效，该用户旧会话全部失效。")

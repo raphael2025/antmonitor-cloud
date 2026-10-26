@@ -101,17 +101,39 @@ def set_password_override(username, pw_hash):
 
 
 def apply_settings(cfg, s):
-    """把 cloud_settings.json 里保存的 alerts 深合并进运行中的 cfg["alerts"]（原地修改）。
+    """把 cloud_settings.json 里保存的 alerts / ingest / connect 叠加进运行中的 cfg（原地修改）。
 
     必须原地改嵌套字典、不能整段替换 cfg["alerts"] = xxx —— collector.py 里
     Notifier 持有的是同一个 dict 对象引用，替换成新对象会导致它继续读旧值
     (server.py/collector.py 里对这条约束有详细说明)。
+
+    ingest(网页「场地接入」管理的上报 token)：
+      token 键存在就覆盖 config.yaml 的共享 token(空串=停用共享 token)；
+      tokens 按场地合并(网页生成的专属 token 覆盖同名的 config.yaml 项)；
+      auto_register 覆盖同名开关。
+    connect.public_url：各场地填的云端地址(覆盖 server.public_url)。
     """
-    a = s.get("alerts") if isinstance(s, dict) else None
-    if not isinstance(a, dict):
+    if not isinstance(s, dict):
         return cfg
-    dst = cfg.setdefault("alerts", {})
-    _merge_inplace(dst, a)
+    a = s.get("alerts")
+    if isinstance(a, dict):
+        _merge_inplace(cfg.setdefault("alerts", {}), a)
+    ing = s.get("ingest")
+    if isinstance(ing, dict):
+        dst = cfg.get("ingest")
+        if not isinstance(dst, dict):
+            dst = cfg["ingest"] = {}
+        if "token" in ing:
+            dst["token"] = str(ing.get("token") or "")
+        if not isinstance(dst.get("tokens"), dict):
+            dst["tokens"] = {}
+        if isinstance(ing.get("tokens"), dict):
+            dst["tokens"].update({str(k): str(v) for k, v in ing["tokens"].items()})
+        if "auto_register" in ing:
+            dst["auto_register"] = bool(ing["auto_register"])
+    con = s.get("connect")
+    if isinstance(con, dict) and "public_url" in con:
+        cfg.setdefault("server", {})["public_url"] = str(con.get("public_url") or "")
     return cfg
 
 

@@ -12,6 +12,8 @@ import copy
 import hmac
 import ipaddress
 import os
+import re
+import secrets
 import sys
 import threading
 import time
@@ -25,6 +27,7 @@ import uvicorn
 
 import appconfig
 import auth
+import connect
 import db
 import seccheck
 import updater
@@ -42,7 +45,12 @@ CFG_PATH = os.environ.get("CO_CONFIG") or os.path.join(BASE, "config.yaml")
 with open(CFG_PATH, "rb") as f:
     CFG = yaml.safe_load(f.read().decode("utf-8-sig")) or {}
 
-# 网页保存的通知设置(cloud_settings.json)叠加进 CFG，早于 Notifier/Collector 构造——
+# config.yaml 里原本写的上报 token(网页「场地接入」不能删这些，只能覆盖)
+_YAML_INGEST = copy.deepcopy(CFG.get("ingest") or {})
+if not isinstance(_YAML_INGEST.get("tokens"), dict):
+    _YAML_INGEST["tokens"] = {}
+
+# 网页保存的通知设置/上报 token(cloud_settings.json)叠加进 CFG，早于 Notifier/Collector 构造——
 # 这样它们捕获的就是已经合并好的 dict，不需要事后再刷新一次引用。
 appconfig.apply_settings(CFG, appconfig.load_settings())
 
@@ -562,6 +570,16 @@ def _clean_alert_summary(groups):
     return out
 
 
+@app.post("/api/ingest/ping")
+def api_ingest_ping(request: Request, body: dict = Body(...)):
+    """场地端「测试连接」：只校验地址/证书/token 是否打通，不写任何数据、不注册场地。"""
+    sid, _name = _ingest_identity(body)
+    _check_ingest_token(request, sid)
+    known = next((x for x in all_sites() if x["id"] == sid), None)
+    return {"ok": True, "ts": int(time.time()), "registered": bool(known),
+            "site_name": known["name"] if known else ""}
+
+
 @app.post("/api/ingest/customers")
 def api_ingest_customers(request: Request, body: dict = Body(...)):
     """场地客户报表上报(默认每10分钟一次，整表替换)。"""
@@ -627,6 +645,190 @@ def api_restore_site(request: Request, key: str):
         raise HTTPException(404, "无此已删除场地")
     _audit(request, sess["user"], "site_restore", key)
     return {"ok": True}
+
+
+# ---------- 场地接入(云端地址/上报 token/证书指纹/接入码；仅 admin) ----------
+# 查看或更换 token 必须再输一次密码：会话被盗(电脑没锁屏、Cookie 泄露)也拿不到 token。
+# token 明文只在这几个接口的响应里出现一次，列表接口只给末 4 位。每次查看/更换都记审计。
+_SITE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _hint(tok):
+    tok = str(tok or "")
+    return tok[-4:] if len(tok) >= 12 and not seccheck.is_placeholder(tok) else ""
+
+
+def _valid_token(tok):
+    return bool(tok) and not seccheck.is_placeholder(tok)
+
+
+def _public_url(request: Request):
+    """各场地应该填的云端地址：管理员/安装脚本设置的优先；没设置就按当前访问地址猜一个。"""
+    u = str((CFG.get("server") or {}).get("public_url") or "").strip().rstrip("/")
+    if u:
+        return u, "config"
+    host = request.headers.get("host") or ""
+    if not host:
+        return "", "unset"
+    return f"{'https' if _is_https(request) else 'http'}://{host}", "guess"
+
+
+def _connect_payload(request: Request):
+    icfg = CFG.get("ingest") or {}
+    per = icfg.get("tokens") if isinstance(icfg.get("tokens"), dict) else {}
+    shared = str(icfg.get("token") or "")
+    url, src = _public_url(request)
+    info = connect.server_info(CFG)
+    sites = {x["id"]: x for x in all_sites()}
+    rows = []
+    for sid in sorted(set(sites) | set(per)):
+        tok = str(per.get(sid) or "")
+        x = sites.get(sid) or {}
+        rows.append({"id": sid, "name": x.get("name") or "", "registered": sid in sites,
+                     "mode": x.get("mode") or "push",
+                     "own_token": _valid_token(tok), "hint": _hint(tok),
+                     "from_config": sid in _YAML_INGEST["tokens"]})
+    warnings = []
+    if src == "guess":
+        warnings.append("还没设置「云端地址」，下面按你当前访问的地址猜测，请确认各场地能访问到它")
+    if url.startswith("http://") and not connect.host_is_ip(url):
+        warnings.append("云端地址是 http://，token 会明文传输；有域名请用 https")
+    elif url.startswith("http://"):
+        warnings.append("云端地址是 http://(明文)：公网 IP 场地端会拒绝，请用一键安装的 IP 模式(自签 HTTPS)")
+    if not _valid_token(shared) and not any(_valid_token(v) for v in per.values()):
+        warnings.append("还没有任何有效的上报 token：上报接口处于关闭状态，场地无法接入")
+    return {"ok": True, "public_url": url, "url_source": src,
+            "mode": connect.mode_of(url, info), "fingerprint": info["fingerprint"],
+            "self_signed": info["self_signed"],
+            "shared": {"set": _valid_token(shared), "hint": _hint(shared),
+                       "from_config": "token" not in (appconfig.load_settings().get("ingest") or {})
+                       and _valid_token(str(_YAML_INGEST.get("token") or ""))},
+            "auto_register": icfg.get("auto_register", True) is not False,
+            "max_sites": int(icfg.get("max_sites") or 200),
+            "sites": rows, "warnings": warnings}
+
+
+@app.get("/api/connect")
+def api_connect(request: Request):
+    _require_admin(request)
+    return _connect_payload(request)
+
+
+def _confirm_pw(request: Request, sess, body):
+    why = auth.confirm_password(CFG, sess["user"], str(body.get("password") or "")[:256],
+                                src=_client_ip(request))
+    if why == "locked":
+        raise HTTPException(429, "失败次数过多，请5分钟后再试")
+    if why:
+        _audit(request, sess["user"], "connect_pw_fail")
+        raise HTTPException(403, "密码不对：查看或更换上报 token 需要再输一次你的登录密码")
+
+
+def _code_for(request: Request, token, site_id=""):
+    url, _src = _public_url(request)
+    return connect.make_code(url, token, connect.server_info(CFG)["fingerprint"], site_id)
+
+
+def _save_ingest(mutate):
+    """改上报 token：先改 cloud_settings.json 覆盖层，再同步到运行中的 CFG(立即生效)。"""
+    cur = appconfig.load_settings().get("ingest")
+    cur = copy.deepcopy(cur) if isinstance(cur, dict) else {}
+    if not isinstance(cur.get("tokens"), dict):
+        cur["tokens"] = {}
+    mutate(cur)
+    appconfig.update_settings({"ingest": cur})
+    icfg = CFG.get("ingest")
+    if not isinstance(icfg, dict):
+        icfg = CFG["ingest"] = {}
+    # 运行中的 CFG = config.yaml 原值 + 覆盖层(删掉的网页 token 也要从 CFG 里拿掉)
+    icfg["tokens"] = {**_YAML_INGEST["tokens"], **cur["tokens"]}
+    icfg["token"] = cur["token"] if "token" in cur else str(_YAML_INGEST.get("token") or "")
+    if "auto_register" in cur:
+        icfg["auto_register"] = bool(cur["auto_register"])
+
+
+def _target(body):
+    t = str(body.get("target") or "")
+    if t != "shared" and not _SITE_ID_RE.match(t):
+        raise HTTPException(400, "target 须为 shared 或场地 ID")
+    return t
+
+
+@app.post("/api/connect/reveal")
+def api_connect_reveal(request: Request, body: dict = Body(...)):
+    """查看某把 token(共享或场地专属) + 对应接入码。"""
+    sess = _require_admin(request)
+    target = _target(body)
+    _confirm_pw(request, sess, body)
+    icfg = CFG.get("ingest") or {}
+    if target == "shared":
+        tok = str(icfg.get("token") or "")
+        sid = ""
+    else:
+        tok = str((icfg.get("tokens") or {}).get(target) or "")
+        sid = target
+    if not _valid_token(tok):
+        raise HTTPException(404, "这把 token 还没生成")
+    _audit(request, sess["user"], "token_reveal", target)
+    return {"ok": True, "target": target, "token": tok, "code": _code_for(request, tok, sid)}
+
+
+@app.post("/api/connect/token")
+def api_connect_token(request: Request, body: dict = Body(...)):
+    """生成/更换(rotate) 或 撤销(revoke) 一把 token。target=shared|场地ID；
+    action=new_site 时预先分配一个新场地 ID + 专属 token(场地端粘贴接入码即按这个 ID 上报)。"""
+    sess = _require_admin(request)
+    action = str(body.get("action") or "")
+    if action not in ("rotate", "revoke", "new_site"):
+        raise HTTPException(400, "action 须为 rotate / revoke / new_site")
+    target = "st-" + secrets.token_hex(6) if action == "new_site" else _target(body)
+    _confirm_pw(request, sess, body)
+    if action == "new_site" and db.site_count(CONN) >= int((CFG.get("ingest") or {}).get("max_sites") or 200):
+        raise HTTPException(403, "场地数已达上限(ingest.max_sites)")
+    if action == "revoke":
+        if target == "shared":
+            _save_ingest(lambda cur: cur.__setitem__("token", ""))
+        else:
+            if target in _YAML_INGEST["tokens"]:
+                raise HTTPException(409, "这把专属 token 写在服务器 config.yaml 的 ingest.tokens 里，"
+                                         "请在服务器上删掉那一行后重启")
+            _save_ingest(lambda cur: cur["tokens"].pop(target, None))
+        _audit(request, sess["user"], "token_revoke", target)
+        return {"ok": True, "target": target}
+    tok = secrets.token_urlsafe(32)
+    if target == "shared":
+        _save_ingest(lambda cur: cur.__setitem__("token", tok))
+    else:
+        _save_ingest(lambda cur: cur["tokens"].__setitem__(target, tok))
+    _audit(request, sess["user"], "token_new_site" if action == "new_site" else "token_rotate", target)
+    return {"ok": True, "target": target, "token": tok,
+            "code": _code_for(request, tok, "" if target == "shared" else target)}
+
+
+@app.post("/api/connect/settings")
+def api_connect_settings(request: Request, body: dict = Body(...)):
+    """改云端地址(public_url) / 新场地自动注册开关。"""
+    sess = _require_admin(request)
+    _confirm_pw(request, sess, body)
+    changed = []
+    if "public_url" in body:
+        u = connect.normalize_url(body.get("public_url"))
+        if u is None:
+            raise HTTPException(400, "云端地址格式不对，例：https://overview.example.com 或 https://1.2.3.4:8900")
+        con = appconfig.load_settings().get("connect")
+        con = dict(con) if isinstance(con, dict) else {}
+        con["public_url"] = u
+        appconfig.update_settings({"connect": con})
+        CFG.setdefault("server", {})["public_url"] = u
+        changed.append("public_url")
+    if "auto_register" in body:
+        if not isinstance(body["auto_register"], bool):
+            raise HTTPException(400, "auto_register 须为布尔值")
+        val = body["auto_register"]
+        _save_ingest(lambda cur: cur.__setitem__("auto_register", val))
+        changed.append(f"auto_register={val}")
+    _audit(request, sess["user"], "connect_settings", ",".join(changed))
+    return _connect_payload(request)
 
 
 # ---------- 版本更新(git 部署时可用；仅 admin) ----------
@@ -976,5 +1178,11 @@ if __name__ == "__main__":
           f"数据库 → {_db_path}")
     COLLECTOR.start()
     srv = CFG.get("server", {})
+    tls = {}
+    if srv.get("tls_cert") and srv.get("tls_key"):
+        # 没有域名(IP 模式)时由服务自己跑 HTTPS(一键安装生成的自签证书)，场地端按证书指纹认它
+        tls = {"ssl_certfile": srv["tls_cert"], "ssl_keyfile": srv["tls_key"]}
+        print(f"HTTPS 已启用(证书 {srv['tls_cert']})"
+              + (f"，证书指纹 {connect.server_info(CFG)['fingerprint']}" if srv.get("tls_self_signed") else ""))
     uvicorn.run(app, host=srv.get("host", "0.0.0.0"), port=int(srv.get("port", 8900)),
-                log_level="warning")
+                log_level="warning", **tls)

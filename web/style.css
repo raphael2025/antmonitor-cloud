@@ -169,3 +169,11 @@ table.mini td { font-size: 13px; }
 .lang-row{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:10px;font-size:13px;color:#8b949e}
 [dir="rtl"] header .actions{flex-direction:row-reverse;flex-wrap:wrap}
 [dir="rtl"] .cards{direction:rtl}
+
+/* 场地接入弹窗 */
+.conn-warn { color: #fab219; font-size: 13px; line-height: 1.6; margin: 6px 0; white-space: pre-line; }
+.conn-warn:empty { display: none; }
+.conn-mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+.conn-result { border: 1px solid #a8761a; border-radius: 8px; padding: 10px 12px; margin: 10px 0; background: #1c1810; }
+.conn-result input[readonly] { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+#tblConnSites td button { padding: 2px 8px; font-size: 12px; margin-right: 4px; }

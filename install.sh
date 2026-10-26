@@ -346,10 +346,25 @@ PY
   systemctl reload caddy 2>/dev/null || systemctl restart caddy
 }
 
-remove_caddy_block() {
-  [[ -f /etc/caddy/Caddyfile ]] && grep -q "$MARK_BEGIN" /etc/caddy/Caddyfile || return 0
-  sed -i "/$MARK_BEGIN/,/$MARK_END/d" /etc/caddy/Caddyfile
-  systemctl reload caddy 2>/dev/null || true
+remove_caddy_block() {   # 只在新模式已配好之后调用
+  local f=/etc/caddy/Caddyfile
+  [[ -f "$f" ]] && grep -q "$MARK_BEGIN" "$f" || return 0
+  cp "$f" "$f.bak.$(date +%s)"
+  sed -i "/$MARK_BEGIN/,/$MARK_END/d" "$f"
+  if grep -qvE '^[[:space:]]*(#.*)?$' "$f"; then
+    # 还有别的网站：校验通过才重载，校验不过就恢复原文件，不能让 Caddy 重启后起不来
+    if caddy validate --config "$f" --adapter caddyfile >/dev/null 2>&1; then
+      systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
+    else
+      cp "$(ls -t "$f".bak.* | head -1)" "$f"
+      warn "$(L '移除后 Caddyfile 校验不过，已恢复原文件，请手动删掉本服务的站点块' 'Caddyfile invalid after removal; restored')"
+      return 0
+    fi
+  else
+    # 只剩本服务那一块(一键安装装的 Caddy)：空 Caddyfile 无效，直接停掉 Caddy
+    echo "# antmonitor-cloud 已改用 IP 模式；本机没有其它网站" > "$f"
+    systemctl disable --now caddy >/dev/null 2>&1 || true
+  fi
   warn "$(L '已从 Caddy 里移除本服务的域名站点' 'Removed our site from Caddy')"
 }
 
@@ -380,7 +395,6 @@ configure_mode() {
       open_firewall 80 443
       ;;
     ip)
-      remove_caddy_block   # 从域名模式切过来：Caddy 还按 http 反代会连不上(后端改成 https 了)
       if [[ -z "$PUBLIC_IP" ]]; then
         PUBLIC_IP="$(detect_ip)"
         # 外部探测全失败时回落到网卡地址：云服务器(NAT)上那是内网 IP，写进证书和地址后
@@ -395,14 +409,15 @@ configure_mode() {
       cfg_set server.host 0.0.0.0 server.port "$PORT" server.trust_proxy false \
         server.public_url "https://$PUBLIC_IP:$PORT" \
         server.tls_cert "$DIR/certs/cert.pem" server.tls_key "$DIR/certs/key.pem" server.tls_self_signed true
+      remove_caddy_block   # 从域名模式切过来：新配置写好之后再撤掉 Caddy 站点(后端已改成 https)
       open_firewall "$PORT"
       ;;
     http)
-      remove_caddy_block
       PUBLIC_IP="${PUBLIC_IP:-$(detect_ip)}"
       warn "$(L '明文 HTTP：只适合内网测试，公网上 token 和密码会被看到' 'Plain HTTP: LAN testing only')"
       cfg_set server.host 0.0.0.0 server.port "$PORT" server.trust_proxy false \
         server.public_url "http://$PUBLIC_IP:$PORT" server.tls_cert "" server.tls_key "" server.tls_self_signed false
+      remove_caddy_block
       open_firewall "$PORT"
       ;;
   esac

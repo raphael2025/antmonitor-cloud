@@ -201,4 +201,5 @@ I18N.register('en', {
   "audit.token_new_site": "New site code",
   "audit.connect_settings": "Change onboarding settings",
   "audit.connect_pw_fail": "Wrong password (onboarding)",
+  "conn.revoked_label": "Revoked (shared token not accepted either)",
 });

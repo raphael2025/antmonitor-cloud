@@ -184,4 +184,5 @@ I18N.register('ar', {
   "audit.token_new_site": "رمز موقع جديد",
   "audit.connect_settings": "تغيير إعدادات الربط",
   "audit.connect_pw_fail": "كلمة مرور خاطئة (الربط)",
+  "conn.revoked_label": "مُلغى (لا يُقبل الرمز المشترك أيضًا)",
 });

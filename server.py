@@ -12,7 +12,6 @@ import copy
 import hmac
 import ipaddress
 import os
-import re
 import secrets
 import sys
 import threading
@@ -650,7 +649,6 @@ def api_restore_site(request: Request, key: str):
 # ---------- 场地接入(云端地址/上报 token/证书指纹/接入码；仅 admin) ----------
 # 查看或更换 token 必须再输一次密码：会话被盗(电脑没锁屏、Cookie 泄露)也拿不到 token。
 # token 明文只在这几个接口的响应里出现一次，列表接口只给末 4 位。每次查看/更换都记审计。
-_SITE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def _hint(tok):
@@ -687,6 +685,7 @@ def _connect_payload(request: Request):
         rows.append({"id": sid, "name": x.get("name") or "", "registered": sid in sites,
                      "mode": x.get("mode") or "push",
                      "own_token": _valid_token(tok), "hint": _hint(tok),
+                     "revoked": sid in per and not _valid_token(tok),
                      "from_config": sid in _YAML_INGEST["tokens"]})
     warnings = []
     if src == "guess":
@@ -730,8 +729,18 @@ def _code_for(request: Request, token, site_id=""):
 
 
 def _save_ingest(mutate):
-    """改上报 token：先改 cloud_settings.json 覆盖层，再同步到运行中的 CFG(立即生效)。"""
-    cur = appconfig.load_settings().get("ingest")
+    """改上报 token：先改 cloud_settings.json 覆盖层，再同步到运行中的 CFG(立即生效)。
+    整个读-改-写-同步持同一把锁：两个请求同时生成 token 时，后写的不会把先写的冲掉
+    (那样先发出去的接入码会一直 401)。"""
+    with appconfig._LOCK:
+        try:
+            _save_ingest_locked(mutate)
+        except appconfig.SettingsError as e:
+            raise HTTPException(500, str(e)) from e
+
+
+def _save_ingest_locked(mutate):
+    cur = appconfig._read_settings().get("ingest")
     cur = copy.deepcopy(cur) if isinstance(cur, dict) else {}
     if not isinstance(cur.get("tokens"), dict):
         cur["tokens"] = {}
@@ -749,7 +758,8 @@ def _save_ingest(mutate):
 
 def _target(body):
     t = str(body.get("target") or "")
-    if t != "shared" and not _SITE_ID_RE.match(t):
+    # 老版本场地端没有 site_id 时用场地名当 ID(可能含中文/空格)，按上报接口同一规则校验
+    if t != "shared" and (not t or validate.site_key(t) != t):
         raise HTTPException(400, "target 须为 shared 或场地 ID")
     return t
 
@@ -789,10 +799,9 @@ def api_connect_token(request: Request, body: dict = Body(...)):
         if target == "shared":
             _save_ingest(lambda cur: cur.__setitem__("token", ""))
         else:
-            if target in _YAML_INGEST["tokens"]:
-                raise HTTPException(409, "这把专属 token 写在服务器 config.yaml 的 ingest.tokens 里，"
-                                         "请在服务器上删掉那一行后重启")
-            _save_ingest(lambda cur: cur["tokens"].pop(target, None))
+            # 记成空串(=已撤销)而不是删掉：删掉的话该场地会退回用共享 token，
+            # 场地机器丢了/泄露了才撤销，结果拿着共享 token 的任何人照样能冒充它
+            _save_ingest(lambda cur: cur["tokens"].__setitem__(target, ""))
         _audit(request, sess["user"], "token_revoke", target)
         return {"ok": True, "target": target}
     tok = secrets.token_urlsafe(32)
@@ -815,10 +824,14 @@ def api_connect_settings(request: Request, body: dict = Body(...)):
         u = connect.normalize_url(body.get("public_url"))
         if u is None:
             raise HTTPException(400, "云端地址格式不对，例：https://overview.example.com 或 https://1.2.3.4:8900")
-        con = appconfig.load_settings().get("connect")
-        con = dict(con) if isinstance(con, dict) else {}
-        con["public_url"] = u
-        appconfig.update_settings({"connect": con})
+        with appconfig._LOCK:
+            try:
+                con = appconfig._read_settings().get("connect")
+                con = dict(con) if isinstance(con, dict) else {}
+                con["public_url"] = u
+                appconfig.update_settings({"connect": con})
+            except appconfig.SettingsError as e:
+                raise HTTPException(500, str(e)) from e
         CFG.setdefault("server", {})["public_url"] = u
         changed.append("public_url")
     if "auto_register" in body:

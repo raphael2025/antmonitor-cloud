@@ -184,4 +184,5 @@ I18N.register('ru', {
   "audit.token_new_site": "Код новой площадки",
   "audit.connect_settings": "Изменение настроек подключения",
   "audit.connect_pw_fail": "Неверный пароль (подключение)",
+  "conn.revoked_label": "Отозван (общий токен тоже не принимается)",
 });

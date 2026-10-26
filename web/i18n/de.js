@@ -184,4 +184,5 @@ I18N.register('de', {
   "audit.token_new_site": "Code für neuen Standort",
   "audit.connect_settings": "Anbindung geändert",
   "audit.connect_pw_fail": "Falsches Passwort (Anbindung)",
+  "conn.revoked_label": "Widerrufen (gemeinsames Token gilt auch nicht)",
 });

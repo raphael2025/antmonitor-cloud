@@ -128,3 +128,60 @@ def test_self_signed_fingerprint_goes_into_code(tmp_path):
     assert connect.parse_code(code)["f"] == want
     assert connect.mode_of("https://1.2.3.4:8900", info) == "ip"
     assert connect.mode_of("https://a.example.com", connect.server_info({})) == "domain"
+
+
+def test_concurrent_new_sites_keep_every_token(cloud):
+    import threading
+    server, client = cloud
+    login(client)
+    out = []
+
+    def one():
+        out.append(write(client, "POST", "/api/connect/token", json={"action": "new_site", **PW}).json())
+
+    ts = [threading.Thread(target=one) for _ in range(12)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    toks = server.CFG["ingest"]["tokens"]
+    disk = server.appconfig.load_settings()["ingest"]["tokens"]
+    for d in out:
+        assert toks[d["target"]] == d["token"] == disk[d["target"]]
+
+
+def test_revoked_site_cannot_fall_back_to_shared_token(cloud):
+    server, client = cloud
+    login(client)
+    d = write(client, "POST", "/api/connect/token", json={"action": "new_site", **PW}).json()
+    sid = d["target"]
+    assert client.post("/api/ingest/summary", headers={"Authorization": f"Bearer {d['token']}"},
+                       json={"site_id": sid, "site": "S"}).status_code == 200
+    write(client, "POST", "/api/connect/token", json={"target": sid, "action": "revoke", **PW})
+    assert report(client, sid).status_code == 401           # 共享 token 也冒充不了它
+    row = next(r for r in client.get("/api/connect").json()["sites"] if r["id"] == sid)
+    assert row["revoked"] and not row["own_token"]
+
+
+def test_legacy_name_as_site_id_is_manageable(cloud):
+    _server, client = cloud
+    login(client)
+    assert report(client, "云海 二期").status_code == 200
+    r = write(client, "POST", "/api/connect/token", json={"target": "云海 二期", "action": "rotate", **PW})
+    assert r.status_code == 200 and r.json()["target"] == "云海 二期"
+
+
+def test_unreadable_settings_file_is_never_overwritten(cloud, tmp_path):
+    import os
+    server, client = cloud
+    login(client)
+    p = server.appconfig.SETTINGS_FILE
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"passwords": {"x": "y"}, "broken": ')   # 半截 JSON
+    r = write(client, "POST", "/api/connect/token", json={"target": "shared", "action": "rotate", **PW})
+    assert r.status_code == 500
+    assert open(p, encoding="utf-8").read().endswith('"broken": ')   # 原样保留
+    os.remove(p)
+
+
+def test_cgnat_metadata_address_is_internal():
+    import notify
+    assert notify._internal_target("100.100.100.200")

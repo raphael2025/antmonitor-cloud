@@ -706,6 +706,7 @@ function renderConnect(d) {
     const id = esc(x.id);
     const name = x.name ? esc(x.name) : `<span class="muted">${t(x.registered ? "conn.no_name" : "conn.waiting")}</span>`;
     const tok = x.own_token ? `…${esc(x.hint || "****")}${x.from_config ? " · config.yaml" : ""}`
+      : x.revoked ? `<span class="muted">${t("conn.revoked_label")}</span>`
       : `<span class="muted">${t("conn.use_shared")}</span>`;
     const ops = x.own_token
       ? `<button data-act="reveal" data-id="${id}">${t("conn.show")}</button>`

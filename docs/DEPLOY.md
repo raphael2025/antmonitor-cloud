@@ -109,6 +109,9 @@ docker run -d --name overview --restart always -p 127.0.0.1:8900:8900 \
   -v ./config.yaml:/app/config.yaml:ro -v ./data:/app/data cloud-overview
 ```
 
+网页改的密码、「场地接入」生成的 token 存在 `cloud_settings.json`，镜像里已用 `CO_SETTINGS=/app/data/cloud_settings.json`
+把它放进 `data` 卷——容器重建不丢。用 `auth.py passwd` 改密码要在容器里跑：`docker exec -it overview python auth.py passwd admin`。
+
 ## 4. 场地接入（网页里完成，每个场地一次）
 
 1. 云端：admin 登录 → 右上 **「🔌 场地接入」**。这里能看到：
@@ -122,7 +125,7 @@ docker run -d --name overview --restart always -p 127.0.0.1:8900:8900 \
      已在上报的场地也可以在表格里点「生成专属 token」，把新接入码发给该场地替换。
 3. 场地端：面板「⚙ 网段 → ☁ 云端上报」→ 粘贴接入码 →「填入」→ 填场地名/类型 → 勾选启用 → 保存 →
    「🔌 测试连接」。下方会一直显示上报状态（最近一次成功时间或失败原因）。
-   新装场地也可以在安装命令里带上：`curl … | sudo bash -s -- --connect-code 'AMC1-…' --site-name XX一场`。
+   新装场地也可以在安装命令里带上：`curl … | sudo bash -s -- --connect-code - --site-name XX一场`。
 4. 1 分钟内云端面板出现场地卡片（场地首轮扫描完成前不推数）。
 
 安全约定：

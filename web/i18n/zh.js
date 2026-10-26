@@ -201,4 +201,5 @@ I18N.register('zh', {
   "audit.token_new_site": "新场地接入码",
   "audit.connect_settings": "修改接入设置",
   "audit.connect_pw_fail": "接入操作密码错误",
+  "conn.revoked_label": "已撤销（共享 token 也不能用）",
 });

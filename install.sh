@@ -82,6 +82,29 @@ ask() {  # ask 变量名 提示 [silent]
 PY="$DIR/venv/bin/python"
 CONF="$DIR/config.yaml"
 
+# 安装目录归服务账号 antcloud(网页「🔄 更新」要能写代码)。所以 root 绝不直接执行目录里的
+# 任何东西(venv 里的 python/pip、auth.py、git 钩子/配置)：服务进程一旦被攻破就能改它们，
+# root 下次跑本脚本时等于替它执行——一律降权到 antcloud 再跑。root 自己用的 python3 加 -I(隔离模式)
+as_svc() { runuser -u "$SVC_USER" -- env HOME="$DIR" PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1 "$@"; }
+
+create_user() {
+  id "$SVC_USER" >/dev/null 2>&1 && return 0
+  useradd --system --home-dir "$DIR" --no-create-home --shell /usr/sbin/nologin "$SVC_USER" 2>/dev/null \
+    || useradd -r -d "$DIR" -s /sbin/nologin "$SVC_USER"
+}
+
+prepare_dir() {   # 目录本身由 root 建(父目录 /opt 归 root)，之后往里写东西一律以 antcloud 身份
+  mkdir -p "$DIR"
+  chown -h "$SVC_USER:$SVC_USER" "$DIR"
+  chmod 700 "$DIR"
+}
+
+fix_owner() {   # 老版本以 root 写进来的文件改归服务账号；-h 不跟随符号链接
+  chown -R -h "$SVC_USER:$SVC_USER" "$DIR"
+}
+
+give_tmp() { chown -R -h "$SVC_USER:$SVC_USER" "$1"; }   # root 的临时目录交给服务账号去拷
+
 # ---------- 依赖 ----------
 install_packages() {
   info "$(L '安装系统依赖(python3 / venv / openssl / curl / git)…' 'Installing system packages…')"
@@ -102,7 +125,7 @@ install_packages() {
 }
 
 # ---------- 代码 ----------
-git_dir() { git -c safe.directory="$DIR" -C "$DIR" "$@"; }
+git_dir() { as_svc git -C "$DIR" "$@"; }
 
 fetch_tarball() {
   local tmp url
@@ -113,17 +136,19 @@ fetch_tarball() {
     rm -rf "$tmp"
     die "$(L '下载失败：检查服务器能否访问 GitHub；国内服务器可设 GH_PROXY 镜像前缀后重试' 'Download failed; check GitHub access or set GH_PROXY')"
   fi
-  mkdir -p "$DIR"
-  cp -a "$tmp"/. "$DIR"/      # config.yaml / 数据库 / 证书不在源码包里，不会被覆盖
+  prepare_dir
+  give_tmp "$tmp"
+  as_svc cp -a "$tmp"/. "$DIR"/      # config.yaml / 数据库 / 证书不在源码包里，不会被覆盖
   rm -rf "$tmp"
 }
 
 copy_local_src() {
   info "$(L '使用本地源码' 'Using local source') $SRC → $DIR"
-  mkdir -p "$DIR"
+  prepare_dir
   tar -C "$SRC" --exclude=./venv --exclude=./.venv --exclude=./.git --exclude=./config.yaml \
     --exclude=./cloud_settings.json --exclude='./*.db' --exclude='./*.db-*' --exclude=./certs \
-    --exclude=./data --exclude='./__pycache__' --exclude=./.pytest_cache -cf - . | tar -C "$DIR" -xf -
+    --exclude=./data --exclude='./__pycache__' --exclude=./.pytest_cache -cf - . \
+    | as_svc tar -C "$DIR" --no-same-owner -xf -
 }
 
 fetch_code() {
@@ -145,10 +170,16 @@ fetch_code() {
   fi
   if command -v git >/dev/null; then
     info "$(L '下载代码' 'Cloning') (git clone)"
-    if git clone -q --branch "$BRANCH" "${GH_PROXY}https://github.com/${REPO}.git" "$DIR"; then
+    local tmpc; tmpc="$(mktemp -d)"
+    # 先克隆到临时目录：目标目录可能已存在且有别的东西，失败了也绝不能 rm -rf 它
+    if git clone -q --branch "$BRANCH" "${GH_PROXY}https://github.com/${REPO}.git" "$tmpc/src"; then
+      prepare_dir
+      give_tmp "$tmpc"
+      as_svc cp -a "$tmpc/src"/. "$DIR"/
+      rm -rf "$tmpc"
       return
     fi
-    rm -rf "$DIR"
+    rm -rf "$tmpc"
     warn "$(L 'git clone 失败，改用源码包' 'git clone failed; trying tarball')"
   fi
   fetch_tarball
@@ -156,33 +187,38 @@ fetch_code() {
 
 setup_venv() {
   info "$(L '安装 Python 依赖…' 'Installing Python dependencies…')"
-  [[ -x "$PY" ]] || python3 -m venv "$DIR/venv"
-  "$DIR/venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
-  "$DIR/venv/bin/pip" install -q -r "$DIR/requirements.txt"
+  [[ -x "$PY" ]] || as_svc python3 -m venv "$DIR/venv"
+  as_svc "$DIR/venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
+  as_svc "$DIR/venv/bin/pip" install -q -r "$DIR/requirements.txt"
 }
 
-cfg_set() { "$PY" "$DIR/tools/configure.py" "$CONF" "$@"; }
+cfg_set() { as_svc "$PY" "$DIR/tools/configure.py" "$CONF" "$@"; }
 cfg_get() {  # cfg_get section key
-  "$PY" - "$CONF" "$1" "$2" <<'PY'
+  as_svc "$PY" - "$CONF" "$1" "$2" <<'PY'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
 v = (d.get(sys.argv[2]) or {}).get(sys.argv[3])
 print("" if v is None else (str(v).lower() if isinstance(v, bool) else v))
 PY
 }
-rand() { "$PY" -c 'import secrets; print(secrets.token_urlsafe(32))'; }
+rand() { python3 -I -c 'import secrets; print(secrets.token_urlsafe(32))'; }
+port_of() {  # 端口从 config.yaml 读出来，进 [[ -lt ]]/systemd 单元前必须是纯数字
+  local p; p="$(cfg_get server port)"
+  [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( p >= 1 && p <= 65535 )) || die "server.port 非法: $p"
+  echo "$p"
+}
 
 ensure_config() {
   if [[ ! -f "$CONF" ]]; then
-    cp "$DIR/config.example.yaml" "$CONF"
+    as_svc cp "$DIR/config.example.yaml" "$CONF"
     cfg_set ingest.token "$(rand)" public_api.token "$(rand)"
     ok "$(L '已生成 config.yaml，上报 token / 取数 token 已随机生成' 'config.yaml created with random tokens')"
   fi
-  chmod 600 "$CONF"
+  as_svc chmod 600 "$CONF"
 }
 
 admin_is_default() {
-  (cd "$DIR" && "$PY" -c 'import yaml,auth,sys; c=yaml.safe_load(open("config.yaml",encoding="utf-8")) or {}; sys.exit(0 if "admin" in auth.weak_default_users(c) else 1)')
+  (cd "$DIR" && as_svc "$PY" -c 'import yaml,auth,sys; c=yaml.safe_load(open("config.yaml",encoding="utf-8")) or {}; sys.exit(0 if "admin" in auth.weak_default_users(c) else 1)')
 }
 
 set_admin_password() {
@@ -197,11 +233,11 @@ set_admin_password() {
     done
   fi
   if [[ -z "$p1" ]]; then
-    p1="$("$PY" -c 'import secrets; print(secrets.token_urlsafe(12))')"
+    p1="$(python3 -I -c 'import secrets; print(secrets.token_urlsafe(12))')"
     GENERATED_PW="$p1"
   fi
   local out
-  if ! out="$(cd "$DIR" && printf '%s\n' "$p1" | "$PY" auth.py passwd admin --stdin 2>&1)"; then
+  if ! out="$(cd "$DIR" && printf '%s\n' "$p1" | as_svc "$PY" auth.py passwd admin --stdin 2>&1)"; then
     die "$(L '密码不合格，请重跑并换一个更复杂的密码' 'Password rejected; rerun with a stronger one'): $out"
   fi
   ok "$(L 'admin 密码已设置' 'admin password set')"
@@ -219,19 +255,25 @@ detect_ip() {
 
 make_self_signed() {  # make_self_signed IP
   local ip="$1" crt="$DIR/certs/cert.pem" key="$DIR/certs/key.pem"
-  mkdir -p "$DIR/certs"
+  as_svc mkdir -p "$DIR/certs"
   if [[ -f "$crt" ]] && openssl x509 -in "$crt" -noout -text 2>/dev/null | grep -q "IP Address:${ip}\b"; then
     return   # 证书已含这个 IP：保持不变(换证书=指纹变，各场地都得重填)
   fi
   [[ -f "$crt" ]] && warn "$(L '公网 IP 变了，重新生成证书：各场地需要更新证书指纹' 'IP changed: new certificate, sites must update the fingerprint')"
+  # 先在 root 自己的临时目录生成再 mv 过去：certs/ 归服务账号，直接往里写会被符号链接骗去覆盖系统文件
+  local tmpk; tmpk="$(mktemp -d)"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
     -subj "/CN=AntMonitor Cloud" -addext "subjectAltName=IP:${ip},DNS:localhost" \
-    -keyout "$key" -out "$crt" 2>/dev/null
-  chmod 600 "$key"
+    -keyout "$tmpk/key.pem" -out "$tmpk/cert.pem" 2>/dev/null
+  chmod 600 "$tmpk/key.pem"
+  give_tmp "$tmpk"
+  as_svc mv -f "$tmpk/key.pem" "$key"
+  as_svc mv -f "$tmpk/cert.pem" "$crt"
+  rm -rf "$tmpk"
   ok "$(L '已生成自签证书' 'Self-signed certificate created') ($ip)"
 }
 
-fingerprint() { openssl x509 -in "$DIR/certs/cert.pem" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+fingerprint() { openssl x509 -in "$DIR/certs/cert.pem" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true; }
 
 open_firewall() {
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -278,7 +320,7 @@ ${DOMAIN} {
 $MARK_END"
   mkdir -p /etc/caddy
   if [[ -f "$f" ]] && grep -q "$MARK_BEGIN" "$f"; then
-    "$PY" - "$f" "$MARK_BEGIN" "$MARK_END" "$block" <<'PY'
+    python3 -I - "$f" "$MARK_BEGIN" "$MARK_END" "$block" <<'PY'
 import re, sys
 p, b, e, block = sys.argv[1:]
 s = open(p, encoding="utf-8").read()
@@ -299,9 +341,8 @@ PY
 }
 
 configure_mode() {
-  local cur_port
-  cur_port="$(cfg_get server port)"
-  PORT="${PORT:-${cur_port:-8900}}"
+  PORT="${PORT:-$(port_of)}"
+  [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "--port $(L '非法' 'invalid'): $PORT"
   case "$MODE" in
     domain)
       [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "$(L '域名格式不对' 'Invalid domain'): $DOMAIN"
@@ -312,7 +353,7 @@ configure_mode() {
       done
       local ip resolved
       ip="$(detect_ip)"
-      resolved="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')"
+      resolved="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)"
       if [[ -z "$resolved" ]]; then
         warn "$(L "域名 $DOMAIN 还解析不到：先在 DNS 里加 A 记录指向 $ip，证书会在解析生效后自动申请" "DNS for $DOMAIN not found yet")"
       elif [[ -n "$ip" && "$resolved" != "$ip" ]]; then
@@ -326,8 +367,16 @@ configure_mode() {
       open_firewall 80 443
       ;;
     ip)
-      PUBLIC_IP="${PUBLIC_IP:-$(detect_ip)}"
-      [[ "$PUBLIC_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "$(L '探测不到公网 IP，请用 --ip 指定' 'Cannot detect public IP; use --ip')"
+      if [[ -z "$PUBLIC_IP" ]]; then
+        PUBLIC_IP="$(detect_ip)"
+        # 外部探测全失败时回落到网卡地址：云服务器(NAT)上那是内网 IP，写进证书和地址后
+        # 场地全都连不上。宁可停下来让人指定
+        if python3 -I -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]).is_global else 1)' "$PUBLIC_IP" 2>/dev/null; then :
+        else
+          die "$(L "探测到的地址 ${PUBLIC_IP:-?} 不是公网 IP(云服务器网卡上一般是内网地址)。请用 --ip 公网IP 指定；云端本来就在内网时也用 --ip 指定内网地址" "Detected ${PUBLIC_IP:-?} is not a public IP; pass --ip")"
+        fi
+      fi
+      [[ "$PUBLIC_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "$(L '公网 IP 格式不对，请用 --ip 指定' 'Invalid IP; use --ip')"
       make_self_signed "$PUBLIC_IP"
       cfg_set server.host 0.0.0.0 server.port "$PORT" server.trust_proxy false \
         server.public_url "https://$PUBLIC_IP:$PORT" \
@@ -353,13 +402,10 @@ current_mode() {
 }
 
 # ---------- 服务 ----------
-ensure_user() {
-  id "$SVC_USER" >/dev/null 2>&1 || useradd --system --home-dir "$DIR" --no-create-home \
-    --shell /usr/sbin/nologin "$SVC_USER" 2>/dev/null || useradd -r -d "$DIR" -s /sbin/nologin "$SVC_USER"
-  chown -R "$SVC_USER:$SVC_USER" "$DIR"
-  chmod 700 "$DIR"
-  [[ -f "$DIR/cloud_settings.json" ]] && chmod 600 "$DIR/cloud_settings.json"
-  [[ -f "$DIR/certs/key.pem" ]] && chmod 600 "$DIR/certs/key.pem"
+ensure_perms() {
+  as_svc chmod 600 "$CONF" 2>/dev/null || true
+  [[ -f "$DIR/cloud_settings.json" ]] && as_svc chmod 600 "$DIR/cloud_settings.json"
+  [[ -f "$DIR/certs/key.pem" ]] && as_svc chmod 600 "$DIR/certs/key.pem"
   return 0
 }
 
@@ -420,7 +466,7 @@ show_info() {
   echo "  $(L '服务管理' 'Service'):  systemctl status ${SERVICE}  |  journalctl -u ${SERVICE} -f"
   case "$mode" in
     domain) echo "  $(L '云服务器安全组/防火墙放行' 'Open in cloud firewall'): TCP 80, 443" ;;
-    *) echo "  $(L '云服务器安全组/防火墙放行' 'Open in cloud firewall'): TCP $(cfg_get server port)" ;;
+    *) echo "  $(L '云服务器安全组/防火墙放行' 'Open in cloud firewall'): TCP $(port_of)" ;;
   esac
   [[ "$mode" == "domain" ]] && echo "  $(L '国内服务器用域名须已 ICP 备案，否则 80/443 会被拦截；没备案请改用 IP 模式' 'Mainland China servers need ICP filing for domains')"
   echo
@@ -428,8 +474,10 @@ show_info() {
 
 do_install() {
   install_packages
+  create_user
   local fresh=0
   [[ -f "$CONF" ]] || fresh=1
+  [[ -d "$DIR" ]] && fix_owner
   fetch_code
   [[ -f "$DIR/server.py" ]] || die "$(L '代码下载不完整' 'Incomplete download')"
   setup_venv
@@ -438,9 +486,9 @@ do_install() {
   # (比如原来自己配的 nginx 反代，重跑本脚本只更新代码)
   [[ -z "$MODE" && $fresh -eq 1 ]] && MODE="ip"
   if [[ -n "$MODE" ]]; then configure_mode; fi
-  PORT="$(cfg_get server port)"
+  PORT="$(port_of)"
   admin_is_default && set_admin_password
-  ensure_user
+  ensure_perms
   write_service
   systemctl restart "$SERVICE"
   if wait_healthy; then ok "$(L '服务已启动' 'Service is running')"
@@ -451,10 +499,12 @@ do_install() {
 do_update() {
   [[ -f "$DIR/server.py" ]] || die "$(L '还没安装' 'Not installed'): $DIR"
   command -v python3 >/dev/null || install_packages
+  create_user
+  fix_owner
   fetch_code
   setup_venv
-  PORT="$(cfg_get server port)"
-  ensure_user
+  PORT="$(port_of)"
+  ensure_perms
   write_service
   systemctl restart "$SERVICE"
   wait_healthy && ok "$(L '已更新并重启' 'Updated and restarted')" \
@@ -482,8 +532,8 @@ case "$ACTION" in
   uninstall) do_uninstall ;;
   reset-password)
     [[ -x "$PY" ]] || die "$(L '还没安装' 'Not installed')"
-    set_admin_password; chown "$SVC_USER:$SVC_USER" "$DIR/cloud_settings.json" 2>/dev/null || true
+    set_admin_password
     show_info ;;
-  info) [[ -f "$CONF" ]] || die "$(L '还没安装' 'Not installed')"; PORT="$(cfg_get server port)"; show_info
+  info) [[ -f "$CONF" ]] || die "$(L '还没安装' 'Not installed')"; PORT="$(port_of)"; show_info
         systemctl --no-pager --lines=0 status "$SERVICE" || true ;;
 esac

@@ -245,6 +245,9 @@ def _url_tail(url):
         return ""
 
 
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
 def _internal_target(host):
     """host 解析到本机/链路本地/保留地址 → 返回原因字符串，否则 None。
 
@@ -265,7 +268,9 @@ def _internal_target(host):
         if ip.version == 6 and ip.ipv4_mapped:   # ::ffff:127.0.0.1 这类写法
             ip = ip.ipv4_mapped
         if (ip.is_loopback or ip.is_link_local or ip.is_unspecified
-                or ip.is_multicast or ip.is_reserved):
+                or ip.is_multicast or ip.is_reserved or ip in _CGNAT):
+            # 100.64.0.0/10(运营商级 NAT)里有阿里云元数据 100.100.100.200，
+            # Python 不把它算 private/reserved/link_local，得单独拦
             return f"{host} 解析到内部地址 {ip}"
     return None
 

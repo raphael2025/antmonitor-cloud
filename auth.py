@@ -22,6 +22,7 @@
 import getpass
 import hashlib
 import hmac
+import os
 import secrets
 import sys
 import threading
@@ -271,6 +272,18 @@ def _ask_new_password(username=""):
         return p1
 
 
+def _chown_like_config(path):
+    """用 sudo 跑本命令时，新写的 cloud_settings.json 会变成 root 所有、服务账号读不了——
+    改回与 config.yaml 同一属主。"""
+    if os.name != "posix" or os.geteuid() != 0:
+        return
+    try:
+        st = os.stat(appconfig._CFG_PATH)
+        os.chown(path, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+
+
 def _cli(argv):
     for _s in (sys.stdout, sys.stderr):
         if hasattr(_s, "reconfigure"):
@@ -300,7 +313,12 @@ def _cli(argv):
         else:
             pw = _ask_new_password(name)
         h = hash_password(pw)
-        appconfig.set_password_override(name, h)
+        try:
+            appconfig.set_password_override(name, h)
+        except appconfig.SettingsError as e:
+            print(f"✗ {e}")
+            return 1
+        _chown_like_config(appconfig.SETTINGS_FILE)
         print(f"✓ 已更新用户 {name} 的密码(写入 {appconfig.SETTINGS_FILE})，"
               f"运行中的服务立即生效，该用户旧会话全部失效。")
         return 0

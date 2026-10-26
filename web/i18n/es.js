@@ -184,4 +184,5 @@ I18N.register('es', {
   "audit.token_new_site": "Código de sitio nuevo",
   "audit.connect_settings": "Cambiar ajustes de alta",
   "audit.connect_pw_fail": "Contraseña errónea (alta)",
+  "conn.revoked_label": "Revocado (tampoco se acepta el token compartido)",
 });

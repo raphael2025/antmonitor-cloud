@@ -24,7 +24,10 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 # 与 server.py 的 CFG_PATH 用同一条环境变量/默认值逻辑，确保 settings 文件
 # 落在 config.yaml 同一目录（测试用 CO_CONFIG=tools/test_config.yaml 时也一致）。
 _CFG_PATH = os.environ.get("CO_CONFIG") or os.path.join(BASE, "config.yaml")
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(_CFG_PATH)), "cloud_settings.json")
+# CO_SETTINGS 可把它放到别处：Docker 部署 config.yaml 只读挂载，这个文件得放进数据卷，
+# 否则容器一重建，网页改的密码 / 生成的场地 token 全丢
+SETTINGS_FILE = (os.environ.get("CO_SETTINGS")
+                 or os.path.join(os.path.dirname(os.path.abspath(_CFG_PATH)), "cloud_settings.json"))
 
 # 可重入锁：保护 cloud_settings.json 的"读-改-写"整体过程。
 # 两个管理员同时保存面板设置时，若各自先 load 再 save，后写的会把先写的改动
@@ -33,15 +36,29 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(_CFG_PATH)), "cloud
 _LOCK = threading.RLock()
 
 
+class SettingsError(RuntimeError):
+    """cloud_settings.json 存在但读不了/解析不了：绝不能当成空文件再整份覆盖写回去。"""
+
+
+def _read_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return {}
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SettingsError(f"{SETTINGS_FILE} 读取失败({e})。常见原因：用 sudo 跑过 auth.py，"
+                            f"文件变成 root 所有——chown 回服务账号后重试") from e
+    return d if isinstance(d, dict) else {}
+
+
 def load_settings():
     with _LOCK:
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (OSError, ValueError) as e:
-                print(f"[appconfig] cloud_settings.json 读取失败，忽略: {e}")
-        return {}
+        try:
+            return _read_settings()
+        except SettingsError as e:
+            print(f"[appconfig] ⚠ {e}")   # 读路径降级为空(服务照常起)；写路径见 update_settings
+            return {}
 
 
 def update_settings(patch):
@@ -52,7 +69,7 @@ def update_settings(patch):
     调用方需自己把完整的合并结果传进来(参见 server.py 的 POST /api/settings)。
     """
     with _LOCK:
-        merged = {**load_settings(), **(patch or {})}
+        merged = {**_read_settings(), **(patch or {})}   # 读失败直接抛错，不覆盖原文件
         _atomic_json(SETTINGS_FILE, merged)
         return merged
 
@@ -93,7 +110,7 @@ def password_overrides():
 
 def set_password_override(username, pw_hash):
     with _LOCK:
-        cur = load_settings().get("passwords")
+        cur = _read_settings().get("passwords")
         cur = dict(cur) if isinstance(cur, dict) else {}
         cur[str(username)] = str(pw_hash)
         update_settings({"passwords": cur})

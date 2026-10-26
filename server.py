@@ -678,6 +678,8 @@ def _connect_payload(request: Request):
     url, src = _public_url(request)
     info = connect.server_info(CFG)
     sites = {x["id"]: x for x in all_sites()}
+    over = appconfig.load_settings().get("ingest") or {}
+    over_tokens = over.get("tokens") if isinstance(over.get("tokens"), dict) else {}
     rows = []
     for sid in sorted(set(sites) | set(per)):
         tok = str(per.get(sid) or "")
@@ -686,7 +688,8 @@ def _connect_payload(request: Request):
                      "mode": x.get("mode") or "push",
                      "own_token": _valid_token(tok), "hint": _hint(tok),
                      "revoked": sid in per and not _valid_token(tok),
-                     "from_config": sid in _YAML_INGEST["tokens"]})
+                     # 网页换过/撤销过的就不再算 config.yaml 里的那把
+                     "from_config": sid in _YAML_INGEST["tokens"] and sid not in over_tokens})
     warnings = []
     if src == "guess":
         warnings.append("还没设置「云端地址」，下面按你当前访问的地址猜测，请确认各场地能访问到它")

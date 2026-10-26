@@ -50,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master
 
 选项：`--port 端口`、`--dir 安装目录`、`--branch 分支`、`--http`（明文，仅内网测试）、`--lang en`。
 GitHub 访问慢：`curl -fsSL <镜像前缀>/https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo GH_PROXY=<镜像前缀>/ bash`（镜像能看到并篡改下载内容，只用信得过的）。
-离线安装：把源码目录拷到服务器，在目录里 `sudo bash install.sh`（直接用这份源码）。
+连不上 GitHub：把源码目录拷到服务器(任意位置，或直接拷成 `/opt/antmonitor-cloud`)，在目录里 `sudo bash install.sh`（直接用这份源码；Python 依赖仍需能访问 PyPI 或国内镜像）。
 
 服务管理：`systemctl status antmonitor-cloud`、`journalctl -u antmonitor-cloud -f`。
 

@@ -52,12 +52,14 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -z "$LANG_CODE" ]] && LANG_CODE="zh"
 
-# 从解压/克隆好的源码目录里运行(sudo bash install.sh)：直接用这份源码，不联网下载(离线安装)
+# 从解压/克隆好的源码目录里运行(sudo bash install.sh)：直接用这份源码，不访问 GitHub(pip 依赖仍需联网或镜像)
 SRC=""
+INPLACE=0   # 源码直接拷进了安装目录、就在那里运行：代码已经在位，不要再去下载
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-  if [[ -f "$_d/server.py" && "$_d" != "$(cd "$DIR" 2>/dev/null && pwd -P || echo "$DIR")" ]]; then
-    SRC="$_d"
+  if [[ -f "$_d/server.py" ]]; then
+    if [[ "$_d" != "$(cd "$DIR" 2>/dev/null && pwd -P || echo "$DIR")" ]]; then SRC="$_d"
+    else INPLACE=1; fi
   fi
 fi
 
@@ -154,6 +156,10 @@ copy_local_src() {
 fetch_code() {
   if [[ -n "$SRC" ]]; then
     copy_local_src
+    return
+  fi
+  if [[ $INPLACE -eq 1 && ! -d "$DIR/.git" ]]; then
+    info "$(L '使用安装目录里现有的源码' 'Using the source already in place')"
     return
   fi
   if [[ -d "$DIR/.git" ]] && command -v git >/dev/null; then
@@ -340,6 +346,13 @@ PY
   systemctl reload caddy 2>/dev/null || systemctl restart caddy
 }
 
+remove_caddy_block() {
+  [[ -f /etc/caddy/Caddyfile ]] && grep -q "$MARK_BEGIN" /etc/caddy/Caddyfile || return 0
+  sed -i "/$MARK_BEGIN/,/$MARK_END/d" /etc/caddy/Caddyfile
+  systemctl reload caddy 2>/dev/null || true
+  warn "$(L '已从 Caddy 里移除本服务的域名站点' 'Removed our site from Caddy')"
+}
+
 configure_mode() {
   PORT="${PORT:-$(port_of)}"
   [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "--port $(L '非法' 'invalid'): $PORT"
@@ -367,6 +380,7 @@ configure_mode() {
       open_firewall 80 443
       ;;
     ip)
+      remove_caddy_block   # 从域名模式切过来：Caddy 还按 http 反代会连不上(后端改成 https 了)
       if [[ -z "$PUBLIC_IP" ]]; then
         PUBLIC_IP="$(detect_ip)"
         # 外部探测全失败时回落到网卡地址：云服务器(NAT)上那是内网 IP，写进证书和地址后
@@ -384,6 +398,7 @@ configure_mode() {
       open_firewall "$PORT"
       ;;
     http)
+      remove_caddy_block
       PUBLIC_IP="${PUBLIC_IP:-$(detect_ip)}"
       warn "$(L '明文 HTTP：只适合内网测试，公网上 token 和密码会被看到' 'Plain HTTP: LAN testing only')"
       cfg_set server.host 0.0.0.0 server.port "$PORT" server.trust_proxy false \
@@ -485,6 +500,16 @@ do_install() {
   # 首次安装没给 --domain：默认 IP 模式。已有配置且没给模式参数：不动现有网络配置
   # (比如原来自己配的 nginx 反代，重跑本脚本只更新代码)
   [[ -z "$MODE" && $fresh -eq 1 ]] && MODE="ip"
+  if [[ -z "$MODE" && -n "$PORT" ]]; then
+    # 已安装、只给了 --port：按现有模式重新配置一遍(域名/IP 从现有地址里取，不重新探测)
+    MODE="$(current_mode)"
+    local host; host="$(cfg_get server public_url | sed -E 's#^[a-z]+://([^/:]+).*#\1#')"
+    case "$MODE" in
+      domain) DOMAIN="$host" ;;
+      ip|http) PUBLIC_IP="$host" ;;
+      *) die "$(L '现有配置看不出部署模式，请同时给 --domain 或 --ip' 'Cannot tell current mode; pass --domain or --ip')" ;;
+    esac
+  fi
   if [[ -n "$MODE" ]]; then configure_mode; fi
   PORT="$(port_of)"
   admin_is_default && set_admin_password
@@ -515,10 +540,7 @@ do_uninstall() {
   systemctl disable --now "$SERVICE" 2>/dev/null || true
   rm -f "/etc/systemd/system/${SERVICE}.service"
   systemctl daemon-reload
-  if [[ -f /etc/caddy/Caddyfile ]] && grep -q "$MARK_BEGIN" /etc/caddy/Caddyfile; then
-    sed -i "/$MARK_BEGIN/,/$MARK_END/d" /etc/caddy/Caddyfile
-    systemctl reload caddy 2>/dev/null || true
-  fi
+  remove_caddy_block
   ok "$(L '服务已卸载' 'Service removed')"
   local a=""
   ask a "$(L "同时删除 $DIR (含数据库和配置，不可恢复)？[y/N] " "Also delete $DIR (data + config)? [y/N] ")" || true

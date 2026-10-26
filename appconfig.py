@@ -75,17 +75,23 @@ def update_settings(patch):
 
 
 def _atomic_json(path, data):
-    """先写 .tmp 再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。
-    .tmp 以 0600 创建(文件里有通知密钥和口令哈希，同机其它用户不可读)。"""
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """先写临时文件再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。
+    临时文件用 mkstemp 新建(随机名 + O_EXCL，0600)：固定名的 .tmp 可能被服务账号预先换成
+    符号链接，root 跑 `sudo python auth.py passwd` 时就会顺着它截断改写系统文件。
+    os.replace 是 rename，目标是符号链接也只替换链接本身。"""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(os.path.abspath(path)))
     try:
-        os.chmod(tmp, 0o600)   # 已存在的旧 .tmp 不受 O_CREAT 的 mode 影响，补一刀
-    except OSError:
-        pass
-    os.replace(tmp, path)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---- 口令覆盖层(网页/命令行改密码) ----

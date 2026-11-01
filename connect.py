@@ -4,9 +4,11 @@
 
 场地端要填三样东西才能上报：云端地址、上报 token、(没有域名时)证书指纹。以前要登服务器
 `cat config.yaml` / `python auth.py token` 才拿得到；现在管理员在网页「场地接入」里看，
-并可一键复制"接入码"——把这三样(加上可选的预分配场地 ID)打包成一行，场地端面板粘贴即可。
+并可一键复制"接入码"——把这些信息、预分配场地 ID 和名称/类型打包成一行。
 
-接入码格式：AMC1-<base64url(JSON {"u": 地址, "t": token, "f": 证书指纹?, "s": 场地ID?})>
+接入码格式：AMC1-<base64url(JSON {"u": 地址, "t": token, "f": 证书指纹?, "s": 场地ID?,
+                                  "n": 场地名?, "y": air|hydro|mixed?})>
+新增字段可选，旧接入码仍有效；旧版场地端会忽略名称/类型，需要在那里手动填写。
 它和 token 一样敏感：只发给场地负责人，别贴群里。
 """
 import base64
@@ -91,12 +93,16 @@ def mode_of(url, info):
     return "ip" if host_is_ip(url) else "domain"
 
 
-def make_code(url, token, fingerprint="", site_id=""):
+def make_code(url, token, fingerprint="", site_id="", site_name="", site_type=""):
     d = {"u": url, "t": token}
     if fingerprint:
         d["f"] = fingerprint
     if site_id:
         d["s"] = site_id
+    if site_name:
+        d["n"] = site_name
+    if site_type:
+        d["y"] = site_type
     raw = json.dumps(d, separators=(",", ":"), ensure_ascii=True).encode()
     return PREFIX + base64.urlsafe_b64encode(raw).decode().rstrip("=")
 

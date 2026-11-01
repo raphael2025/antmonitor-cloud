@@ -4,7 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title data-i18n="doc.title">AntMonitor Cloud</title>
+  <script src="/web/theme.js" data-storage-key="antmonitor_cloud_theme"></script>
   <link rel="stylesheet" href="/web/style.css">
+  <link rel="stylesheet" href="/web/theme.css">
   <!-- Chart.js 放本地(web/vendor)：不依赖外部 CDN(国内常被墙/被劫持即 XSS)，配合 CSP script-src 'self' -->
   <script src="/web/vendor/chart.umd.min.js"></script>
   <script src="/web/i18n/i18n.js"></script>
@@ -27,6 +29,9 @@
           <option value="es">Español</option><option value="de">Deutsch</option><option value="ar">العربية</option>
         </select>
       </div>
+      <div class="theme-row"><label class="theme-label" for="themeSelectLogin">界面主题</label>
+        <select id="themeSelectLogin" class="theme-select" aria-label="界面主题"><option value="system">跟随系统</option><option value="time">按时间自动</option><option value="light">日间</option><option value="dark">夜间</option></select>
+      </div>
       <h2 data-i18n="login.h2">☁ AntMonitor Cloud · 登录</h2>
       <input id="loginUser" data-i18n-placeholder="login.user_ph" placeholder="用户名" autocomplete="username">
       <input id="loginPass" type="password" data-i18n-placeholder="login.pass_ph" placeholder="密码" autocomplete="current-password">
@@ -42,6 +47,7 @@
         <option value="zh">中文</option><option value="en">English</option><option value="ru">Русский</option>
         <option value="es">Español</option><option value="de">Deutsch</option><option value="ar">العربية</option>
       </select>
+      <select id="themeSelect" class="theme-select" aria-label="界面主题"><option value="system">跟随系统</option><option value="time">按时间自动</option><option value="light">日间</option><option value="dark">夜间</option></select>
       <span id="lastUpdate" class="muted" data-i18n="header.loading">加载中…</span>
       <button id="btnUpdate" class="hidden primary" data-i18n-title="header.update_title" title="发现新版本，点击更新并重启"></button>
       <button id="btnConnect" class="hidden" data-i18n="header.connect" data-i18n-title="header.connect_title" title="各场地接入云端要填的地址、上报 token、证书指纹">🔌 场地接入</button>
@@ -243,52 +249,68 @@
         <span style="flex:1"></span>
         <button id="connectClose">×</button>
       </div>
-      <div class="muted" data-i18n="conn.intro">场地端面板「⚙ 网段 → ☁ 云端上报」要填：云端地址、上报 token，以及云端没有域名时的证书指纹。最省事：复制下面的「接入码」，到场地端粘贴后点「填入」。</div>
+      <div class="muted" data-i18n="conn.intro">填写场地名称和类型，生成一份专属接入码。场地端粘贴后即可自动填好上报信息。</div>
       <div id="connWarn" class="conn-warn"></div>
+      <div class="muted conn-current"><span data-i18n="conn.current_url">当前云端：</span><span id="connUrlCurrent"></span></div>
 
-      <h3 data-i18n="conn.addr">云端地址（各场地填这个）</h3>
+      <h3 data-i18n="conn.add_site">添加场地</h3>
       <div class="formrow">
-        <input type="text" id="connUrl" class="wide" spellcheck="false" autocomplete="off" placeholder="https://overview.example.com  /  https://1.2.3.4:8900">
-        <span id="connMode" class="chbadge"></span>
-        <button id="connUrlSave" data-i18n="conn.save_url">保存地址</button>
+        <label class="wide"><span data-i18n="conn.site_name">场地名称</span><input type="text" id="connSiteName" class="wide" maxlength="64" autocomplete="off" data-i18n-placeholder="conn.site_name_ph" placeholder="如：内蒙一场"></label>
+        <label><span data-i18n="conn.site_type">场地类型</span><select id="connSiteType">
+          <option value="air" data-i18n="type.air">风冷</option>
+          <option value="hydro" data-i18n="type.hydro">水冷</option>
+          <option value="mixed" data-i18n="type.mixed">混合</option>
+        </select></label>
       </div>
-      <div class="formrow hidden" id="connFpRow">
-        <label data-i18n="conn.fp">证书指纹(SHA-256)</label>
-        <code id="connFp" class="conn-mono"></code>
-        <button id="connFpCopy" data-i18n="conn.copy">复制</button>
-      </div>
-      <div class="muted hidden" id="connFpHelp" data-i18n="conn.fp_help">没有域名，云端用的是自签证书：场地端必须填这个指纹，按指纹认云端(防冒充/中间人)。浏览器提示"不安全"时，核对证书指纹与此一致再继续。</div>
-
       <h3 data-i18n="conn.pw">管理员密码（查看或更换 token 前验证）</h3>
       <div class="formrow">
         <input type="password" id="connPw" autocomplete="current-password" data-i18n-placeholder="conn.pw_ph" placeholder="输入你的登录密码">
+        <button id="connNewSite" class="primary" data-i18n="conn.new_site">生成专属接入码</button>
       </div>
 
-      <h3 data-i18n="conn.shared">共享上报 token（所有场地通用）</h3>
-      <div class="formrow">
-        <span id="connShared" class="muted"></span>
-        <button id="connSharedShow" data-i18n="conn.show">查看 / 接入码</button>
-        <button id="connSharedRotate" data-i18n="conn.rotate">更换</button>
-        <button id="connSharedRevoke" class="danger" data-i18n="conn.disable">停用</button>
+      <div id="connResult" class="conn-result hidden">
+        <div class="conn-warn" data-i18n="conn.secret_warn">⚠ 接入码含专属凭据，只发给对应场地负责人。2 分钟后隐藏，凭据不会因此失效。</div>
+        <div id="connResultFor" class="conn-result-for"></div>
+        <div class="formrow"><label data-i18n="conn.code">接入码</label><input type="text" id="connCode" class="wide" readonly><button id="connCodeCopy" data-i18n="conn.copy">复制</button></div>
+        <p class="muted" data-i18n="conn.existing_help">场地端已安装：打开「⚙ 网段 → ☁ 云端上报」，粘贴接入码并点「测试并保存」。云端收到首次上报后才算接入完成。</p>
+        <h3 data-i18n="conn.install_title">场地端还没安装？</h3>
+        <div class="formrow"><label><span data-i18n="conn.install_os">场地电脑系统</span><select id="connInstallOs"><option value="linux">Ubuntu / Linux</option><option value="windows">Windows</option></select></label></div>
+        <p class="muted" id="connInstallHelp"></p>
+        <div class="conn-install-command"><div><strong>GitHub</strong><button id="connInstallGithubCopy" data-i18n="conn.copy_install">复制安装命令</button></div><code id="connInstallGithub"></code></div>
+        <div class="conn-install-command"><div><strong>Gitee</strong><button id="connInstallGiteeCopy" data-i18n="conn.copy_install">复制安装命令</button></div><code id="connInstallGitee"></code></div>
+        <details class="conn-raw-token" id="connRawToken"><summary data-i18n="conn.raw_token">单独查看 token（高级）</summary><div class="formrow"><label>token</label><input type="text" id="connTok" class="wide" readonly><button id="connTokCopy" data-i18n="conn.copy">复制</button></div></details>
       </div>
+      <div id="connMsg" class="notifymsg muted" role="status" aria-live="polite"></div>
 
-      <h3 data-i18n="conn.per">场地专属 token（推荐：一个场地泄露不影响其它场地）</h3>
-      <div class="formrow">
-        <button id="connNewSite" class="primary" data-i18n="conn.new_site">＋ 新场地：生成专属接入码</button>
-        <label><input type="checkbox" id="connAutoReg"> <span data-i18n="conn.auto_reg">允许新场地用共享 token 自动注册</span></label>
-      </div>
+      <h3 data-i18n="conn.sites_title">已分配的场地</h3>
       <div class="tablewrap"><table class="mini" id="tblConnSites">
         <thead><tr><th data-i18n="conn.col_site">场地</th><th>ID</th><th data-i18n="conn.col_token">专属 token</th><th data-i18n="conn.col_ops">操作</th></tr></thead>
         <tbody></tbody>
       </table></div>
 
-      <div id="connResult" class="conn-result hidden">
-        <div class="conn-warn" data-i18n="conn.secret_warn">⚠ 下面含上报 token：只发给场地负责人，别贴群里、别截图外传。2 分钟后自动隐藏。</div>
-        <div id="connResultFor" class="muted"></div>
-        <div class="formrow"><label data-i18n="conn.code">接入码</label><input type="text" id="connCode" class="wide" readonly><button id="connCodeCopy" data-i18n="conn.copy">复制</button></div>
-        <div class="formrow"><label>token</label><input type="text" id="connTok" class="wide" readonly><button id="connTokCopy" data-i18n="conn.copy">复制</button></div>
-      </div>
-      <div id="connMsg" class="notifymsg muted" role="status"></div>
+      <details id="connAdvanced" class="conn-advanced">
+        <summary data-i18n="conn.advanced">高级管理：云端地址、证书和共享 token</summary>
+        <h3 data-i18n="conn.addr">云端地址（各场地填这个）</h3>
+        <div class="formrow">
+          <input type="text" id="connUrl" class="wide" spellcheck="false" autocomplete="off" placeholder="https://overview.example.com  /  https://1.2.3.4:8900">
+          <span id="connMode" class="chbadge"></span>
+          <button id="connUrlSave" data-i18n="conn.save_url">保存地址</button>
+        </div>
+        <div class="formrow hidden" id="connFpRow">
+          <label data-i18n="conn.fp">证书指纹(SHA-256)</label>
+          <code id="connFp" class="conn-mono"></code>
+          <button id="connFpCopy" data-i18n="conn.copy">复制</button>
+        </div>
+        <div class="muted hidden" id="connFpHelp" data-i18n="conn.fp_help">没有域名，云端用的是自签证书：场地端必须填这个指纹，按指纹认云端(防冒充/中间人)。浏览器提示"不安全"时，核对证书指纹与此一致再继续。</div>
+        <h3 data-i18n="conn.shared">共享上报 token（所有场地通用）</h3>
+        <div class="formrow">
+          <span id="connShared" class="muted"></span>
+          <button id="connSharedShow" data-i18n="conn.show">查看 / 接入码</button>
+          <button id="connSharedRotate" data-i18n="conn.rotate">更换</button>
+          <button id="connSharedRevoke" class="danger" data-i18n="conn.disable">停用</button>
+        </div>
+        <label><input type="checkbox" id="connAutoReg"> <span data-i18n="conn.auto_reg">允许新场地用共享 token 自动注册</span></label>
+      </details>
     </div>
   </div>
 

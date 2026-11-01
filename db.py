@@ -420,4 +420,7 @@ def site_exists(conn, site_id):
 
 
 def site_count(conn):
-    return conn.execute("SELECT COUNT(*) FROM sites").fetchone()[0]
+    # 单连接跨线程共享：COUNT 的 execute + fetchone 也必须与其它 COUNT/审计写入串行，
+    # 否则并发复用 SQLite 语句时可能得到空行或错误计数，导致新场地接入失败。
+    with _lock:
+        return conn.execute("SELECT COUNT(*) FROM sites").fetchone()[0]

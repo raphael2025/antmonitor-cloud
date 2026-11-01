@@ -5,18 +5,24 @@
 #   curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- --domain overview.example.com
 # 没有域名(用公网 IP + 自签证书，场地端按证书指纹认云端)：
 #   curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash
+# Gitee 一键安装（有域名时再加 --domain 域名）：
+#   curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | sudo bash -s -- --source gitee
 #
 # 再跑一次同样的命令 = 更新(保留配置和数据)。其它：
 #   ... | sudo bash -s -- update            只更新代码和依赖
 #   ... | sudo bash -s -- info              显示面板地址/证书指纹/服务状态
 #   ... | sudo bash -s -- reset-password    重设 admin 密码
 #   ... | sudo bash -s -- uninstall         卸载服务(数据目录默认保留)
-# 选项：--domain 域名 | --ip 公网IP | --port 端口(默认 8900) | --dir 安装目录 | --branch 分支
+# 选项：--source github|gitee | --domain 域名 | --ip 公网IP | --port 端口(默认 8900) | --dir 安装目录 | --branch 分支
 #       --http(仅内网测试：不加密) | --lang zh|en
 # 环境变量：GH_PROXY=https://镜像前缀/  访问 GitHub 很慢时用(镜像能看到并篡改下载内容，只用信得过的)
+#           ANTCLOUD_SOURCE=github|gitee 与 --source 等效；不指定时保留已有 Git origin
 set -euo pipefail
 
 REPO="${ANTCLOUD_REPO:-raphael2025/antmonitor-cloud}"
+SOURCE="${ANTCLOUD_SOURCE:-github}"
+SOURCE_EXPLICIT=0
+[[ -n "${ANTCLOUD_SOURCE:-}" ]] && SOURCE_EXPLICIT=1
 BRANCH="${ANTCLOUD_BRANCH:-master}"
 DIR="${ANTCLOUD_HOME:-/opt/antmonitor-cloud}"
 SERVICE="antmonitor-cloud"
@@ -38,6 +44,9 @@ case "${LANG:-}" in zh*) LANG_CODE="zh" ;; esac
 while [[ $# -gt 0 ]]; do
   case "$1" in
     install|update|uninstall|reset-password|info) ACTION="$1" ;;
+    --source)
+      [[ $# -ge 2 ]] || { echo '--source requires github or gitee' >&2; exit 2; }
+      SOURCE="$2"; SOURCE_EXPLICIT=1; shift ;;
     --domain) DOMAIN="${2:-}"; MODE="domain"; shift ;;
     --ip) PUBLIC_IP="${2:-}"; [[ -z "$MODE" ]] && MODE="ip"; shift ;;
     --port) PORT="${2:-}"; shift ;;
@@ -52,7 +61,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -z "$LANG_CODE" ]] && LANG_CODE="zh"
 
-# 从解压/克隆好的源码目录里运行(sudo bash install.sh)：直接用这份源码，不访问 GitHub(pip 依赖仍需联网或镜像)
+# 未显式选择 --source 时，从解压/克隆目录运行会直接使用本地源码(pip 依赖仍需联网或镜像)
 SRC=""
 INPLACE=0   # 源码直接拷进了安装目录、就在那里运行：代码已经在位，不要再去下载
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -70,6 +79,12 @@ info() { echo "${CYN}→${RST} $*"; }
 ok()   { echo "${GRN}✓${RST} $*"; }
 warn() { echo "${YLW}!${RST} $*"; }
 die()  { echo "${RED}✗${RST} $*" >&2; exit 1; }
+
+case "$SOURCE" in
+  github) REPO_URL="${GH_PROXY}https://github.com/${REPO}.git" ;;
+  gitee) REPO_URL="https://gitee.com/raphael01/antmonitor-cloud.git" ;;
+  *) die "$(L '--source 只支持 github 或 gitee' '--source must be github or gitee')" ;;
+esac
 
 # curl | bash 时标准输入是脚本本身：交互一律走 /dev/tty，没有终端(cloud-init 等)就用默认值
 has_tty() { ( exec </dev/tty ) 2>/dev/null; }
@@ -114,11 +129,17 @@ install_packages() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq || warn "apt-get update $(L '失败，继续尝试' 'failed, continuing')"
     apt-get install -y -qq python3 python3-venv python3-pip curl ca-certificates openssl tar >/dev/null
-    apt-get install -y -qq git >/dev/null 2>&1 || warn "$(L 'git 装不上，改用源码包下载(网页一键更新不可用，可再跑本命令更新)' 'git unavailable; using tarball download')"
+    if ! apt-get install -y -qq git >/dev/null 2>&1 && ! command -v git >/dev/null; then
+      [[ "$SOURCE" != "gitee" ]] || die "$(L 'Gitee 安装需要 Git；请检查系统软件源后重试' 'Gitee requires Git; check the package repositories and retry')"
+      warn "$(L 'git 装不上，改用源码包下载(网页一键更新不可用，可再跑本命令更新)' 'git unavailable; using tarball download')"
+    fi
   elif command -v dnf >/dev/null || command -v yum >/dev/null; then
     local pm; pm="$(command -v dnf || command -v yum)"
     "$pm" install -y -q python3 python3-pip curl ca-certificates openssl tar >/dev/null
-    "$pm" install -y -q git >/dev/null 2>&1 || warn "$(L 'git 装不上，改用源码包下载' 'git unavailable; using tarball')"
+    if ! "$pm" install -y -q git >/dev/null 2>&1 && ! command -v git >/dev/null; then
+      [[ "$SOURCE" != "gitee" ]] || die "$(L 'Gitee 安装需要 Git；请检查系统软件源后重试' 'Gitee requires Git; check the package repositories and retry')"
+      warn "$(L 'git 装不上，改用源码包下载' 'git unavailable; using tarball')"
+    fi
   else
     die "$(L '只支持 apt / dnf / yum 系统' 'Only apt/dnf/yum based systems are supported')"
   fi
@@ -129,7 +150,34 @@ install_packages() {
 # ---------- 代码 ----------
 git_dir() { as_svc git -C "$DIR" "$@"; }
 
+official_origin() {
+  local url="${1%/}"
+  url="${url%.git}"
+  case "$url" in
+    https://github.com/raphael2025/antmonitor-cloud|git@github.com:raphael2025/antmonitor-cloud|ssh://git@github.com/raphael2025/antmonitor-cloud|\
+    https://gitee.com/raphael01/antmonitor-cloud|git@gitee.com:raphael01/antmonitor-cloud|ssh://git@gitee.com/raphael01/antmonitor-cloud)
+      return 0 ;;
+  esac
+  [[ -n "$GH_PROXY" && "$url" == "${GH_PROXY}https://github.com/raphael2025/antmonitor-cloud" ]]
+}
+
+select_origin() {
+  [[ "$SOURCE_EXPLICIT" -eq 1 ]] || return 0
+  local current
+  current="$(git_dir remote get-url origin)" \
+    || die "$(L '没有 origin，无法选择更新来源；请先配置 Git 远端' 'No origin; configure the Git remote before selecting a source')"
+  [[ "$current" != "$REPO_URL" ]] || return 0
+  official_origin "$current" \
+    || die "$(L '当前 origin 是自定义仓库，未自动改写；请手动确认远端，或不指定 --source' 'Custom origin was not changed; configure it manually or omit --source')"
+  git_dir remote set-url origin "$REPO_URL" \
+    || die "$(L '无法切换 Git 更新来源' 'Could not change the Git source')"
+  info "$(L '已选择代码来源' 'Selected source'): $SOURCE"
+}
+
 fetch_tarball() {
+  # Gitee 的公开 archive URL 可能返回登录/下载页面；只使用 Git 获取源码。
+  [[ "$SOURCE" != "gitee" ]] \
+    || die "$(L 'Gitee 下载需要 Git；请安装 Git 并检查 Gitee 连接后重试' 'Gitee requires Git; install Git and check Gitee access before retrying')"
   local tmp url
   tmp="$(mktemp -d)"
   url="${GH_PROXY}https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
@@ -154,23 +202,25 @@ copy_local_src() {
 }
 
 fetch_code() {
-  if [[ -n "$SRC" ]]; then
+  if [[ "$SOURCE_EXPLICIT" -eq 0 && -n "$SRC" ]]; then
     copy_local_src
     return
   fi
-  if [[ $INPLACE -eq 1 && ! -d "$DIR/.git" ]]; then
+  if [[ "$SOURCE_EXPLICIT" -eq 0 && $INPLACE -eq 1 && ! -d "$DIR/.git" ]]; then
     info "$(L '使用安装目录里现有的源码' 'Using the source already in place')"
     return
   fi
-  if [[ -d "$DIR/.git" ]] && command -v git >/dev/null; then
+  if [[ -d "$DIR/.git" ]]; then
+    command -v git >/dev/null \
+      || die "$(L '现有安装是 Git 仓库，请安装 Git 后重试，避免覆盖更新来源' 'This installation is a Git checkout; install Git before updating')"
+    select_origin
     info "$(L '更新代码' 'Updating code') (git, $BRANCH)"
     if git_dir fetch -q origin "$BRANCH" && git_dir merge -q --ff-only FETCH_HEAD; then
       return
     fi
-    warn "$(L 'git 更新失败(网络或本地有改动)，代码保持不变' 'git update failed; code unchanged')"
-    return
+    die "$(L 'git 更新失败，请检查所选仓库的连接、分支和本地改动' 'git update failed; check source access, branch and local changes')"
   fi
-  if [[ -f "$DIR/server.py" ]]; then   # 以前用源码包装的：继续用源码包覆盖更新
+  if [[ -f "$DIR/server.py" && "$SOURCE" != "gitee" ]]; then   # GitHub 源码包安装沿用原更新方式
     fetch_tarball
     return
   fi
@@ -178,7 +228,7 @@ fetch_code() {
     info "$(L '下载代码' 'Cloning') (git clone)"
     local tmpc; tmpc="$(mktemp -d)"
     # 先克隆到临时目录：目标目录可能已存在且有别的东西，失败了也绝不能 rm -rf 它
-    if git clone -q --branch "$BRANCH" "${GH_PROXY}https://github.com/${REPO}.git" "$tmpc/src"; then
+    if git clone -q --branch "$BRANCH" "$REPO_URL" "$tmpc/src"; then
       prepare_dir
       give_tmp "$tmpc"
       as_svc cp -a "$tmpc/src"/. "$DIR"/
@@ -186,6 +236,8 @@ fetch_code() {
       return
     fi
     rm -rf "$tmpc"
+    [[ "$SOURCE" != "gitee" ]] \
+      || die "$(L 'Gitee 克隆失败，请检查仓库连接和分支后重试；不会切换到 GitHub' 'Gitee clone failed; check access and branch. GitHub will not be used')"
     warn "$(L 'git clone 失败，改用源码包' 'git clone failed; trying tarball')"
   fi
   fetch_tarball
@@ -538,7 +590,9 @@ do_install() {
 
 do_update() {
   [[ -f "$DIR/server.py" ]] || die "$(L '还没安装' 'Not installed'): $DIR"
-  command -v python3 >/dev/null || install_packages
+  if ! command -v python3 >/dev/null || { [[ "$SOURCE" == "gitee" ]] && ! command -v git >/dev/null; }; then
+    install_packages
+  fi
   create_user
   fix_owner
   fetch_code

@@ -5,22 +5,45 @@
 ## 1. 云服务器要求
 
 - 任意 Linux 云主机即可（Ubuntu 20.04+/Debian 11+/CentOS Stream 等），**1核1G 都绰绰有余**（10 场地 ≈ 43 万行/月 SQLite）。
-- 不需要提前装 git / Python，一键脚本会装。
+- GitHub / Gitee 均提供一键安装，脚本自动准备 Git / Python，无需手动克隆仓库。
 - 入方向放行：**有域名**放行 TCP 80、443；**没有域名**放行 TCP 8900（或 `--port` 指定的端口）。
 - 各场地只需要**能访问公网**（出方向），不需要公网 IP / 端口映射。
 
-## 2. 一键部署（推荐）
+## 2. 部署（GitHub / Gitee）
+
+按网络情况选择下载源，再按有无域名选一条命令。示例域名替换为实际域名。
+
+### GitHub 一键部署
 
 ```bash
 # A. 有域名：域名 A 记录先指向本服务器
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- --domain overview.example.com
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- --source github --domain overview.example.com
 
 # B. 没有域名：用公网 IP(自动探测，探测不准用 --ip 指定) + 自签证书
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- --source github
 ```
 
-脚本做的事：装系统依赖 → 下载代码到 `/opt/antmonitor-cloud`（有 git 用 git clone，网页「🔄 更新」可用；
-没有 git 下载源码包）→ 建 venv 装依赖 → 生成 `config.yaml`（600 权限，上报/取数 token 随机生成）→
+### Gitee 一键部署
+
+```bash
+# A. 有域名：域名 A 记录先指向本服务器
+curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | sudo bash -s -- --source gitee --domain overview.example.com
+
+# B. 没有域名：自动探测公网 IP，使用自签 HTTPS
+curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | sudo bash -s -- --source gitee
+
+# B 的替代：明确指定公网 IPv4，请替换占位内容
+curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | sudo bash -s -- --source gitee --ip 你的公网IPv4
+```
+
+B 的两条命令选择一条即可。Gitee 模式会自动安装 Git，并从 Gitee 克隆源码；
+安装 Git 或拉取失败时停止并显示错误，不会改从 GitHub 下载。
+仓库归档下载页可能返回 HTML，Gitee 模式使用 Git 拉取，不把该页面当作 tar.gz / ZIP 解包。
+
+### 安装结果与网络模式
+
+脚本做的事：装系统依赖 → 从所选平台下载代码到 `/opt/antmonitor-cloud` → 建 venv 装依赖 →
+生成 `config.yaml`（600 权限，上报/取数 token 随机生成）→
 设置 admin 密码（终端里输入；直接回车 = 随机生成并在结尾显示一次）→ 按模式配置 HTTPS →
 建系统用户 `antcloud` 和 systemd 服务 `antmonitor-cloud`（NoNewPrivileges / ProtectSystem / ProtectHome）→ 启动并自检。
 
@@ -35,26 +58,63 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master
 - **为什么无域名也要 HTTPS**：明文 HTTP 下 token、登录密码、Cookie 全在网上裸奔。自签证书 + 场地端钉指纹，
   中间人拿不到私钥就冒充不了云端，安全性不比买证书差（场地端按指纹认，不看 CA）。
 - **国内服务器 + 域名须 ICP 备案**，否则云厂商会拦截 80/443，证书也申请不下来——没备案用 B。
-- 公网 IP 变了：重跑 `curl … | sudo bash -s -- --ip 新IP`，会重新生成证书（指纹变，各场地要更新）。
+- 公网 IP 变了：用同一下载源重跑安装命令并追加 `--ip 新IP`（Gitee 保留 `--source gitee`），会重新生成证书，场地端需更新证书指纹。
 - 80/443 已被 nginx/apache 占用时脚本会停下：要么停掉它，要么按 §3 自己配反代。
 
-其它命令（都是同一个脚本）：
+### 更新与日常管理
+
+更新代码、Python 依赖并重启服务，按希望使用的来源选一条：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash                          # 再跑一次 = 更新(保留配置/数据/证书)
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- update             # 只更新代码和依赖
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- info               # 面板地址 / 证书指纹 / 服务状态
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- reset-password     # 重设 admin 密码
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- uninstall          # 卸载服务(数据目录默认保留)
+# GitHub
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo bash -s -- update --source github
+
+# Gitee
+curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | sudo bash -s -- update --source gitee
 ```
 
-选项：`--port 端口`、`--dir 安装目录`、`--branch 分支`、`--http`（明文，仅内网测试）、`--lang en`。
-GitHub 访问慢：`curl -fsSL <镜像前缀>/https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh | sudo GH_PROXY=<镜像前缀>/ bash`（镜像能看到并篡改下载内容，只用信得过的）。
-连不上 GitHub：把源码目录拷到服务器(任意位置，或直接拷成 `/opt/antmonitor-cloud`)，在目录里 `sudo bash install.sh`（直接用这份源码；Python 依赖仍需能访问 PyPI 或国内镜像）。
+`update` 保留配置、数据库和证书。默认脚本安装可直接用本地脚本查看状态、重设 admin 密码或卸载服务：
 
-服务管理：`systemctl status antmonitor-cloud`、`journalctl -u antmonitor-cloud -f`。
+```bash
+sudo bash /opt/antmonitor-cloud/install.sh info
+sudo bash /opt/antmonitor-cloud/install.sh reset-password
+sudo bash /opt/antmonitor-cloud/install.sh uninstall
+```
+
+卸载服务时会另行询问是否删除数据目录，默认保留。服务日志见 `journalctl -u antmonitor-cloud -f`。
+
+可用选项：`--source github|gitee`、`--port 端口`、`--dir 安装目录`、`--branch 分支`、
+`--http`（明文，仅内网测试）、`--lang en`。云端生产分支是 `master`，场地端是 `main`，不要混用。
+自定义安装目录时，每次安装/更新/管理都传入相同的 `--dir`，本地脚本路径也改为该目录。
+
+Gitee 负责源码下载与 Git 更新；系统软件、Python 依赖、Caddy 和域名证书申请仍需相应网络访问。
+GitHub 模式也可使用可信的 `GH_PROXY` 镜像前缀。选择 Gitee 请直接用 `--source gitee`，
+不要把 Gitee 仓库 URL 填入 `GH_PROXY` 或 GitHub `owner/repo` 参数。
+
+### 已有安装切换到 Gitee
+
+适用于已有官方 GitHub / Gitee Git 部署。先保存本地代码改动，并确认两个平台拥有相同提交历史。
+然后直接执行 Gitee 的一行更新命令：
+
+```bash
+curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | sudo bash -s -- update --source gitee
+```
+
+显式 `--source gitee` 会把已有官方仓库的 `origin` 切换到 Gitee，再更新代码、依赖并重启；
+网页更新随后使用这一来源。默认安装可核对：
+
+```bash
+sudo -u antcloud git -C /opt/antmonitor-cloud remote get-url origin
+# 应显示 https://gitee.com/raphael01/antmonitor-cloud.git
+```
+
+原来不带 `--source` 的命令仍兼容：新装默认 GitHub，已有 Git 部署继续使用原 `origin`。自维护仓库或 fork 会被拒绝自动换源，
+应由维护者确认来源，或省略 `--source` 沿用原仓库。若提示无法快进，请检查分支历史和本地改动，不要强制覆盖。
+切换部署机的来源不会同步两个托管平台；发布者仍需维护镜像，见[GitHub 与 Gitee 同步](#github-与-gitee-同步)。
 
 ### 手动部署（不用一键脚本时）
+
+下面的克隆地址可替换为 `https://gitee.com/raphael01/antmonitor-cloud.git`，后续步骤相同。
 
 ```bash
 cd /opt && git clone https://github.com/raphael2025/antmonitor-cloud.git && cd antmonitor-cloud
@@ -175,22 +235,30 @@ alerts:
 
 ## 6. 更新与发布（git 更新器）
 
-本地开发 → push 到 git 远端 → 已部署的云端/场地端**检测并更新**（手动或自动），
-配置和数据永远不被更新触碰（config.yaml/数据库都在 .gitignore 里）。
+本地开发 → push 到 git 远端 → 已部署的云端/场地端**检测并更新**（手动或自动）。
+更新来源由安装目录的 `origin` 决定；配置和数据库通过 `.gitignore` 排除，更新前仍应保存本地代码改动。
 
-### 一次性准备
+### 选择发布源
 
-1. 建一个**私有** git 仓库（Gitee/GitHub 私有仓库，或云服务器上 `git init --bare /srv/git/main.git` 走 SSH）。
-   ⚠ 必须私有——代码里虽无密钥，但架构/接口属敏感信息。
-2. 开发机（本机）：`git remote add origin <仓库地址> && git push -u origin master`
-3. 部署机改用 git 部署：`git clone <仓库地址> /opt/cloud-overview`，
-   `cp config.example.yaml config.yaml` 填好配置再启动。
-   （已在跑的老部署：`git init && git remote add origin <地址> && git fetch &&
-   git reset --hard origin/master`，config.yaml 因被 ignore 不受影响）
+1. 使用官方公开仓库即可：[GitHub](https://github.com/raphael2025/antmonitor-cloud) 或 [Gitee](https://gitee.com/raphael01/antmonitor-cloud)，不需要另建私有仓库。首次安装与已有部署切换来源见 §2。
+2. 自行修改代码时，可使用自己的 GitHub/Gitee 仓库或自建 Git 服务；部署机需要能读取所选远端。
+3. 同时维护 GitHub 和 Gitee 时，发布者需将同一版本同步到两个仓库。部署机和网页更新器只检查自己的 `origin`，不会在两个平台之间自动切换。
+
+### GitHub 与 Gitee 同步
+
+推荐以 GitHub 为主库，在 Gitee「管理 → 仓库镜像管理」中配置 **Pull（GitHub → Gitee）自动镜像**。
+平台是否为当前账户/仓库开放镜像功能，以管理入口和权限为准；需要按提示授权 GitHub 仓库并配置自动同步。
+**导入仓库不等于已经开启自动同步**，未配置镜像时，后续 GitHub 提交不会仅因曾经导入就持续同步。
+
+官方说明：[Gitee 仓库镜像管理](https://help.gitee.com/repository/settings/sync-between-gitee-github) ·
+[2026 年官方介绍](https://blog.gitee.com/2026/01/23/github-gitee-mirror-sync-one-commit-two-repos/)。
+自动 Pull 使用 GitHub webhook 触发；官方的 5 分钟是最短触发间隔，不是默认每 5 分钟轮询。
+如没有自动镜像入口，发布者也可将**同一提交**分别推送到 GitHub 和 Gitee；不要在两边分别修改出不同历史。
+发布后核对云端 `master`、场地端 `main` 的提交一致，再通知部署机更新。使用本项目公开仓库即可，无需另外建立私有仓库。
 
 ### 分支模型与发布流程（日常）
 
-`dev` 分支开发迭代，`master` 主支 = 生产（全部部署机跟踪它）。
+以下以云端为例：`dev` 分支开发迭代，`master` 主支 = 生产。场地端的生产分支为 `main`，不要混用。
 历史提交天然就是"所有旧版本"，回退不需要专门的备份分支。
 
 ```bash
@@ -220,7 +288,7 @@ git revert -m 1 HEAD && git push origin master   # 反向提交往前推，部�
 - **⚠ 红线：master 永远禁止 `git push --force` / `reset --hard` 后强推**——部署机只做
   快进合并，主支历史被改写后所有部署机快进失败、集体卡住不更新。回退一律用
   `git revert`（见上），它是"往前滚"的回退，与自动更新完美兼容。
-- 只做**快进合并**（部署机本地有改动/分叉直接拒绝，不会丢东西）
+- 只做**快进合并**，分叉历史会被拒绝；这不能代替保存本地代码改动，更新前先检查 `git status`
 - 更新后全量 `py_compile` 自检，**语法错误自动回滚**到原版本，绝不带病重启
 - 重启交给守护进程（云端 systemd；场地端 NSSM 或 `run.bat` 循环）
 - **灰度习惯**：先只给一个试点场地开 `update.auto`（或手动先更它），推完看云端面板
@@ -273,7 +341,7 @@ git revert -m 1 HEAD && git push origin master   # 反向提交往前推，部�
 - [ ] `server.host: "127.0.0.1"` 或防火墙拦截 8900，外部只能走 443
 - [ ] `config.yaml` / `cloud_settings.json` 权限 600
 - [ ] 每个场地发专属接入码（「🔌 场地接入 → ＋ 新场地」），全部发完后关闭自动注册并停用共享 token
-- [ ] 开了 `update.auto` 的话：GitHub 账号开两步验证，生产只跟踪受保护的分支
+- [ ] 开了 `update.auto` 的话：GitHub/Gitee 账号开两步验证，生产只跟踪受保护的分支
 - [ ] 外部看门狗已盯 `/api/health`
 - [ ] 确认：本服务对场地零控制能力（只收数），无需给它任何场地内网权限
 

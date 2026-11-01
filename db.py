@@ -43,9 +43,31 @@ CREATE TABLE IF NOT EXISTS site_customers(
   uptime_pct REAL,
   delivered_th_h REAL,
   power_kwh REAL,
+  hashrate_ths REAL,                   -- 最新扫描的实际算力合计(TH/s)，未知为 NULL
+  avg_hashrate_ths REAL,               -- 已观测时间的加权平均(TH/s)，不是累计 TH·h
+  hashrate_hours REAL,                 -- 平均值请求窗口；不能拿报表的旧截断时长替代
+  observed_hours REAL,                -- 平均值实际覆盖的时长(非机器小时)
+  coverage_pct REAL,
+  hashrate_ts INTEGER,                -- 场地扫描时间(不是云端收到报表的时间)
+  current_machines INTEGER,
   hours INTEGER,
   updated_ts INTEGER,
   PRIMARY KEY(site_id, worker)
+);
+
+-- 轻量实时算力随摘要每分钟同步，与每十分钟一次的历史报表分开，避免慢报表覆盖新扫描。
+CREATE TABLE IF NOT EXISTS site_customer_current(
+  site_id TEXT NOT NULL,
+  worker TEXT NOT NULL,
+  machines INTEGER,
+  hashrate_ths REAL,
+  hashrate_ts INTEGER,
+  PRIMARY KEY(site_id, worker)
+);
+CREATE TABLE IF NOT EXISTS site_customer_current_state(
+  site_id TEXT PRIMARY KEY,
+  scan_ts INTEGER NOT NULL,
+  updated_ts INTEGER NOT NULL
 );
 
 -- 场地活跃告警摘要最新一份(整表替换)：按类型分组，不含单机IP，只标受影响客户+台数，
@@ -144,6 +166,14 @@ def connect(path):
     conn.execute("PRAGMA synchronous=NORMAL")
     _migrate_v1(conn)
     conn.executescript(SCHEMA)
+    # 旧报表只包含累计算力，不能用累计值伪造实时/平均算力；新增列保持 NULL。
+    customer_cols = {r[1] for r in conn.execute("PRAGMA table_info(site_customers)")}
+    for column, kind in (("hashrate_ths", "REAL"), ("avg_hashrate_ths", "REAL"),
+                         ("hashrate_hours", "REAL"), ("observed_hours", "REAL"),
+                         ("coverage_pct", "REAL"), ("hashrate_ts", "INTEGER"),
+                         ("current_machines", "INTEGER")):
+        if column not in customer_cols:
+            conn.execute(f"ALTER TABLE site_customers ADD COLUMN {column} {kind}")
     conn.commit()
     return conn
 
@@ -209,12 +239,40 @@ def replace_customers(conn, site_id, customers, hours):
         conn.execute("DELETE FROM site_customers WHERE site_id=?", (site_id,))
         conn.executemany(
             "INSERT OR REPLACE INTO site_customers"
-            "(site_id,worker,machines,uptime_pct,delivered_th_h,power_kwh,hours,updated_ts)"
-            " VALUES(?,?,?,?,?,?,?,?)",
+            "(site_id,worker,machines,uptime_pct,delivered_th_h,power_kwh,"
+            "hashrate_ths,avg_hashrate_ths,hashrate_hours,observed_hours,coverage_pct,"
+            "hashrate_ts,current_machines,hours,updated_ts)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(site_id, str(c.get("worker") or "(未知)")[:128], c.get("machines") or 0,
               c.get("uptime_pct"), c.get("delivered_th_h"), c.get("power_kwh"),
+              c.get("hashrate_ths"), c.get("avg_hashrate_ths"), c.get("hashrate_hours"),
+              c.get("observed_hours"), c.get("coverage_pct"), c.get("hashrate_ts"),
+              c.get("current_machines"),
               hours, now) for c in customers])
         conn.commit()
+
+
+def replace_customer_hashrates(conn, site_id, rows, scan_ts):
+    """替换一轮完整扫描的客户实时值；旧扫描不能倒退/复活已离场客户，空列表也是有效扫描。"""
+    if not scan_ts:
+        return False
+    now = int(time.time())
+    with _lock:
+        old = conn.execute("SELECT scan_ts FROM site_customer_current_state WHERE site_id=?",
+                           (site_id,)).fetchone()
+        if old and old["scan_ts"] > scan_ts:
+            return False
+        conn.execute("DELETE FROM site_customer_current WHERE site_id=?", (site_id,))
+        conn.executemany(
+            "INSERT INTO site_customer_current(site_id,worker,machines,hashrate_ths,hashrate_ts)"
+            " VALUES(?,?,?,?,?)",
+            [(site_id, c["worker"], c.get("machines"), c.get("hashrate_ths"),
+              c.get("hashrate_ts") or scan_ts) for c in rows])
+        conn.execute("INSERT INTO site_customer_current_state(site_id,scan_ts,updated_ts)"
+                     " VALUES(?,?,?) ON CONFLICT(site_id) DO UPDATE SET "
+                     "scan_ts=excluded.scan_ts,updated_ts=excluded.updated_ts", (site_id, scan_ts, now))
+        conn.commit()
+    return True
 
 
 def replace_alert_summary(conn, site_id, groups):
@@ -251,20 +309,56 @@ def get_alert_summary(conn, site_id):
 
 
 def customers(conn, site_id=None):
-    """客户明细，带场地显示名(site_name, 场地未注册时回退 site_id)。"""
+    """历史报表叠加独立完整扫描；首份历史报表到达前也能看到实时客户。"""
     q = ("SELECT c.*, COALESCE(NULLIF(m.name_override, ''), s.name, c.site_id) AS site_name"
          " FROM site_customers c LEFT JOIN sites s ON s.id = c.site_id"
          " LEFT JOIN site_management m ON m.site_id = c.site_id")
-    if site_id:
-        rows = conn.execute(q + " WHERE c.site_id=? ORDER BY c.machines DESC", (site_id,)).fetchall()
-    else:
-        rows = conn.execute(q + " ORDER BY site_name, c.machines DESC").fetchall()
-    return [dict(r) for r in rows]
+    live_q = q.replace("site_customers c", "site_customer_current c")
+    where, args = (" WHERE c.site_id=?", (site_id,)) if site_id else ("", ())
+    with _lock:
+        rows = conn.execute(q + where, args).fetchall()
+        current = conn.execute(live_q + where, args).fetchall()
+        states = conn.execute("SELECT * FROM site_customer_current_state" +
+                              (" WHERE site_id=?" if site_id else ""), args).fetchall()
+    state_map = {r["site_id"]: dict(r) for r in states}
+    out = {(r["site_id"], r["worker"]): dict(r) for r in rows}
+    current_keys = {(r["site_id"], r["worker"]) for r in current}
+
+    def machine_count(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    for key, r in out.items():
+        r["hashrate_updated_ts"] = r.get("updated_ts")
+        r["hashrate_source"] = "report" if r.get("hashrate_ts") else "legacy"
+        state = state_map.get(r["site_id"])
+        if state and key not in current_keys:
+            # 完整新扫描里没有该客户：当前无机器，不能把历史机器/算力当作现在仍在运行。
+            r.update(current_machines=0, hashrate_ths=0.0, hashrate_ts=state["scan_ts"],
+                     hashrate_updated_ts=state["updated_ts"], hashrate_source="summary")
+    for c in current:
+        key = (c["site_id"], c["worker"])
+        r = out.setdefault(key, {"site_id": c["site_id"], "worker": c["worker"],
+                                "site_name": c["site_name"], "machines": c["machines"] or 0,
+                                "uptime_pct": None, "delivered_th_h": None, "power_kwh": None,
+                                "hours": None, "updated_ts": None, "avg_hashrate_ths": None,
+                                "hashrate_hours": None, "observed_hours": None, "coverage_pct": None})
+        # 摘要是完整且独立排序的实时通道。慢报表使用场地时钟，不能与云端校准后的
+        # 摘要时间直接比大小，否则仅两分钟的时钟偏差就能用旧报表覆盖新扫描。
+        state = state_map[c["site_id"]]
+        r.update(current_machines=c["machines"], hashrate_ths=c["hashrate_ths"],
+                 hashrate_ts=c["hashrate_ts"], hashrate_updated_ts=state["updated_ts"],
+                 hashrate_source="summary")
+    return sorted(out.values(), key=lambda r: (r["site_name"], -machine_count(r.get("machines"))))
 
 
 def customer_count_by_site(conn):
-    rows = conn.execute(
-        "SELECT site_id, COUNT(*) AS n FROM site_customers GROUP BY site_id").fetchall()
+    with _lock:
+        rows = conn.execute(
+            "SELECT site_id, COUNT(*) AS n FROM (SELECT site_id,worker FROM site_customers "
+            "UNION SELECT site_id,worker FROM site_customer_current) GROUP BY site_id").fetchall()
     return {r["site_id"]: r["n"] for r in rows}
 
 
@@ -333,7 +427,8 @@ def delete_site(conn, site_id, name=None):
                      "VALUES(?,?,?) ON CONFLICT(site_id) DO UPDATE SET "
                      "deleted_name=excluded.deleted_name, deleted_ts=excluded.deleted_ts",
                      (site_id, name or site_id, int(time.time())))
-        for t in ("sites", "snapshots", "site_customers", "site_alert_summary",
+        for t in ("sites", "snapshots", "site_customers", "site_customer_current",
+                  "site_customer_current_state", "site_alert_summary",
                   "daily", "notify_log"):
             conn.execute(f"DELETE FROM {t} WHERE {'id' if t == 'sites' else 'site_id'}=?",
                          (site_id,))

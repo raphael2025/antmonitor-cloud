@@ -32,6 +32,21 @@ def opt_num(v, cast=float, hi=None):
     return num(v, cast, None, hi)
 
 
+def measurement(v, cast=float, hi=None):
+    """可空测量值：非法、负值、布尔值和越界值都表示未知，不能当作实测 0。"""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        n = cast(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(n, float) and not math.isfinite(n):
+        return None
+    if n < 0 or (hi is not None and n > hi):
+        return None
+    return n
+
+
 def text(v, maxlen):
     """文本：转字符串、去掉控制字符(换行/回车/NUL 等)、截长。"""
     if v is None:
@@ -70,8 +85,55 @@ def customers(rows, limit=5000):
             "uptime_pct": opt_num(c.get("uptime_pct"), float, hi=100),
             "delivered_th_h": opt_num(c.get("delivered_th_h"), float, hi=10**13),
             "power_kwh": opt_num(c.get("power_kwh"), float, hi=10**10),
+            "hashrate_ths": measurement(c.get("hashrate_ths"), hi=10**9),
+            "avg_hashrate_ths": measurement(c.get("avg_hashrate_ths"), hi=10**9),
+            "hashrate_hours": measurement(c.get("hashrate_hours"), hi=24 * 90),
+            "observed_hours": measurement(c.get("observed_hours"), hi=24 * 90),
+            "coverage_pct": measurement(c.get("coverage_pct"), hi=100),
+            "hashrate_ts": measurement(c.get("hashrate_ts"), int, hi=253402300799),
+            "current_machines": measurement(c.get("current_machines"), int, hi=10**6),
         })
     return out
+
+
+def customer_hashrates(rows, limit=5000):
+    """完整实时客户列表；格式错误必须拒绝，不能把坏消息误认为空场地。"""
+    if not isinstance(rows, list) or len(rows) > limit:
+        raise ValueError("customer_hashrates 非法")
+    out, seen = [], set()
+    for c in rows:
+        if not isinstance(c, dict):
+            raise ValueError("customer_hashrates 行非法")
+        worker = text(c.get("worker"), 128) or "(未知)"
+        if worker in seen:
+            raise ValueError("customer_hashrates 客户重复")
+        seen.add(worker)
+        out.append({"worker": worker,
+                    "machines": measurement(c.get("machines"), int, hi=10**6),
+                    "hashrate_ths": measurement(c.get("hashrate_ths"), hi=10**9),
+                    "hashrate_ts": measurement(c.get("hashrate_ts"), int, hi=253402300799)})
+    return out
+
+
+def customer_snapshot(src, now):
+    """可选完整扫描：缺字段兼容旧端；坏字段拒绝；时钟漂移不能锁死后续的实时扫描。"""
+    if "customer_hashrates" not in src:
+        return None
+    rows = customer_hashrates(src["customer_hashrates"])
+    if src.get("scan_age_s") is not None:
+        age = measurement(src["scan_age_s"], int, hi=10**7)
+        if age is None or age >= now:
+            raise ValueError("customer_hashrates scan_age_s 非法")
+        scan_ts = now - age
+    else:
+        scan_ts = measurement(src.get("scan_ts"), int)
+        if not scan_ts or scan_ts > now + 300:
+            raise ValueError("customer_hashrates scan_ts 非法")
+        scan_ts = min(scan_ts, now)
+    for row in rows:
+        # 每行属于这轮完整扫描；不接受任意未来时间使旧数据永远看起来新鲜。
+        row["hashrate_ts"] = scan_ts
+    return rows, scan_ts
 
 
 def site_key(v, maxlen=64):

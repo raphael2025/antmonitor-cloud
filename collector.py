@@ -145,12 +145,15 @@ class Collector:
         try:
             d = self._get(site, "/api/public/summary", {"lite": 1})
             scan_ts = validate.num(d.get("scan_ts"), int, 0)
+            customer_snapshot = validate.customer_snapshot(d, now)
             # 场地返回的数据同样不可信(场地机器可能被攻破)：数值列一律清洗，见 validate.py
             snap = validate.snapshot_fields({**d, "hashrate_ths": d.get("total_hashrate_ths"),
                                              "power_kw": d.get("total_power_kw")})
             snap.update({"ts": now, "site_id": sid, "ok": 1, "error": None,
                          "scan_age_s": max(0, now - scan_ts) if scan_ts else None})
             db.insert_snapshot(self.conn, snap)
+            if customer_snapshot is not None:
+                db.replace_customer_hashrates(self.conn, sid, *customer_snapshot)
             st["fails"] = 0
             st["last_ok_ts"] = now
             st["last_err"] = ""

@@ -283,14 +283,33 @@ function renderOverview(o) {
 }
 
 function renderCustomers(d) {
+  $("workerAverageHead").textContent = AntCustomerRates.header(d.by_worker, t);
+  $("customerAverageHead").textContent = AntCustomerRates.header(d.rows, t);
   $("tblWorkers").querySelector("tbody").innerHTML = d.by_worker.map((w) => `<tr>
-    <td>${esc(w.worker)}</td><td>${int0(w.sites)}</td><td>${intTxt(w.machines)}</td>
-    <td>${fmtHash(num(w.delivered_th_h), "·h")}</td><td>${fmtEnergy(num(w.power_kwh))}</td></tr>`).join("")
-    || `<tr><td colspan="5" class="muted">${t("empty.customers")}</td></tr>`;
+    <td>${esc(w.worker)}</td><td>${int0(w.sites)}</td><td>${AntCustomerRates.machines(w, t)}</td>
+    <td>${AntCustomerRates.cell(w, "current", t, fmtHash, fmtAgo)}</td>
+    <td>${AntCustomerRates.cell(w, "average", t, fmtHash, fmtAgo)}</td>
+    <td>${fmtEnergy(num(w.power_kwh))}</td></tr>`).join("")
+    || `<tr><td colspan="6" class="muted">${t("empty.customers")}</td></tr>`;
   $("tblCustomers").querySelector("tbody").innerHTML = d.rows.map((r) => `<tr>
-    <td>${esc(r.site_name)}</td><td>${esc(r.worker)}</td><td>${intTxt(r.machines)}</td>
+    <td>${esc(r.site_name)}</td><td>${esc(r.worker)}</td><td>${AntCustomerRates.machines(r, t)}</td>
     <td>${num(r.uptime_pct) != null ? num(r.uptime_pct).toFixed(1) + "%" : "–"}</td>
-    <td>${fmtHash(num(r.delivered_th_h), "·h")}</td><td>${fmtEnergy(num(r.power_kwh))}</td></tr>`).join("")
+    <td>${AntCustomerRates.cell(r, "current", t, fmtHash, fmtAgo)}</td>
+    <td>${AntCustomerRates.cell(r, "average", t, fmtHash, fmtAgo)}</td>
+    <td>${fmtEnergy(num(r.power_kwh))}</td></tr>`).join("")
+    || `<tr><td colspan="7" class="muted">${t("empty.none")}</td></tr>`;
+  if (curSite && !$("siteModal").classList.contains("hidden"))
+    renderSiteCustomers(d.rows.filter(r => r.site_id === curSite));
+}
+
+function renderSiteCustomers(rows) {
+  $("siteAverageHead").textContent = AntCustomerRates.header(rows, t);
+  $("tblSiteCustomers").querySelector("tbody").innerHTML = rows.map((r) => `<tr>
+    <td>${esc(r.worker)}</td><td>${AntCustomerRates.machines(r, t)}</td>
+    <td>${num(r.uptime_pct) != null ? num(r.uptime_pct).toFixed(1) + "%" : "–"}</td>
+    <td>${AntCustomerRates.cell(r, "current", t, fmtHash, fmtAgo)}</td>
+    <td>${AntCustomerRates.cell(r, "average", t, fmtHash, fmtAgo)}</td>
+    <td>${fmtEnergy(num(r.power_kwh))}</td></tr>`).join("")
     || `<tr><td colspan="6" class="muted">${t("empty.none")}</td></tr>`;
 }
 
@@ -445,11 +464,7 @@ async function loadSite() {
   mkLine("chPower", [{ label: t("chart.power"), borderColor: METRIC.power, backgroundColor: METRIC.power,
     data: withGaps(tr.map((p) => ({ x: p.ts, y: p.power_kw || 0 }))) }], { hours, yUnit: "kW" });
 
-  $("tblSiteCustomers").querySelector("tbody").innerHTML = d.customers.map((r) => `<tr>
-    <td>${esc(r.worker)}</td><td>${intTxt(r.machines)}</td>
-    <td>${num(r.uptime_pct) != null ? num(r.uptime_pct).toFixed(1) + "%" : "–"}</td>
-    <td>${fmtHash(num(r.delivered_th_h), "·h")}</td><td>${fmtEnergy(num(r.power_kwh))}</td></tr>`).join("")
-    || `<tr><td colspan="5" class="muted">${t("empty.none")}</td></tr>`;
+  renderSiteCustomers(d.customers);
 
   loadDaily(d.site.id).catch(() => {});
 }

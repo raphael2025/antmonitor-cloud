@@ -3,7 +3,12 @@
 
 // ---- 调色板(已按暗色面板 #161b22 校验)：场地序列色按 config 顺序固定分配，不随筛选重排 ----
 const SERIES = ["#3987e5", "#199e70", "#c98500", "#008300", "#9085e9", "#e66767", "#d55181", "#d95926"];
-const INK = { grid: "#21262d", axis: "#30363d", tick: "#6e7681", label: "#adbac7" };
+const INK = {
+  get grid() { return window.AntTheme?.palette().grid || "#21262d"; },
+  get axis() { return window.AntTheme?.palette().axis || "#30363d"; },
+  get tick() { return window.AntTheme?.palette().tick || "#6e7681"; },
+  get label() { return window.AntTheme?.palette().label || "#adbac7"; },
+};
 const METRIC = { hashrate: "#3987e5", online: "#199e70", power: "#c98500" };
 
 const $ = (id) => document.getElementById(id);
@@ -656,10 +661,11 @@ $("secRevoke").onclick = async () => {
 
 // ---- 场地接入：云端地址 / 证书指纹 / 上报 token / 接入码(仅 admin) ----
 let _connHideTimer = null;
+let _connSavedUrl = null;
 function connMsg(text, bad) {
   const el = $("connMsg");
   el.textContent = text || "";
-  el.style.color = bad ? "#ff9b9b" : "";
+  el.style.color = bad ? "var(--theme-danger, #ff9b9b)" : "";
 }
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text); connMsg(t("conn.copied")); return; } catch (e) {}
@@ -671,13 +677,16 @@ async function copyText(text) {
 function hideConnResult() {
   $("connResult").classList.add("hidden");
   $("connCode").value = ""; $("connTok").value = "";
+  $("connRawToken").open = false;
   if (_connHideTimer) { clearTimeout(_connHideTimer); _connHideTimer = null; }
 }
 function showConnResult(label, d) {
-  $("connResultFor").textContent = label;
+  const kind = ["air", "hydro", "mixed"].includes(d.site_type) ? t("type." + d.site_type) : "";
+  $("connResultFor").textContent = [d.site_name, kind, label].filter(Boolean).join(" · ");
   $("connCode").value = d.code || "";
   $("connTok").value = d.token || "";
   $("connResult").classList.remove("hidden");
+  renderConnInstall();
   if (_connHideTimer) clearTimeout(_connHideTimer);
   _connHideTimer = setTimeout(hideConnResult, 120000);
 }
@@ -685,8 +694,35 @@ const MODE_TXT = {
   domain: ["ok", "conn.mode_domain"], ip: ["ok", "conn.mode_ip"], self_signed: ["ok", "conn.mode_selfsigned"],
   http: ["fail", "conn.mode_http"], unset: ["off", "conn.mode_unset"],
 };
-function renderConnect(d) {
-  $("connUrl").value = d.public_url || "";
+function renderConnInstall() {
+  const windows = $("connInstallOs").value === "windows";
+  const roots = {
+    Github: "https://raw.githubusercontent.com/raphael2025/antmonitor/main",
+    Gitee: "https://gitee.com/raphael01/antmonitor/raw/main",
+  };
+  for (const [label, root] of Object.entries(roots)) {
+    const source = label.toLowerCase();
+    // 这里只生成公开安装命令，长期凭据始终由接入码单独交接。
+    $("connInstall" + label).textContent = windows
+      ? `& ([scriptblock]::Create((irm '${root}/install.ps1'))) -Source ${source}`
+      : `curl -fsSL ${root}/install.sh | sudo bash -s -- --source ${source} --connect-code -`;
+  }
+  $("connInstallHelp").textContent = t(windows ? "conn.install_windows" : "conn.install_linux");
+}
+function connUrlValue(value) { return String(value || "").trim().replace(/\/+$/, ""); }
+function connAddressReady() {
+  if (_connSavedUrl !== null && _connSavedUrl && connUrlValue($("connUrl").value) === connUrlValue(_connSavedUrl)) return true;
+  hideConnResult();
+  connMsg(t(_connSavedUrl === null ? "conn.not_loaded" : "conn.url_unsaved"), true);
+  $("connAdvanced").open = true;
+  $("connUrl").focus();
+  return false;
+}
+function renderConnect(d, savedAddress = false) {
+  const dirty = _connSavedUrl !== null && connUrlValue($("connUrl").value) !== connUrlValue(_connSavedUrl);
+  _connSavedUrl = d.public_url || "";
+  if (!dirty || savedAddress) $("connUrl").value = _connSavedUrl;
+  $("connUrlCurrent").textContent = _connSavedUrl || t("conn.mode_unset");
   const m = MODE_TXT[d.mode] || MODE_TXT.unset;
   $("connMode").className = "chbadge " + m[0];
   $("connMode").textContent = t(m[1]);
@@ -704,7 +740,9 @@ function renderConnect(d) {
   $("connAutoReg").checked = !!d.auto_register;
   $("tblConnSites").querySelector("tbody").innerHTML = (d.sites || []).map((x) => {
     const id = esc(x.id);
-    const name = x.name ? esc(x.name) : `<span class="muted">${t(x.registered ? "conn.no_name" : "conn.waiting")}</span>`;
+    const name = x.name ? esc(x.name) : `<span class="muted">${t("conn.no_name")}</span>`;
+    const kind = ["air", "hydro", "mixed"].includes(x.type) ? t("type." + x.type) : "";
+    const status = [kind, t(x.registered ? "conn.registered" : "conn.waiting")].filter(Boolean).join(" · ");
     const tok = x.own_token ? `…${esc(x.hint || "****")}${x.from_config ? " · config.yaml" : ""}`
       : x.revoked ? `<span class="muted">${t("conn.revoked_label")}</span>`
       : `<span class="muted">${t("conn.use_shared")}</span>`;
@@ -713,7 +751,7 @@ function renderConnect(d) {
         + `<button data-act="rotate" data-id="${id}">${t("conn.rotate")}</button>`
         + (x.from_config ? "" : `<button class="danger" data-act="revoke" data-id="${id}">${t("conn.revoke")}</button>`)
       : (x.mode === "pull" ? "" : `<button data-act="rotate" data-id="${id}">${t("conn.make_own")}</button>`);
-    return `<tr><td>${name}</td><td class="conn-mono">${id}</td><td>${tok}</td><td>${ops}</td></tr>`;
+    return `<tr><td>${name}<div class="muted">${esc(status)}</div></td><td class="conn-mono">${id}</td><td>${tok}</td><td>${ops}</td></tr>`;
   }).join("") || `<tr><td colspan="4" class="muted">${t("empty.none")}</td></tr>`;
 }
 async function loadConnect() {
@@ -723,6 +761,8 @@ async function loadConnect() {
 }
 async function openConnect() {
   hideConnResult(); connMsg("");
+  _connSavedUrl = null;
+  $("connAdvanced").open = false;
   $("connPw").value = "";
   $("connectModal").classList.remove("hidden");
   try { await loadConnect(); } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); }
@@ -730,12 +770,15 @@ async function openConnect() {
 async function connPost(path, body) {
   const pw = $("connPw").value;
   if (!pw) { connMsg(t("conn.need_pw"), true); $("connPw").focus(); return null; }
-  const r = await send("POST", path, Object.assign({ password: pw }, body));
-  if (!r.ok) { connMsg("✗ " + await errText(r), true); return null; }
-  connMsg("");
-  return r.json();
+  try {
+    const r = await send("POST", path, Object.assign({ password: pw }, body));
+    if (!r.ok) { connMsg("✗ " + await errText(r), true); return null; }
+    connMsg("");
+    return await r.json();
+  } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); return null; }
 }
 async function connAction(act, target) {
+  if ((act === "reveal" || act === "rotate") && !connAddressReady()) return;
   if (act === "reveal") {
     const d = await connPost("/api/connect/reveal", { target });
     if (d) showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: target }), d);
@@ -756,10 +799,19 @@ $("connSharedShow").onclick = () => connAction("reveal", "shared");
 $("connSharedRotate").onclick = () => connAction("rotate", "shared");
 $("connSharedRevoke").onclick = () => connAction("revoke", "shared");
 $("connNewSite").onclick = async () => {
-  const d = await connPost("/api/connect/token", { action: "new_site" });
-  if (!d) return;
-  showConnResult(t("conn.for_new_site", { id: d.target }), d);
-  loadConnect().catch(() => {});
+  if (!connAddressReady()) return;
+  const name = $("connSiteName").value.trim();
+  if (!name || Array.from(name).length > 64 || /[\x00-\x1f\x7f]/.test(name)) {
+    connMsg(t("conn.name_invalid"), true); $("connSiteName").focus(); return;
+  }
+  $("connNewSite").disabled = true;
+  try {
+    const d = await connPost("/api/connect/token", { action: "new_site", site_name: name, site_type: $("connSiteType").value });
+    if (!d) return;
+    showConnResult(t("conn.for_new_site", { id: d.target }), d);
+    await loadConnect();
+  } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); }
+  finally { $("connNewSite").disabled = false; }
 };
 $("tblConnSites").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-act]");
@@ -767,7 +819,7 @@ $("tblConnSites").addEventListener("click", (e) => {
 });
 $("connUrlSave").onclick = async () => {
   const d = await connPost("/api/connect/settings", { public_url: $("connUrl").value.trim() });
-  if (d) { renderConnect(d); connMsg(t("conn.saved")); }
+  if (d) { hideConnResult(); renderConnect(d, true); connMsg(t("conn.saved")); }
 };
 $("connAutoReg").onchange = async () => {
   const want = $("connAutoReg").checked;
@@ -777,6 +829,12 @@ $("connAutoReg").onchange = async () => {
 $("connCodeCopy").onclick = () => copyText($("connCode").value);
 $("connTokCopy").onclick = () => copyText($("connTok").value);
 $("connFpCopy").onclick = () => copyText($("connFp").textContent);
+$("connUrl").oninput = hideConnResult;
+$("connSiteName").oninput = hideConnResult;
+$("connSiteType").onchange = hideConnResult;
+$("connInstallOs").onchange = renderConnInstall;
+$("connInstallGithubCopy").onclick = () => copyText($("connInstallGithub").textContent);
+$("connInstallGiteeCopy").onclick = () => copyText($("connInstallGitee").textContent);
 
 // ---- 启动 ----
 let _loops = false;

@@ -305,14 +305,17 @@ curl -b ck.txt -X POST https://云端/api/settings -H "Content-Type: application
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/connect` | 云端地址 `public_url`(及来源 config/guess)、模式 `mode`(domain/ip/self_signed/http/unset)、证书指纹 `fingerprint`(自签时)、共享 token 是否设置+末4位、各场地专属 token 状态、`auto_register`、`warnings`。**不含任何 token 明文** |
-| `POST /api/connect/reveal` | `{"password", "target": "shared"\|<site_id>}` → `{token, code}`。需再输登录密码 |
-| `POST /api/connect/token` | `{"password", "target", "action": "rotate"\|"revoke"}` 更换/撤销；`{"password", "action": "new_site"}` 预分配新场地 ID + 专属 token → `{target, token, code}` |
+| `GET /api/connect` | 云端地址 `public_url`(及来源 config/guess)、模式 `mode`(domain/ip/self_signed/http/unset)、证书指纹 `fingerprint`(自签时)、共享 token 是否设置+末4位、各场地的 `id/name/type/registered` 与专属 token 状态、`auto_register`、`warnings`。未首次上报的场地也显示保存的名称/类型。**不含任何 token 明文** |
+| `POST /api/connect/reveal` | `{"password", "target": "shared"\|<site_id>}` → `{target, token, code, site_name, site_type}`。需再输登录密码；已上报场地使用当前名称/类型，待接入场地恢复保存的描述 |
+| `POST /api/connect/token` | `{"password", "target", "action": "rotate"\|"revoke"}` 更换/撤销；`{"password", "action": "new_site", "site_name", "site_type"}` 创建命名场地与专属 token → `{target, token, code, site_name, site_type}` |
 | `POST /api/connect/settings` | `{"password", "public_url"?, "auto_register"?}` 改云端地址 / 自动注册开关，返回同 `GET /api/connect` |
 
 - 密码错误返回 403 并计入来源 IP 的登录失败次数（8 次锁 5 分钟，429）；每次查看/更换都写审计（`token_reveal` / `token_rotate` / `token_revoke` / `token_new_site` / `connect_settings`）。
-- 网页生成的 token 存 `cloud_settings.json`（0600），立即生效，无需重启；`config.yaml` 里的 token 只能被覆盖，不能被网页删除（撤销返回 409）。
-- **接入码**：`AMC1-` + base64url(JSON `{"u": 云端地址, "t": token, "f": 证书指纹?, "s": 场地ID?}`)，场地端面板「填入」或安装参数 `--connect-code` 使用。
+- 新建要求 `site_name` 为去除首尾空白后 1–64 个字符的字符串，不允许换行/控制字符；`site_type` 必须为 `air` / `hydro` / `mixed`。非法输入返回 400，不生成凭据。
+- 网页生成的 token 与名称/类型元数据存 `cloud_settings.json`（0600）的 `ingest.tokens` / `ingest.site_meta`，同一次原子写入，立即生效。查看/轮换时，已上报场地使用当前名称/类型（含管理员设置的显示名），待接入场地恢复保存的交接描述；旧待接入项没有元数据仍可查看/轮换。
+- 网页不改写 `config.yaml`；更换/撤销使用覆盖层。撤销专属 token 保存空值，拒绝该场地上报，不会回退到共享 token。
+- **接入码**：`AMC1-` + base64url(JSON `{"u": 云端地址, "t": token, "f": 证书指纹?, "s": 场地ID?, "n": 场地名称?, "y": 场地类型?}`)。`n/y` 为可选扩展，旧码保持兼容，旧版场地端会忽略新增字段。
+- 新版场地网页可粘贴后「连接云端」，安装脚本可使用 `--connect-code -` 隐藏输入。接入码包含长期凭据，不能写进命令行或 URL；页面 2 分钟后隐藏只清空显示，不撤销凭据。
 
 ## 三、Agent 公共 API（`GET /api/public/*`，只读）
 

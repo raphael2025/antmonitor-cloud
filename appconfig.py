@@ -133,6 +133,7 @@ def apply_settings(cfg, s):
     ingest(网页「场地接入」管理的上报 token)：
       token 键存在就覆盖 config.yaml 的共享 token(空串=停用共享 token)；
       tokens 按场地合并(网页生成的专属 token 覆盖同名的 config.yaml 项)；
+      site_meta 按场地合并，保存待接入场地的名称/类型；
       auto_register 覆盖同名开关。
     connect.public_url：各场地填的云端地址(覆盖 server.public_url)。
     """
@@ -152,6 +153,10 @@ def apply_settings(cfg, s):
             dst["tokens"] = {}
         if isinstance(ing.get("tokens"), dict):
             dst["tokens"].update({str(k): str(v) for k, v in ing["tokens"].items()})
+        if isinstance(ing.get("site_meta"), dict):
+            if not isinstance(dst.get("site_meta"), dict):
+                dst["site_meta"] = {}
+            dst["site_meta"].update(copy.deepcopy(ing["site_meta"]))
         if "auto_register" in ing:
             dst["auto_register"] = bool(ing["auto_register"])
     con = s.get("connect")

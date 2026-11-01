@@ -660,6 +660,33 @@ def _valid_token(tok):
     return bool(tok) and not seccheck.is_placeholder(tok)
 
 
+def _connect_site_meta(site_id, sites=None):
+    """已注册场地用当前显示名/类型；待接入场地才使用持久化的交接描述。"""
+    sites = {x["id"]: x for x in all_sites()} if sites is None else sites
+    saved = sites.get(site_id)
+    if not isinstance(saved, dict):
+        pending = (CFG.get("ingest") or {}).get("site_meta")
+        saved = pending.get(site_id) if isinstance(pending, dict) else None
+    if not isinstance(saved, dict):
+        saved = {}
+    name = saved.get("name")
+    kind = saved.get("type")
+    return {"name": name if isinstance(name, str) else "",
+            "type": kind if kind in ("air", "hydro", "mixed") else ""}
+
+
+def _new_site_meta(body):
+    """用户输入不静默截断或换成默认值，以免安装的是另一个名称/类型。"""
+    name = body.get("site_name")
+    if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 64
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
+        raise HTTPException(400, "场地名称须为 1–64 个字符，不能包含换行或控制字符")
+    kind = body.get("site_type")
+    if kind not in ("air", "hydro", "mixed"):
+        raise HTTPException(400, "场地类型须为 air / hydro / mixed")
+    return {"name": name.strip(), "type": kind}
+
+
 def _public_url(request: Request):
     """各场地应该填的云端地址：管理员/安装脚本设置的优先；没设置就按当前访问地址猜一个。"""
     u = str((CFG.get("server") or {}).get("public_url") or "").strip().rstrip("/")
@@ -684,7 +711,9 @@ def _connect_payload(request: Request):
     for sid in sorted(set(sites) | set(per)):
         tok = str(per.get(sid) or "")
         x = sites.get(sid) or {}
-        rows.append({"id": sid, "name": x.get("name") or "", "registered": sid in sites,
+        meta = _connect_site_meta(sid, sites)
+        rows.append({"id": sid, "name": x.get("name") or meta["name"], "registered": sid in sites,
+                     "type": x.get("type") or meta["type"],
                      "mode": x.get("mode") or "push",
                      "own_token": _valid_token(tok), "hint": _hint(tok),
                      "revoked": sid in per and not _valid_token(tok),
@@ -726,9 +755,14 @@ def _confirm_pw(request: Request, sess, body):
         raise HTTPException(403, "密码不对：查看或更换上报 token 需要再输一次你的登录密码")
 
 
-def _code_for(request: Request, token, site_id=""):
+def _code_for(request: Request, token, site_id="", meta=None):
     url, _src = _public_url(request)
-    return connect.make_code(url, token, connect.server_info(CFG)["fingerprint"], site_id)
+    url = connect.normalize_url(url)
+    if not url:
+        raise HTTPException(400, "请先在高级管理中保存有效的云端地址")
+    meta = _connect_site_meta(site_id) if meta is None and site_id else (meta or {})
+    return connect.make_code(url, token, connect.server_info(CFG)["fingerprint"], site_id,
+                             meta.get("name", ""), meta.get("type", ""))
 
 
 def _save_ingest(mutate):
@@ -738,7 +772,7 @@ def _save_ingest(mutate):
     with appconfig._LOCK:
         try:
             _save_ingest_locked(mutate)
-        except appconfig.SettingsError as e:
+        except (appconfig.SettingsError, OSError) as e:
             raise HTTPException(500, str(e)) from e
 
 
@@ -754,6 +788,10 @@ def _save_ingest_locked(mutate):
         icfg = CFG["ingest"] = {}
     # 运行中的 CFG = config.yaml 原值 + 覆盖层(删掉的网页 token 也要从 CFG 里拿掉)
     icfg["tokens"] = {**_YAML_INGEST["tokens"], **cur["tokens"]}
+    yaml_meta = _YAML_INGEST.get("site_meta")
+    saved_meta = cur.get("site_meta")
+    icfg["site_meta"] = {**(yaml_meta if isinstance(yaml_meta, dict) else {}),
+                         **(saved_meta if isinstance(saved_meta, dict) else {})}
     icfg["token"] = cur["token"] if "token" in cur else str(_YAML_INGEST.get("token") or "")
     if "auto_register" in cur:
         icfg["auto_register"] = bool(cur["auto_register"])
@@ -783,19 +821,22 @@ def api_connect_reveal(request: Request, body: dict = Body(...)):
     if not _valid_token(tok):
         raise HTTPException(404, "这把 token 还没生成")
     _audit(request, sess["user"], "token_reveal", target)
-    return {"ok": True, "target": target, "token": tok, "code": _code_for(request, tok, sid)}
+    meta = _connect_site_meta(sid) if sid else {}
+    return {"ok": True, "target": target, "token": tok, "code": _code_for(request, tok, sid, meta),
+            "site_name": meta.get("name", ""), "site_type": meta.get("type", "")}
 
 
 @app.post("/api/connect/token")
 def api_connect_token(request: Request, body: dict = Body(...)):
     """生成/更换(rotate) 或 撤销(revoke) 一把 token。target=shared|场地ID；
-    action=new_site 时预先分配一个新场地 ID + 专属 token(场地端粘贴接入码即按这个 ID 上报)。"""
+    action=new_site 时校验名称/类型，并原子保存新场地 ID + 专属 token + 接入描述。"""
     sess = _require_admin(request)
     action = str(body.get("action") or "")
     if action not in ("rotate", "revoke", "new_site"):
         raise HTTPException(400, "action 须为 rotate / revoke / new_site")
     target = "st-" + secrets.token_hex(6) if action == "new_site" else _target(body)
     _confirm_pw(request, sess, body)
+    meta = _new_site_meta(body) if action == "new_site" else _connect_site_meta(target)
     if action == "new_site" and db.site_count(CONN) >= int((CFG.get("ingest") or {}).get("max_sites") or 200):
         raise HTTPException(403, "场地数已达上限(ingest.max_sites)")
     if action == "revoke":
@@ -808,13 +849,23 @@ def api_connect_token(request: Request, body: dict = Body(...)):
         _audit(request, sess["user"], "token_revoke", target)
         return {"ok": True, "target": target}
     tok = secrets.token_urlsafe(32)
+    # 完整接入码先生成，之后 token 与描述一次落盘。校验/编码/写盘失败不留下半成品。
+    code = _code_for(request, tok, "" if target == "shared" else target,
+                     {} if target == "shared" else meta)
     if target == "shared":
         _save_ingest(lambda cur: cur.__setitem__("token", tok))
     else:
-        _save_ingest(lambda cur: cur["tokens"].__setitem__(target, tok))
+        def save_site(cur):
+            cur["tokens"][target] = tok
+            if meta["name"] or meta["type"]:
+                if not isinstance(cur.get("site_meta"), dict):
+                    cur["site_meta"] = {}
+                cur["site_meta"][target] = meta
+        _save_ingest(save_site)
     _audit(request, sess["user"], "token_new_site" if action == "new_site" else "token_rotate", target)
-    return {"ok": True, "target": target, "token": tok,
-            "code": _code_for(request, tok, "" if target == "shared" else target)}
+    return {"ok": True, "target": target, "token": tok, "code": code,
+            "site_name": "" if target == "shared" else meta["name"],
+            "site_type": "" if target == "shared" else meta["type"]}
 
 
 @app.post("/api/connect/settings")

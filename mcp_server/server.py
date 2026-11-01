@@ -189,8 +189,11 @@ def farm_site_detail(site: str, hours: int = 24) -> dict:
         power_kw/active_alerts/data_age_s 等字段含义相同）
       trend —— [[ts, hashrate_ths], ...] 时间序列点（按 hours 窗口分桶均值），
         相邻点若时间间隔明显偏大代表期间断报/停电，不应线性插值理解
-      customers —— 该场地客户明细（worker/machines/uptime_pct/delivered_th_h/
-        power_kwh/hours）
+      customers —— 该场地客户明细（worker/machines/current_machines/uptime_pct/
+        hashrate_ths/avg_hashrate_ths/hashrate_hours/observed_hours/coverage_pct/
+        hashrate_ts/delivered_th_h/power_kwh/hours）；实时／平均值单位 TH/s，
+        delivered_th_h 是时间累计量，不能当作算力。平均值覆盖不足时只代表已观测
+        时段，旧场地端缺失的新字段为 null；具体解释同 farm_customers()。
       alert_summary —— 活跃告警摘要，按类型分组（category/label/count/since_ts/
         workers），不含单机IP，只标"哪类故障、多少台、受影响客户、已持续多久"；
         场地本地未推送该字段时为 []
@@ -247,10 +250,27 @@ def farm_customers() -> dict:
     """跨场地客户表（服务端缓存 30 秒）。用于按客户/矿工名维度问询时。
 
     返回结构：
-      rows —— 每场地每客户一条明细：{site_id, worker, machines, uptime_pct,
-        delivered_th_h, power_kwh, hours}（24h 口径，对账以场地本地 CSV 为准）
+      rows —— 每场地每客户一条明细：{site_id, worker, machines, current_machines,
+        uptime_pct, hashrate_ths, avg_hashrate_ths, hashrate_hours, observed_hours,
+        coverage_pct, hashrate_ts, delivered_th_h, power_kwh, hours}。
+        hashrate_ths 是最新扫描的实际总算力，avg_hashrate_ths 是按有效观测持续
+        时间加权的总平均算力，单位均为 TH/s；必须同时查看采样时间、统计窗口
+        hashrate_hours 和 coverage_pct，覆盖不足只能称为已观测时段平均。
+        observed_hours 是观测时间，不是机器小时。确认离线计零，未知不补成零。
+        hashrate_stale 表示实时值过期，report_stale 表示平均报表过期；
+        avg_complete 只表示覆盖完整，不能代替新鲜度判断。
+        delivered_th_h 是累计交付 TH·h，不能当作实时或平均算力；对账以场地
+        本地 CSV 为准。旧场地端缺少新指标时为 null，不能由累计量伪造实时值。
       by_worker —— 已跨场地按 worker(客户名) 合并汇总：{worker, sites(涉及
-        场地数), machines, delivered_th_h, power_kwh}，按 machines 降序
+        场地数), machines, hashrate_ths, avg_hashrate_ths, hashrate_hours,
+        delivered_th_h, power_kwh}，按 machines 降序。实际总算力直接相加，
+        不再乘机器数；平均窗口不同或有未知指标时不能宣称完整的 24h 总平均。
+        多场地中任一场地覆盖不足，也不能确定共同观测区间，总平均为 null；
+        avg_unavailable_reason 为 missing_data/mixed_periods/partial_coverage。
+        默认客户实时数据随摘要每 60 秒更新，平均报表每 600 秒更新。
+
+      例如一台机器全天保持 293 TH/s，24h 平均仍是 293 TH/s，累计是
+      7,032 TH·h；100 台均如此时客户总平均为 29.3 PH/s。
     """
     return _request("/api/public/customers")
 

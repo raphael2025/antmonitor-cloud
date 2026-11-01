@@ -186,3 +186,10 @@ table.mini td { font-size: 13px; }
 .conn-install-command > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
 .conn-install-command code { display: block; padding: 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; direction: ltr; text-align: left; }
 #tblConnSites td button { padding: 2px 8px; font-size: 12px; margin-right: 4px; }
+
+/* Customer rates keep observation quality next to the measured value. */
+.rate-value { display: block; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rate-note { display: block; max-width: 230px; white-space: normal; line-height: 1.5; margin-top: 3px; }
+.rate-note.rate-warning { color: var(--theme-warning, #fab219); }
+.grid2 > .panel { min-width: 0; }
+.customer-help { margin: -10px 22px 22px; line-height: 1.7; }

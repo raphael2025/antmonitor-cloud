@@ -307,11 +307,36 @@ def _daily_payload(key, days):
 def _customer_rows(rows):
     """出库再清洗一遍数值列：修复前入库的脏行(数值列里存了字符串)不能再 500 或流到前端。"""
     out = []
+    now = int(time.time())
+    stale_after = max(60, int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
+    report_after = max(stale_after, 3 * int(CFG.get("poll", {}).get("customer_interval", 600)))
     for r in rows:
         r = dict(r)
         r["machines"] = validate.num(r.get("machines"), int)
         for k in ("uptime_pct", "delivered_th_h", "power_kwh"):
             r[k] = validate.opt_num(r.get(k))
+        clean = validate.customers([r])[0]
+        for k in ("hashrate_ths", "avg_hashrate_ths", "hashrate_hours", "observed_hours",
+                  "coverage_pct", "hashrate_ts", "current_machines"):
+            r[k] = clean[k]
+        if not r["hashrate_hours"]:
+            r["hashrate_hours"] = None
+            r["avg_hashrate_ths"] = None
+        if r["observed_hours"] == 0:
+            r["avg_hashrate_ths"] = None
+        # 完整平均必须同时有窗口与覆盖证据，不能把旧版累计 TH·h/24 假装成实测均值。
+        r["avg_complete"] = bool(r["avg_hashrate_ths"] is not None and
+            r["coverage_pct"] is not None and r["coverage_pct"] >= 99.99 and
+            r["observed_hours"] is not None and
+            r["observed_hours"] >= r["hashrate_hours"] - 1 / 3600)
+        r["avg_unavailable_reason"] = "missing_data" if r["avg_hashrate_ths"] is None else None
+        stamp = r["hashrate_ts"]
+        r["hashrate_age_s"] = max(0, now - stamp) if stamp and stamp <= now + 300 else None
+        r["hashrate_stale"] = r["hashrate_age_s"] is None or r["hashrate_age_s"] > stale_after
+        stamp = validate.measurement(r.get("updated_ts"), int)
+        r["updated_ts"] = stamp
+        r["report_age_s"] = max(0, now - stamp) if stamp and stamp <= now + 300 else None
+        r["report_stale"] = r["report_age_s"] is None or r["report_age_s"] > report_after
         out.append(r)
     return out
 
@@ -321,11 +346,43 @@ def _customers_payload():
     agg = {}
     for r in rows:
         a = agg.setdefault(r["worker"], {"worker": r["worker"], "sites": 0, "machines": 0,
-                                         "delivered_th_h": 0.0, "power_kwh": 0.0})
+                                         "delivered_th_h": 0.0, "power_kwh": 0.0, "_rows": []})
         a["sites"] += 1
         a["machines"] += r["machines"] or 0
         a["delivered_th_h"] += r["delivered_th_h"] or 0
         a["power_kwh"] += r["power_kwh"] or 0
+        a["_rows"].append(r)
+    for a in agg.values():
+        parts = a.pop("_rows")
+
+        def complete_reduce(key, reducer):
+            values = [p.get(key) for p in parts]
+            return reducer(values) if all(v is not None for v in values) else None
+
+        a["current_machines"] = complete_reduce("current_machines", sum)
+        a["hashrate_ths"] = complete_reduce("hashrate_ths", sum)
+        a["hashrate_ts"] = complete_reduce("hashrate_ts", min)
+        a["hashrate_age_s"] = complete_reduce("hashrate_age_s", max)
+        a["hashrate_stale"] = any(p["hashrate_stale"] for p in parts)
+        a["hashrate_known_sites"] = sum(p["hashrate_ths"] is not None for p in parts)
+        a["periods"] = sorted({p["hashrate_hours"] for p in parts if p["hashrate_hours"] is not None})
+        same_period = len(a["periods"]) == 1 and all(p["hashrate_hours"] is not None for p in parts)
+        a["hashrate_hours"] = a["periods"][0] if same_period else None
+        # 不同场地的实际 TH/s 相加，既不按台数再乘一次，也不将24/48小时均值混算成24小时。
+        a["avg_hashrate_ths"] = complete_reduce("avg_hashrate_ths", sum) if same_period else None
+        a["observed_hours"] = complete_reduce("observed_hours", min) if same_period else None
+        a["coverage_pct"] = complete_reduce("coverage_pct", min) if same_period else None
+        a["avg_complete"] = bool(same_period and all(p["avg_complete"] for p in parts))
+        a["avg_unavailable_reason"] = ("mixed_periods" if len(a["periods"]) > 1 else
+            "missing_data" if a["avg_hashrate_ths"] is None else None)
+        if len(parts) > 1 and a["avg_hashrate_ths"] is not None and not a["avg_complete"]:
+            # 只有覆盖时长，不能证明两个场地的缺口重合；相加不同已观测时段的均值会造假。
+            a["avg_hashrate_ths"] = None
+            a["avg_unavailable_reason"] = "partial_coverage"
+        a["avg_known_sites"] = sum(p["avg_hashrate_ths"] is not None for p in parts)
+        a["updated_ts"] = complete_reduce("updated_ts", min)
+        a["report_age_s"] = complete_reduce("report_age_s", max)
+        a["report_stale"] = any(p["report_stale"] for p in parts)
     return {"ok": True, "ts": int(time.time()), "rows": rows,
             "by_worker": sorted(agg.values(), key=lambda x: -x["machines"])}
 
@@ -528,6 +585,10 @@ def api_ingest_summary(request: Request, body: dict = Body(...)):
     _check_ingest_token(request, sid)
     site_type = body.get("type") if body.get("type") in ("air", "hydro", "mixed") else "air"
     now = int(time.time())
+    try:
+        customer_snapshot = validate.customer_snapshot(body, now)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     snap = validate.snapshot_fields(body)
     snap.update({"ts": now, "site_id": sid, "ok": 1, "error": None,
                  "scan_age_s": (_num(body.get("scan_age_s"), int, None, hi=10**7)
@@ -535,6 +596,8 @@ def api_ingest_summary(request: Request, body: dict = Body(...)):
     with _ingest_write(sid):
         db.upsert_site(CONN, sid, name, site_type, now)
         db.insert_snapshot(CONN, snap)
+        if customer_snapshot is not None:
+            db.replace_customer_hashrates(CONN, sid, *customer_snapshot)
         if "alert_summary" in body:   # 字段缺失(旧版场地端)不动已存数据；显式空列表=清空
             db.replace_alert_summary(CONN, sid, _clean_alert_summary(body.get("alert_summary")))
     return {"ok": True, "ts": now}

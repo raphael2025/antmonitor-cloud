@@ -2,7 +2,7 @@
 
 > 基址：`http://<云服务器>:8900`（生产走 nginx TLS 后为 `https://overview.example.com`）。
 > 所有响应为 JSON，UTF-8，含 `ok`(bool) 与 `ts`(Unix 秒，云端时间)。
-> 时间戳一律 Unix 秒；算力单位 TH/s（字段 `hashrate_ths`）、功率 kW（`power_kw`）、
+> 时间戳一律 Unix 秒；实时／平均算力单位 TH/s（`hashrate_ths` / `avg_hashrate_ths`），累计交付为 TH·h（`delivered_th_h`），功率 kW（`power_kw`）、
 > 能量 kWh（`power_kwh`）、时长秒（`*_s` / `*_ts`）。
 
 接口分四组：
@@ -57,7 +57,12 @@
   "containers": 30,           // 水冷集装箱数(风冷场填0)
   "containers_faulty": 2,
   "containers_offline": 1,
+  "scan_ts": 1783573880,      // 完整扫描的采样时间，随 customer_hashrates 提供
   "scan_age_s": 120,          // 场地本地上次扫描距现在多少秒(判"监控停滞"用)，可 null
+  "customer_hashrates": [    // 可选：该次完整扫描的客户实时合计，不含单机 IP
+    {"worker": "Asuna666", "machines": 320, "hashrate_ths": 100000.0,
+     "hashrate_ts": 1783573880}
+  ],
   "alert_summary": [          // 可选：活跃告警摘要(按类型分组，不含单机IP)。缺省字段=不动云端已存数据；
                               // 显式传 []=清空。上限 30 组、每组上限 30 个客户，超出截断。
     {"category": "offline", "label": "掉线", "count": 12,
@@ -67,11 +72,18 @@
 }
 ```
 数字字段可缺省（按 0）；负数归零、超合理上限被钳制（防污染图表）。
+`customer_hashrates` 的测量值例外：缺失／非法值为 `null`（未知），明确读到零才传 `0`。
+这个可选完整列表随摘要更新，默认每 60 秒一次，避免客户实时值等待每 600 秒一次的历史报表；
+旧场地端省略字段时保持已有实时值，超过新鲜度阈值后标为过期；显式 `[]` 表示本轮完整扫描没有客户机器。
+`machines` 是该轮扫描的客户机器数；`hashrate_ts` 是采样时间，不能用报表发送时间代替。
+云端优先用收到摘要的时间减 `scan_age_s` 还原采样时刻，并统一应用于列表内各行；缺少龄期时校验 `scan_ts`，避免未来时钟污染后续更新。
+完整列表上限 5,000 行；非列表、非法行或重复客户名返回 `400`，不会把格式错误当成空场地。
 **响应**：`{"ok": true, "ts": 1783574001}`
 
 ### 2. `POST /api/ingest/customers` — 客户报表（建议每 600s 一次）
 
-整表替换该场地的客户数据（云端只存最新一份；历史对账以场地本地为准）。
+更新该场地的客户历史报表（云端只存最新一份；历史对账以场地本地为准）。实时值随摘要独立更新；
+收到首份完整实时列表后，该通道决定当前客户归属和算力，慢报表不再覆盖它。此前可使用报表携带的实时字段作为兼容来源。
 
 **请求体**
 ```json
@@ -81,11 +93,31 @@
   "hours": 24,                       // 统计周期(小时)
   "customers": [                      // 上限 5000 行，超出 400；worker 名超128字符截断
     {"worker": "Asuna666", "machines": 320,
-     "uptime_pct": 99.2, "delivered_th_h": 2360160.0, "power_kwh": 423360.0}
+     "uptime_pct": 99.2, "delivered_th_h": 2360160.0, "power_kwh": 423360.0,
+     "hashrate_ths": 100000.0, "current_machines": 320,
+     "avg_hashrate_ths": 98340.0, "hashrate_hours": 24,
+     "observed_hours": 24.0, "coverage_pct": 100.0,
+     "hashrate_ts": 1783573880}
   ]
 }
 ```
 **响应**：`{"ok": true, "ts": ..., "count": 1}`
+
+新增字段均可省略，旧上报端与旧数据库继续兼容；缺失的新指标保留为 `null`，不会由累计交付伪造实时值或补成零。
+
+| 字段 | 含义 |
+|---|---|
+| `hashrate_ths` | 最新完整扫描中该客户各台矿机实际算力的合计，TH/s；确认离线为零，无法确定完整合计时为 `null` |
+| `current_machines` | 最新扫描的客户机器数，与历史报表的 `machines` 分开 |
+| `avg_hashrate_ths` | `hashrate_hours` 窗口内，按有效观测持续时间加权的客户总平均算力，TH/s |
+| `hashrate_hours` | 平均值所请求的回看窗口，默认 24；不等同旧累计报表可能截断后的 `hours` |
+| `observed_hours` | 该客户有效观测覆盖的小时数，按时间计，**不是机器小时数** |
+| `coverage_pct` | 有效覆盖比例：`observed_hours / hashrate_hours × 100`；不足 100% 时，平均值仅代表已观测时段 |
+| `hashrate_ts` | 实时算力的采样时刻，Unix 秒，用来判断数据新鲜度 |
+
+平均值包含确认离线的零值；监控停摆、没有读到算力的时段属于未知，不按零算，也不宣称覆盖完整一天。
+例如一台机器稳定 293 TH/s 运行 24 小时，平均是 293 TH/s、累计交付是 7,032 TH·h；100 台同样运行时总平均是 29,300 TH/s（29.3 PH/s）。
+`delivered_th_h` 保持原累计统计口径用于历史报表／CSV，不能直接改单位成 `/s`，也不能在不知道覆盖范围时直接除以 24。
 
 ### 3. `POST /api/ingest/ping` — 测试连接（只校验，不写数据）
 
@@ -193,6 +225,9 @@ curl -X POST https://overview.example.com/api/ingest/summary \
               "hashrate_ths": 1013328.0, "power_kw": 18103.6, "active_alerts": 7} ],
   "customers": [ {"site": "内蒙一场", "worker": "Asuna666", "machines": 320,
                   "uptime_pct": 99.2, "delivered_th_h": 2360160.0, "power_kwh": 423360.0,
+                  "hashrate_ths": 100000.0, "avg_hashrate_ths": 98340.0,
+                  "current_machines": 320, "hashrate_hours": 24,
+                  "observed_hours": 24, "coverage_pct": 100, "hashrate_ts": 1783573880,
                   "hours": 24, "updated_ts": 1783573900} ],
   "alert_summary": [ {"category": "offline", "label": "掉线", "count": 12,
                       "since_ts": 1783573000,
@@ -208,9 +243,31 @@ curl -X POST https://overview.example.com/api/ingest/summary \
 { "ok": true,
   "rows": [ ...全部 (site, worker) 明细行, 字段同上... ],
   "by_worker": [ {"worker": "Asuna666", "sites": 2, "machines": 2100,
+                  "hashrate_ths": ..., "avg_hashrate_ths": ..., "hashrate_hours": 24,
                   "delivered_th_h": ..., "power_kwh": ...} ] }
 ```
-> `by_worker` 按矿工名跨场地合并（同一客户在多场地托管时汇总台数/交付/耗电）。
+> `by_worker` 按矿工名跨场地合并。客户总实时算力是各场地实测总算力之和，不能再乘机器数；
+> 总平均算力也按相同统计窗口相加，不按场地数或机器数再次求均值。
+> 任一场地缺少对应指标时，完整合计为 `null`；平均窗口不同时也不拼成一个“24 小时平均”。
+> 展示平均值时必须同时检查覆盖比例，不足完整窗口只能标为已观测时段平均。
+
+多个场地都请求 24 小时，也可能分别只观测到不同的时间片段。协议没有这些片段的交集信息，
+因此任一场地覆盖不足时，多场地合计平均返回 `null`；单场地的已观测平均仍可查看。
+
+客户明细和 `by_worker` 还包含以下展示状态，公共 API 同样返回：
+
+| 字段 | 含义 |
+|---|---|
+| `hashrate_age_s` / `hashrate_stale` | 实时采样距现在的秒数／是否过期；过期时应明确标为旧数据 |
+| `hashrate_source` | 明细的实时值来源：`summary`（摘要）、`report`（报表）、`legacy`（旧端没有新指标） |
+| `avg_complete` | 是否具有完整统计窗口的平均值；仅为 `true` 时可直接作为该周期完整平均展示 |
+| `avg_unavailable_reason` | `missing_data`（缺少指标）、`mixed_periods`（跨场地窗口不同）、`partial_coverage`（多场地覆盖不足）；可用时为 `null` |
+| `updated_ts` / `report_age_s` / `report_stale` | 历史报表接收时间／龄期／是否过期，与实时采样时间分开 |
+| `periods` | `by_worker` 涉及的平均统计窗口列表，单位小时 |
+| `hashrate_known_sites` / `avg_known_sites` | `by_worker` 中有对应指标的场地数，缺少部分场地不补成零 |
+
+默认实时过期阈值取 `poll.stalled_after_s`（1,200 秒）；平均报表过期阈值至少是该值，且不短于 `poll.customer_interval` 的三倍（默认 1,800 秒）。
+`avg_complete` 描述覆盖，`report_stale` 描述新鲜度；展示时两者都需要检查。
 
 ### 5. `GET /api/daily?site=<id>&days=14` — 单场地日级汇总
 
@@ -349,7 +406,8 @@ curl -s -H "Authorization: Bearer $TOKEN" https://overview.example.com/api/publi
 - 汇报主体用 `/api/public/overview`：`sites[].state` 非 `ok` 的置顶
   （`unreachable`=场地断网断电、`stalled`=场地监控停滞、`alert`=有告警），
   每场地报 名称/类型(风冷air/水冷hydro)/算力/在线率/功耗；`data_age_s` 大=数据旧要注明。
-- 客户维度问询用 `/api/public/customers`（`by_worker` 已跨场地合并）。
+- 客户维度问询用 `/api/public/customers`（`by_worker` 已跨场地合并）。实时看 `hashrate_ths`，平均看 `avg_hashrate_ths`，
+  同时检查统计窗口、覆盖和采样时间；`delivered_th_h` 是累计交付，不能当作实时或平均算力。
 - 想知道某场地"具体是谁受影响"（掉线/零算力等，不含单机IP）用 `/api/public/site/{key}`
   的 `alert_summary`：按类型分组，带受影响客户名+台数+已持续时长，不用追问场地本地。
 - 算力显示按千进制换档：1000 TH=1 PH，1000 PH=1 EH。

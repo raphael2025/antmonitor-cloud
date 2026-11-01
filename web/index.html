@@ -107,18 +107,20 @@
     <div class="panel">
       <h2 data-i18n="cust.summary">客户汇总（跨场地）</h2>
       <div class="tablewrap"><table class="mini" id="tblWorkers">
-        <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.site">场地</th><th data-i18n="th.count">台数</th><th data-i18n="th.deliv24">24h 交付算力</th><th data-i18n="th.kwh24">24h 耗电</th></tr></thead>
+        <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.site">场地</th><th data-i18n="th.count">台数</th><th data-i18n="rate.current">实时算力</th><th id="workerAverageHead">24h 平均算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
     <div class="panel">
       <h2 data-i18n="cust.detail">客户明细（按场地）</h2>
       <div class="tablewrap"><table class="mini" id="tblCustomers">
-        <thead><tr><th data-i18n="th.site">场地</th><th data-i18n="th.cust">客户</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="th.deliv">交付算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
+        <thead><tr><th data-i18n="th.site">场地</th><th data-i18n="th.cust">客户</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="rate.current">实时算力</th><th id="customerAverageHead">24h 平均算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
   </section>
+
+  <p class="customer-help muted" data-i18n="rate.help">实时算力为最近一次扫描的实测总和，默认统计近 24 小时平均；数据不足时仅显示已观测时段平均。旧版场地需更新后上报这些指标。</p>
 
   <div id="deletedSitesModal" class="modal hidden">
     <div class="modal-box">
@@ -165,9 +167,9 @@
         <div class="chartbox"><h3 data-i18n="chart.online">在线台数</h3><div class="cwrap"><canvas id="chOnline"></canvas></div></div>
         <div class="chartbox"><h3 data-i18n="chart.power">功耗</h3><div class="cwrap"><canvas id="chPower"></canvas></div></div>
       </div>
-      <h3 class="subhead">客户（该场地，24h）</h3>
+      <h3 class="subhead" data-i18n="rate.site_customers">客户（该场地）</h3>
       <div class="tablewrap"><table class="mini" id="tblSiteCustomers">
-        <thead><tr><th>客户 / 矿工名</th><th>台数</th><th>可用率</th><th>交付算力</th><th>耗电</th></tr></thead>
+        <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="rate.current">实时算力</th><th id="siteAverageHead">24h 平均算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
         <tbody></tbody>
       </table></div>
       <h3 class="subhead">近 14 天日报（耗电为估算，精确对账以场地本地为准）</h3>
@@ -351,6 +353,7 @@
     </div>
   </div>
 
+  <script src="/web/customer-rates.js"></script>
   <script src="/web/app.js"></script>
 </body>
 </html>

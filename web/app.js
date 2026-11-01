@@ -677,21 +677,34 @@ $("secRevoke").onclick = async () => {
 // ---- 场地接入：云端地址 / 证书指纹 / 上报 token / 接入码(仅 admin) ----
 let _connHideTimer = null;
 let _connSavedUrl = null;
+let _connAddressError = "";
 function connMsg(text, bad) {
   const el = $("connMsg");
   el.textContent = text || "";
   el.style.color = bad ? "var(--theme-danger, #ff9b9b)" : "";
 }
-async function copyText(text) {
-  try { await navigator.clipboard.writeText(text); connMsg(t("conn.copied")); return; } catch (e) {}
+async function copyText(text, manualField) {
+  if (!text) { connMsg(t("conn.copy_empty"), true); return false; }
+  try { await navigator.clipboard.writeText(text); connMsg(t("conn.copied")); return true; } catch (e) {}
   const ta = document.createElement("textarea");   // 非安全上下文/老浏览器兜底
   ta.value = text; document.body.appendChild(ta); ta.select();
-  try { document.execCommand("copy"); connMsg(t("conn.copied")); } catch (e) { connMsg(t("conn.copy_manual"), true); }
+  let copied = false;
+  try { copied = document.execCommand("copy") === true; } catch (e) {}
   ta.remove();
+  if (copied) { connMsg(t("conn.copied")); return true; }
+  if (manualField) {
+    if (manualField === $("connCode")) $("connDetails").open = true;
+    manualField.focus();
+    if (manualField.select) manualField.select();
+  }
+  connMsg(t("conn.copy_manual"), true);
+  return false;
 }
 function hideConnResult() {
   $("connResult").classList.add("hidden");
   $("connCode").value = ""; $("connTok").value = "";
+  $("connResultUrl").textContent = "";
+  $("connDetails").open = false;
   $("connRawToken").open = false;
   if (_connHideTimer) { clearTimeout(_connHideTimer); _connHideTimer = null; }
 }
@@ -700,6 +713,8 @@ function showConnResult(label, d) {
   $("connResultFor").textContent = [d.site_name, kind, label].filter(Boolean).join(" · ");
   $("connCode").value = d.code || "";
   $("connTok").value = d.token || "";
+  $("connResultUrl").textContent = d.public_url || _connSavedUrl || "";
+  $("connIncludes").textContent = t(d.site_name && d.site_type ? "conn.includes" : "conn.includes_basic");
   $("connResult").classList.remove("hidden");
   renderConnInstall();
   if (_connHideTimer) clearTimeout(_connHideTimer);
@@ -726,9 +741,11 @@ function renderConnInstall() {
 }
 function connUrlValue(value) { return String(value || "").trim().replace(/\/+$/, ""); }
 function connAddressReady() {
-  if (_connSavedUrl !== null && _connSavedUrl && connUrlValue($("connUrl").value) === connUrlValue(_connSavedUrl)) return true;
+  const unchanged = connUrlValue($("connUrl").value) === connUrlValue(_connSavedUrl);
+  if (_connSavedUrl !== null && _connSavedUrl && unchanged && !_connAddressError) return true;
   hideConnResult();
-  connMsg(t(_connSavedUrl === null ? "conn.not_loaded" : "conn.url_unsaved"), true);
+  connMsg(unchanged && _connAddressError ? _connAddressError
+    : t(_connSavedUrl === null ? "conn.not_loaded" : "conn.url_unsaved"), true);
   $("connAdvanced").open = true;
   $("connUrl").focus();
   return false;
@@ -736,6 +753,7 @@ function connAddressReady() {
 function renderConnect(d, savedAddress = false) {
   const dirty = _connSavedUrl !== null && connUrlValue($("connUrl").value) !== connUrlValue(_connSavedUrl);
   _connSavedUrl = d.public_url || "";
+  _connAddressError = d.address_ready === false ? (d.address_error || t("conn.url_unsaved")) : "";
   if (!dirty || savedAddress) $("connUrl").value = _connSavedUrl;
   $("connUrlCurrent").textContent = _connSavedUrl || t("conn.mode_unset");
   const m = MODE_TXT[d.mode] || MODE_TXT.unset;
@@ -765,7 +783,9 @@ function renderConnect(d, savedAddress = false) {
       ? `<button data-act="reveal" data-id="${id}">${t("conn.show")}</button>`
         + `<button data-act="rotate" data-id="${id}">${t("conn.rotate")}</button>`
         + (x.from_config ? "" : `<button class="danger" data-act="revoke" data-id="${id}">${t("conn.revoke")}</button>`)
-      : (x.mode === "pull" ? "" : `<button data-act="rotate" data-id="${id}">${t("conn.make_own")}</button>`);
+      : (x.mode === "pull" ? "" : (x.can_reveal
+          ? `<button data-act="reveal" data-id="${id}">${t("conn.show")}</button>` : "")
+        + `<button data-act="rotate" data-id="${id}">${t("conn.make_own")}</button>`);
     return `<tr><td>${name}<div class="muted">${esc(status)}</div></td><td class="conn-mono">${id}</td><td>${tok}</td><td>${ops}</td></tr>`;
   }).join("") || `<tr><td colspan="4" class="muted">${t("empty.none")}</td></tr>`;
 }
@@ -777,6 +797,7 @@ async function loadConnect() {
 async function openConnect() {
   hideConnResult(); connMsg("");
   _connSavedUrl = null;
+  _connAddressError = "";
   $("connAdvanced").open = false;
   $("connPw").value = "";
   $("connectModal").classList.remove("hidden");
@@ -796,7 +817,10 @@ async function connAction(act, target) {
   if ((act === "reveal" || act === "rotate") && !connAddressReady()) return;
   if (act === "reveal") {
     const d = await connPost("/api/connect/reveal", { target });
-    if (d) showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: target }), d);
+    if (d) {
+      showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: target }), d);
+      await copyText(d.code, $("connCode"));
+    }
     return;
   }
   if (act === "revoke" && !confirm(target === "shared" ? t("conn.confirm_disable") : t("conn.confirm_revoke", { id: target }))) return;
@@ -824,6 +848,7 @@ $("connNewSite").onclick = async () => {
     const d = await connPost("/api/connect/token", { action: "new_site", site_name: name, site_type: $("connSiteType").value });
     if (!d) return;
     showConnResult(t("conn.for_new_site", { id: d.target }), d);
+    await copyText(d.code, $("connCode"));
     await loadConnect();
   } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); }
   finally { $("connNewSite").disabled = false; }
@@ -841,8 +866,8 @@ $("connAutoReg").onchange = async () => {
   const d = await connPost("/api/connect/settings", { auto_register: want });
   if (d) { renderConnect(d); connMsg(t("conn.saved")); } else $("connAutoReg").checked = !want;
 };
-$("connCodeCopy").onclick = () => copyText($("connCode").value);
-$("connTokCopy").onclick = () => copyText($("connTok").value);
+$("connCodeCopy").onclick = () => copyText($("connCode").value, $("connCode"));
+$("connTokCopy").onclick = () => copyText($("connTok").value, $("connTok"));
 $("connFpCopy").onclick = () => copyText($("connFp").textContent);
 $("connUrl").oninput = hideConnResult;
 $("connSiteName").oninput = hideConnResult;
@@ -850,6 +875,8 @@ $("connSiteType").onchange = hideConnResult;
 $("connInstallOs").onchange = renderConnInstall;
 $("connInstallGithubCopy").onclick = () => copyText($("connInstallGithub").textContent);
 $("connInstallGiteeCopy").onclick = () => copyText($("connInstallGitee").textContent);
+$("connCliLinuxCopy").onclick = () => copyText($("connCliLinux").textContent);
+$("connCliWindowsCopy").onclick = () => copyText($("connCliWindows").textContent);
 
 // ---- 启动 ----
 let _loops = false;

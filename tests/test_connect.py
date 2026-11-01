@@ -11,10 +11,21 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import auth
 import connect
-from test_site_management import cloud, login, report, write  # noqa: F401  (fixture 复用)
+from test_site_management import cloud as cloud_base, login, report, write  # noqa: F401
 
 PW = {"password": "admin-test-password"}
 NEW_SITE = {"action": "new_site", "site_name": "新场", "site_type": "hydro"}
+
+
+@pytest.fixture
+def cloud(cloud_base):
+    from fastapi.testclient import TestClient
+    server, _client = cloud_base
+    # Real operators open the public HTTPS page; no separate public_url save is
+    # needed before generating connection information from that address.
+    client = TestClient(server.app, base_url="https://cloud.example.com")
+    yield server, client
+    client.close()
 
 
 @pytest.fixture(autouse=True)
@@ -33,7 +44,8 @@ def test_connect_requires_admin_and_never_lists_plain_tokens(cloud):
     d = client.get("/api/connect", headers={"Host": "cloud.example.com"}).json()
     assert d["shared"]["set"] and d["shared"]["hint"] == "oken"
     assert "reporting-test-token" not in str(d)
-    assert d["public_url"] == "http://cloud.example.com" and d["url_source"] == "guess"
+    assert d["public_url"] == "https://cloud.example.com" and d["url_source"] == "guess"
+    assert d["address_ready"] and not d["address_error"]
 
 
 def test_reveal_needs_password_and_is_audited(cloud):
@@ -48,6 +60,88 @@ def test_reveal_needs_password_and_is_audited(cloud):
     assert connect.parse_code(d["code"])["t"] == "reporting-test-token"
     actions = [a["action"] for a in server.db.audit_recent(server.CONN, 20)]
     assert "token_reveal" in actions and "connect_pw_fail" in actions
+
+
+def test_existing_shared_site_copies_full_packet_without_rotating_credentials(cloud):
+    server, client = cloud
+    sid = "云海 二期"
+    assert report(client, sid).status_code == 200
+    login(client)
+    assert write(client, "PATCH", f"/api/site/{sid}", json={"name": "管理界面新名"}).status_code == 200
+    server.appconfig.update_settings({"alerts": {"retained": True}})
+    before = copy.deepcopy(server.CFG["ingest"])
+    path = Path(server.appconfig.SETTINGS_FILE)
+    disk = path.read_bytes()
+    expected = {"u": "https://cloud.example.com", "t": "reporting-test-token",
+                "s": sid, "n": "管理界面新名", "y": "hydro"}
+    row = next(x for x in client.get("/api/connect").json()["sites"] if x["id"] == sid)
+    assert row["can_reveal"] and not row["own_token"] and not row["revoked"]
+    for _ in range(2):
+        response = write(client, "POST", "/api/connect/reveal", json={"target": sid, **PW})
+        assert response.status_code == 200
+        assert connect.parse_code(response.json()["code"]) == expected
+        assert response.json()["token"] == expected["t"]
+        assert server.CFG["ingest"] == before
+        assert path.read_bytes() == disk
+    assert report(client, sid).status_code == 200, "copying must leave the installed reporter working"
+    audits = server.db.audit_recent(server.CONN, 20)
+    assert sum(a["action"] == "token_reveal" for a in audits) == 2
+    assert "reporting-test-token" not in str(audits)
+
+
+@pytest.mark.parametrize("own_token", ["dedicated-test-token", "", None, "CHANGE_ME_site_token"])
+def test_site_copy_uses_the_same_dedicated_or_revoked_credential_as_ingest(cloud, own_token):
+    server, client = cloud
+    sid = "st-own"
+    assert report(client, sid).status_code == 200
+    server.CFG["ingest"].setdefault("tokens", {})[sid] = own_token
+    before = copy.deepcopy(server.CFG["ingest"])
+    login(client)
+    row = next(x for x in client.get("/api/connect").json()["sites"] if x["id"] == sid)
+    response = write(client, "POST", "/api/connect/reveal", json={"target": sid, **PW})
+    assert report(client, sid).status_code == 401, "a per-site entry must never fall back to shared"
+    if own_token == "dedicated-test-token":
+        assert row["can_reveal"] and row["own_token"] and not row["revoked"]
+        assert response.status_code == 200
+        packet = connect.parse_code(response.json()["code"])
+        assert packet["t"] == own_token and packet["s"] == sid
+        assert client.post("/api/ingest/ping", headers={"Authorization": f"Bearer {packet['t']}"},
+                           json={"site_id": sid}).status_code == 200
+    else:
+        assert not row["can_reveal"] and row["revoked"]
+        assert response.status_code == 404
+        assert "reporting-test-token" not in response.text
+    assert server.CFG["ingest"] == before
+    assert not Path(server.appconfig.SETTINGS_FILE).exists()
+
+
+def test_shared_site_copy_keeps_admin_password_and_csrf_checks(cloud):
+    server, client = cloud
+    assert report(client, "st-shared").status_code == 200
+    before = copy.deepcopy(server.CFG["ingest"])
+    body = {"target": "st-shared", **PW}
+    assert write(client, "POST", "/api/connect/reveal", json=body).status_code == 401
+    login(client, "viewer")
+    assert write(client, "POST", "/api/connect/reveal", json=body).status_code == 403
+    login(client)
+    assert client.post("/api/connect/reveal", json=body).status_code == 403
+    assert write(client, "POST", "/api/connect/reveal", json={**body, "password": "wrong"}).status_code == 403
+    assert write(client, "POST", "/api/connect/reveal", json=body).status_code == 200
+    assert server.CFG["ingest"] == before
+    assert not Path(server.appconfig.SETTINGS_FILE).exists()
+
+
+def test_shared_site_copy_does_not_create_new_or_pull_bindings(cloud):
+    server, client = cloud
+    server.CFG["sites"] = [{"id": "st-pull", "name": "拉取场地", "url": "http://127.0.0.1:8800"}]
+    login(client)
+    row = next(x for x in client.get("/api/connect").json()["sites"] if x["id"] == "st-pull")
+    assert row["mode"] == "pull" and not row["can_reveal"]
+    for sid in ("st-pull", "st-unknown"):
+        response = write(client, "POST", "/api/connect/reveal", json={"target": sid, **PW})
+        assert response.status_code == 404
+        assert "reporting-test-token" not in response.text
+    assert not Path(server.appconfig.SETTINGS_FILE).exists()
 
 
 def test_reveal_password_failures_lock_out(cloud):
@@ -116,6 +210,94 @@ def test_public_url_validation(cloud):
               json={"public_url": "https://1.2.3.4:8900/", **PW}).json()
     assert d["public_url"] == "https://1.2.3.4:8900" and d["url_source"] == "config"
     assert d["mode"] == "ip"
+
+
+def test_https_page_generates_one_complete_packet_without_saving_address_first(cloud):
+    server, client = cloud
+    login(client)
+    before = client.get("/api/connect").json()
+    assert before["url_source"] == "guess" and before["address_ready"]
+    response = write(client, "POST", "/api/connect/token",
+                     json={**NEW_SITE, "site_name": "北场 / 一期", **PW})
+    assert response.status_code == 200
+    d = response.json()
+    packet = connect.parse_code(d["code"])
+    assert packet == {"u": "https://cloud.example.com", "t": d["token"],
+                      "s": d["target"], "n": "北场 / 一期", "y": "hydro"}
+    assert d["public_url"] == packet["u"]
+    assert "connect" not in server.appconfig.load_settings(), "no extra address configuration step"
+    for _ in range(2):
+        copied = write(client, "POST", "/api/connect/reveal",
+                       json={"target": d["target"], **PW}).json()
+        assert copied["token"] == d["token"] and copied["code"] == d["code"]
+        assert copied["public_url"] == packet["u"]
+    assert client.post("/api/ingest/ping", headers={"Authorization": "Bearer " + packet["t"]},
+                       json={"site_id": packet["s"]}).status_code == 200
+
+
+@pytest.mark.parametrize("url", ["http://cloud.example.com", "http://8.8.8.8:8900", "HTTP://cloud.example.com"])
+def test_public_http_cannot_issue_new_or_rotated_credentials(cloud, url):
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    server.CFG.setdefault("server", {})["public_url"] = url
+    before = copy.deepcopy(server.CFG["ingest"])
+    disk = Path(server.appconfig.SETTINGS_FILE).read_bytes()
+    state = client.get("/api/connect").json()
+    assert not state["address_ready"] and "HTTPS" in state["address_error"]
+    for body in ({**NEW_SITE, **PW}, {"action": "rotate", "target": created["target"], **PW}):
+        denied = write(client, "POST", "/api/connect/token", json=body)
+        assert denied.status_code == 400 and "HTTPS" in denied.json()["detail"]
+        assert server.CFG["ingest"] == before
+        assert Path(server.appconfig.SETTINGS_FILE).read_bytes() == disk
+
+
+def test_inferred_loopback_needs_a_site_reachable_address(cloud):
+    from fastapi.testclient import TestClient
+    server, _client = cloud
+    local = TestClient(server.app, base_url="http://127.0.0.1:8900")
+    login(local)
+    state = local.get("/api/connect").json()
+    assert not state["address_ready"] and "SSH" in state["address_error"]
+    assert write(local, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).status_code == 400
+    assert not Path(server.appconfig.SETTINGS_FILE).exists()
+    # An explicit private URL remains usable for installations on the same network.
+    server.CFG.setdefault("server", {})["public_url"] = "http://192.168.1.10:8900"
+    assert local.get("/api/connect").json()["address_ready"]
+    made = write(local, "POST", "/api/connect/token", json={**NEW_SITE, **PW})
+    assert made.status_code == 200
+    assert connect.parse_code(made.json()["code"])["u"] == "http://192.168.1.10:8900"
+    local.close()
+
+
+def test_forwarded_headers_only_help_when_the_proxy_is_trusted(cloud, monkeypatch):
+    import ipaddress
+    from starlette.requests import Request
+    server, _client = cloud
+    monkeypatch.setattr(server, "_TRUST_PROXY", True)
+    monkeypatch.setattr(server, "_TRUSTED_NETS", [ipaddress.ip_network("127.0.0.0/8")])
+
+    def request(client_ip):
+        return Request({"type": "http", "method": "POST", "scheme": "http", "path": "/api/connect/token",
+                        "server": ("cloud.example.com", 80), "client": (client_ip, 1234),
+                        "query_string": b"", "headers": [(b"host", b"cloud.example.com"),
+                            (b"x-forwarded-proto", b"https"), (b"x-forwarded-host", b"attacker.invalid")]})
+
+    trusted = request("127.0.0.1")
+    packet = connect.parse_code(server._code_for(trusted, "test-token", "st-proxy",
+                                               {"name": "代理场地", "type": "air"}))
+    assert packet["u"] == "https://cloud.example.com"
+    with pytest.raises(server.HTTPException) as exc:
+        server._code_for(request("8.8.8.8"), "test-token")
+    assert exc.value.status_code == 400 and "HTTPS" in exc.value.detail
+    server.CFG.setdefault("server", {})["public_url"] = "https://configured.example.com/prefix"
+    packet = connect.parse_code(server._code_for(request("8.8.8.8"), "test-token"))
+    assert packet["u"] == "https://configured.example.com/prefix"
+
+
+@pytest.mark.parametrize("url", ["https://cloud.example.com/\nextra", "https://cloud .example.com", "https://cloud.example.com/\x00x"])
+def test_control_characters_and_spaces_do_not_become_connection_addresses(url):
+    assert connect.normalize_url(url) is None
 
 
 def test_self_signed_fingerprint_goes_into_code(tmp_path):
@@ -200,7 +382,8 @@ def test_revoked_site_cannot_fall_back_to_shared_token(cloud):
     write(client, "POST", "/api/connect/token", json={"target": sid, "action": "revoke", **PW})
     assert report(client, sid).status_code == 401           # 共享 token 也冒充不了它
     row = next(r for r in client.get("/api/connect").json()["sites"] if r["id"] == sid)
-    assert row["revoked"] and not row["own_token"]
+    assert row["revoked"] and not row["own_token"] and not row["can_reveal"]
+    assert write(client, "POST", "/api/connect/reveal", json={"target": sid, **PW}).status_code == 404
 
 
 def test_legacy_name_as_site_id_is_manageable(cloud):
@@ -257,7 +440,7 @@ def test_named_pending_site_survives_restart_reveal_and_rotation(cloud):
     # 真正重新导入服务：从磁盘重新叠加 token 与元数据，不依赖旧 CFG。
     server.CONN.close()
     server = importlib.reload(server)
-    client = TestClient(server.app)
+    client = TestClient(server.app, base_url="https://cloud.example.com")
     login(client)
     for action in ("reveal", "rotate"):
         endpoint = "/api/connect/reveal" if action == "reveal" else "/api/connect/token"

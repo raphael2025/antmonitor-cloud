@@ -41,6 +41,12 @@ curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | 
 Gitee 模式自动安装 Git 并从 `raphael01/antmonitor-cloud` 的 `master` 分支拉取源码；
 Git 安装或拉取失败时会停止，请修复网络或系统软件源后重试。
 
+GitHub / Gitee 是代码下载网站，不需要注册账号或安装专门的客户端；缺少的 Git / Python 由安装器准备。
+Ubuntu 的命令下载入口需要 `curl`，没有时先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`。
+不确定哪个网站可用时，见 [README 的自动选择入口](../../README.md#三分钟上手)：先完整下载脚本，再执行一次，源码也会自动选源。
+两网站均无法访问时，可拷入完整源码，解压并进入目录执行 `sudo bash install.sh --dir /opt/antmonitor-cloud`，不加 `--source`。
+系统包、Python 包和 HTTPS 所需网络仍须准备；本地 wheels 与限制见 [DEPLOY · 本地源码与受限网络](../DEPLOY.md#本地源码与受限网络)。
+
 两种下载源的部署结果相同：
 
 - 默认目录 `/opt/antmonitor-cloud`，服务名 `antmonitor-cloud`。
@@ -64,7 +70,8 @@ curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | 
 ```
 
 已有官方 GitHub / Gitee Git 部署可以通过 `--source` 切换 `origin`，网页更新随后使用所选仓库。
-不指定 `--source` 时保留现有 `origin`；自维护仓库或 fork 不会被自动改写，使用这类仓库时请省略该选项。
+不指定 `--source` 或选择 `auto` 时保留现有 `origin`。自动模式在官方来源网络 fetch 失败时可临时尝试另一平台同分支，只接受快进，不回退到旧镜像版本。
+自维护仓库或 fork 不会被自动换成官方来源，使用这类仓库时请省略该选项。
 两平台各自能更新到哪个版本，取决于发布者是否同步了相应分支。
 
 默认脚本安装可核对更新来源：
@@ -86,8 +93,8 @@ sudo bash /opt/antmonitor-cloud/install.sh reset-password
 ### 场地接入（名字和类型只填一次）
 
 1. admin 登录云端，打开右上 **「🔌 场地接入」**。
-2. 在 **「添加场地」** 填名称、选择风冷/水冷/混合，输入当前管理员密码，点 **「生成专属接入码」**。
-3. 场地端已安装：打开 **「☁ 连接云端」**，粘贴接入码，点 **「连接云端」**。名称、类型、地址、证书指纹和场地 ID 自动填好。
+2. 在 **「添加场地」** 填名称、选择风冷/水冷/混合，输入当前管理员密码，点 **「生成并复制接入信息」**。
+3. 场地端已安装：打开 **「☁ 连接云端」**，点 **「粘贴接入信息并连接」**。局域网 HTTP 页面如果不能自动读取剪贴板，按提示 **Ctrl+V** 即继续连接。名称、类型、地址、token、证书指纹和场地 ID 自动填好。
 4. 等待云端收到首次上报。列表先显示填写的名称和「等待首次上报」；收到数据后完成接入。单独测试连接不会注册场地。
 
 场地电脑还没安装时，云端结果区提供 **GitHub / Gitee** 安装命令复制按钮。Ubuntu / Linux 选择一条运行，提示时粘贴接入码；
@@ -101,8 +108,13 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- --source gitee --connect-code -
 ```
 
-Windows 在结果区选择 Windows，复制安装命令到场地电脑 PowerShell 运行，装好后在网页粘贴码并「连接云端」。
-Gitee 的 Windows 安装需要先安装 Git for Windows 并加入 PATH。
+Windows 在结果区选择 Windows，复制安装命令到场地电脑 PowerShell 运行，装好后在网页点「粘贴接入信息并连接」。
+GitHub 和 Gitee 安装器都会准备 Git / Python，Gitee 方式无需手动安装 Git，也不依赖 GitHub 下载便携 Git。
+
+**网页和终端使用同一份 `AMC1-…` 接入信息**：Ubuntu 已安装后，在安装目录运行 `sudo bash install.sh connect --dir .`；
+Windows 可以双击安装目录的 `connect-cloud.bat`。按提示粘贴并回车，输入不显示，通过连接测试才保存。
+Windows 原监控还在运行时，需要按提示重启原窗口或服务后生效；Ubuntu 命令会重启原服务。
+已有场地再次复制用「复制接入信息」，不会为了复制而更换 token。复制受浏览器限制时会选中内容，按 **Ctrl+C** 即可。
 
 一键部署已填好云端地址和指纹；需要修改时展开 **「高级管理」**，先「保存地址」，再生成码。
 共享 token 与自动注册开关也在高级管理，正常新增场地不用修改它们。旧接入码继续有效，缺少名称/类型时在场地端补填。

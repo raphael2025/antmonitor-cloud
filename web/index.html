@@ -50,7 +50,7 @@
       <select id="themeSelect" class="theme-select" aria-label="界面主题"><option value="system">跟随系统</option><option value="time">按时间自动</option><option value="light">日间</option><option value="dark">夜间</option></select>
       <span id="lastUpdate" class="muted" data-i18n="header.loading">加载中…</span>
       <button id="btnUpdate" class="hidden primary" data-i18n-title="header.update_title" title="发现新版本，点击更新并重启"></button>
-      <button id="btnConnect" class="hidden" data-i18n="header.connect" data-i18n-title="header.connect_title" title="各场地接入云端要填的地址、上报 token、证书指纹">🔌 场地接入</button>
+      <button id="btnConnect" class="hidden" data-i18n="header.connect" data-i18n-title="header.connect_title" title="生成供场地端粘贴的接入信息">🔌 场地接入</button>
       <button id="btnNotifySettings" class="hidden" title="配置告警通知渠道(Telegram/Webhook/邮件)" data-i18n="header.notify" data-i18n-title="header.notify_title" title="配置告警通知渠道(Telegram/Webhook/邮件)">⚙ 通知设置</button>
       <button id="btnSecurity" class="hidden" title="修改密码；管理员可看安全自检、操作记录、强制下线" data-i18n="header.security" data-i18n-title="header.security_title" title="修改密码；管理员可看安全自检、操作记录、强制下线">🔒 账号安全</button>
       <span id="userBadge" class="badge"></span>
@@ -251,9 +251,9 @@
         <span style="flex:1"></span>
         <button id="connectClose">×</button>
       </div>
-      <div class="muted" data-i18n="conn.intro">填写场地名称和类型，生成一份专属接入码。场地端粘贴后即可自动填好上报信息。</div>
+      <div class="muted" data-i18n="conn.intro">填好场地名称和类型，复制一份场地接入信息。本地网页和命令行都能粘贴同一份内容，不用分别填写地址和 token。</div>
       <div id="connWarn" class="conn-warn"></div>
-      <div class="muted conn-current"><span data-i18n="conn.current_url">当前云端：</span><span id="connUrlCurrent"></span></div>
+      <div class="muted conn-current"><span data-i18n="conn.current_url">上报地址：</span><span id="connUrlCurrent"></span></div>
 
       <h3 data-i18n="conn.add_site">添加场地</h3>
       <div class="formrow">
@@ -264,23 +264,36 @@
           <option value="mixed" data-i18n="type.mixed">混合</option>
         </select></label>
       </div>
-      <h3 data-i18n="conn.pw">管理员密码（查看或更换 token 前验证）</h3>
+      <h3 data-i18n="conn.pw">输入云端管理员密码确认本次操作</h3>
       <div class="formrow">
         <input type="password" id="connPw" autocomplete="current-password" data-i18n-placeholder="conn.pw_ph" placeholder="输入你的登录密码">
-        <button id="connNewSite" class="primary" data-i18n="conn.new_site">生成专属接入码</button>
+        <button id="connNewSite" class="primary" data-i18n="conn.new_site">生成并复制接入信息</button>
       </div>
 
       <div id="connResult" class="conn-result hidden">
-        <div class="conn-warn" data-i18n="conn.secret_warn">⚠ 接入码含专属凭据，只发给对应场地负责人。2 分钟后隐藏，凭据不会因此失效。</div>
         <div id="connResultFor" class="conn-result-for"></div>
-        <div class="formrow"><label data-i18n="conn.code">接入码</label><input type="text" id="connCode" class="wide" readonly><button id="connCodeCopy" data-i18n="conn.copy">复制</button></div>
-        <p class="muted" data-i18n="conn.existing_help">场地端已安装：打开「⚙ 网段 → ☁ 云端上报」，粘贴接入码并点「测试并保存」。云端收到首次上报后才算接入完成。</p>
-        <h3 data-i18n="conn.install_title">场地端还没安装？</h3>
-        <div class="formrow"><label><span data-i18n="conn.install_os">场地电脑系统</span><select id="connInstallOs"><option value="linux">Ubuntu / Linux</option><option value="windows">Windows</option></select></label></div>
-        <p class="muted" id="connInstallHelp"></p>
-        <div class="conn-install-command"><div><strong>GitHub</strong><button id="connInstallGithubCopy" data-i18n="conn.copy_install">复制安装命令</button></div><code id="connInstallGithub"></code></div>
-        <div class="conn-install-command"><div><strong>Gitee</strong><button id="connInstallGiteeCopy" data-i18n="conn.copy_install">复制安装命令</button></div><code id="connInstallGitee"></code></div>
-        <details class="conn-raw-token" id="connRawToken"><summary data-i18n="conn.raw_token">单独查看 token（高级）</summary><div class="formrow"><label>token</label><input type="text" id="connTok" class="wide" readonly><button id="connTokCopy" data-i18n="conn.copy">复制</button></div></details>
+        <div class="conn-current"><span data-i18n="conn.current_url">上报地址：</span><code id="connResultUrl"></code></div>
+        <p class="muted" id="connIncludes"></p>
+        <button id="connCodeCopy" class="primary conn-copy-main" data-i18n="conn.copy_info">复制场地接入信息</button>
+        <p class="muted" data-i18n="conn.existing_help">在本地网页点击「☁ 连接云端 → 粘贴接入信息并连接」，或在终端绑定提示中粘贴同一份内容。连接测试通过后保存，上报状态会显示是否已收到数据。</p>
+        <div class="conn-warn" data-i18n="conn.secret_warn">接入信息含上报凭据，只交给对应场地负责人。2 分钟后隐藏，凭据不会因此失效。</div>
+        <details class="conn-help">
+          <summary data-i18n="conn.cli_title">已有安装：在命令行绑定</summary>
+          <p class="muted" data-i18n="conn.cli_help">在场地端原安装文件夹运行对应命令，然后粘贴同一份接入信息。接入信息不需要写进命令。</p>
+          <div class="conn-install-command"><div><strong>Ubuntu / Linux</strong><button id="connCliLinuxCopy" data-i18n="conn.copy_command">复制命令</button></div><code id="connCliLinux">sudo bash install.sh connect --dir .</code></div>
+          <div class="conn-install-command"><div><strong>Windows</strong><button id="connCliWindowsCopy" data-i18n="conn.copy_command">复制命令</button></div><code id="connCliWindows">.\connect-cloud.bat</code></div>
+        </details>
+        <details class="conn-help">
+          <summary data-i18n="conn.install_title">场地端还没安装？</summary>
+          <div class="formrow"><label><span data-i18n="conn.install_os">场地电脑系统</span><select id="connInstallOs"><option value="linux">Ubuntu / Linux</option><option value="windows">Windows</option></select></label></div>
+          <p class="muted" id="connInstallHelp"></p>
+          <div class="conn-install-command"><div><strong>GitHub</strong><button id="connInstallGithubCopy" data-i18n="conn.copy_install">复制安装命令</button></div><code id="connInstallGithub"></code></div>
+          <div class="conn-install-command"><div><strong>Gitee</strong><button id="connInstallGiteeCopy" data-i18n="conn.copy_install">复制安装命令</button></div><code id="connInstallGitee"></code></div>
+        </details>
+        <details class="conn-help" id="connDetails"><summary data-i18n="conn.details">查看接入信息 / 手工复制</summary>
+          <div class="formrow"><label data-i18n="conn.code">场地接入信息</label><input type="text" id="connCode" class="wide" readonly spellcheck="false" autocomplete="off"></div>
+          <details class="conn-raw-token" id="connRawToken"><summary data-i18n="conn.raw_token">单独查看 token（高级）</summary><div class="formrow"><label>token</label><input type="text" id="connTok" class="wide" readonly><button id="connTokCopy" data-i18n="conn.copy">复制</button></div></details>
+        </details>
       </div>
       <div id="connMsg" class="notifymsg muted" role="status" aria-live="polite"></div>
 
@@ -292,7 +305,7 @@
 
       <details id="connAdvanced" class="conn-advanced">
         <summary data-i18n="conn.advanced">高级管理：云端地址、证书和共享 token</summary>
-        <h3 data-i18n="conn.addr">云端地址（各场地填这个）</h3>
+        <h3 data-i18n="conn.addr">上报地址（特殊网络或自定义地址）</h3>
         <div class="formrow">
           <input type="text" id="connUrl" class="wide" spellcheck="false" autocomplete="off" placeholder="https://overview.example.com  /  https://1.2.3.4:8900">
           <span id="connMode" class="chbadge"></span>

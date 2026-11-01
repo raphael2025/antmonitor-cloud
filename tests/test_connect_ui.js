@@ -11,7 +11,7 @@ const app = fs.readFileSync(path.join(root, "web/app.js"), "utf8");
 const source = app.slice(app.indexOf("// ---- 场地接入："), app.indexOf("// ---- 启动 ----"));
 assert.ok(source.length > 1000, "load the real onboarding section");
 
-function setup() {
+function setup(options = {}) {
   const elements = new Map();
   function element(id) {
     assert.ok(ids.has(id), `UI element exists in HTML: ${id}`);
@@ -22,12 +22,14 @@ function setup() {
         open: false, dataset: {}, style: {}, focused: false,
         classList: { add: (x) => classes.add(x), remove: (x) => classes.delete(x),
           contains: (x) => classes.has(x), toggle: (x, hide) => hide ? classes.add(x) : classes.delete(x) },
-        focus() { this.focused = true; }, addEventListener() {}, querySelector: () => tbody,
+        focus() { this.focused = true; }, select() { this.selected = true; },
+        addEventListener() {}, querySelector: () => tbody,
       });
     }
     return elements.get(id);
   }
   let state = { public_url: "https://cloud.example.com", mode: "domain", fingerprint: "", warnings: [],
+    address_ready: true, address_error: "",
     shared: { set: true, hint: "tail" }, auto_register: false, sites: [] };
   const calls = [], copies = [];
   const context = vm.createContext({ $: element, t: (key) => key,
@@ -39,11 +41,18 @@ function setup() {
         state = { ...state, ...body, public_url: body.public_url.replace(/\/+$/, "") };
         return { ok: true, json: async () => state };
       }
-      return { ok: true, json: async () => ({ target: "st-test", token: "secret-test-token", code: "AMC1-secret-code",
-        site_name: body.site_name, site_type: body.site_type }) };
+      const code = "AMC1-" + Buffer.from(JSON.stringify({ u: state.public_url, t: "secret-test-token",
+        s: "st-test", n: body.site_name || "北场 / 一期", y: body.site_type || "hydro" })).toString("base64url");
+      return { ok: true, json: async () => ({ target: "st-test", token: "secret-test-token", code,
+        public_url: state.public_url, site_name: body.site_name || "北场 / 一期", site_type: body.site_type || "hydro" }) };
     },
     errText: async () => "request failed", confirm: () => true,
-    navigator: { clipboard: { writeText: async (value) => copies.push(value) } },
+    navigator: { clipboard: { writeText: async (value) => {
+      if (options.clipboardBlocked) throw new Error("clipboard denied");
+      copies.push(value);
+    } } },
+    document: { body: { appendChild() {} }, createElement: () => ({ value: "", select() {}, remove() {} }),
+      execCommand: () => options.execCopyResult === true },
     setTimeout: () => 1, clearTimeout() {},
   });
   vm.runInContext(source, context, { filename: "web/app.js:onboarding" });
@@ -72,6 +81,13 @@ function setup() {
   assert.equal(a.calls[1].body.site_type, "hydro");
   assert.equal(a.calls[1].body.password, "password-for-test");
   assert.equal(a.element("connNewSite").disabled, false);
+  assert.equal(a.copies.at(-1), a.element("connCode").value, "generation copies the entire connection packet");
+  const decoded = JSON.parse(Buffer.from(a.copies.at(-1).slice(5), "base64url").toString());
+  assert.deepEqual(decoded, { u: "https://new.example.com", t: "secret-test-token", s: "st-test", n: "北场 / 一期", y: "hydro" });
+  assert.equal(a.element("connResultUrl").textContent, decoded.u);
+  await a.context.connAction("reveal", "st-test");
+  assert.equal(a.calls.at(-1).url, "/api/connect/reveal", "recopying an existing site does not rotate credentials");
+  assert.equal(a.copies.at(-1), a.element("connCode").value, "existing-site action copies in one operation");
   for (const [label, sourceName] of [["Github", "github"], ["Gitee", "gitee"]]) {
     const command = a.element("connInstall" + label).textContent;
     assert.ok(command.includes(`--source ${sourceName} --connect-code -`));
@@ -87,6 +103,22 @@ function setup() {
   const table = a.element("tblConnSites").querySelector("tbody").innerHTML;
   assert.ok(table.includes("&lt;北场&gt;") && table.includes("conn.waiting"));
   assert.ok(!table.includes("<北场>"));
+  a.context.renderConnect({ ...a.state(), sites: [
+    { id: "st-shared", name: "已有共享场地", mode: "push", registered: true, can_reveal: true },
+    { id: "st-revoked", name: "已撤销场地", mode: "push", registered: true, revoked: true, can_reveal: false },
+    { id: "st-pull", name: "拉取场地", mode: "pull", registered: true, can_reveal: false },
+  ] });
+  const sharedTable = a.element("tblConnSites").querySelector("tbody").innerHTML;
+  assert.ok(sharedTable.includes('data-act="reveal" data-id="st-shared"'), "existing shared sites can copy without rotating");
+  assert.ok(sharedTable.includes('data-act="rotate" data-id="st-shared"'), "dedicated-token creation remains a separate action");
+  assert.ok(!sharedTable.includes('data-act="reveal" data-id="st-revoked"'), "revocation cannot fall back to shared");
+  assert.ok(!sharedTable.includes('data-act="reveal" data-id="st-pull"'));
+  const beforeSharedCopy = a.calls.length;
+  await a.context.connAction("reveal", "st-shared");
+  assert.equal(a.calls.length, beforeSharedCopy + 1);
+  assert.equal(a.calls.at(-1).url, "/api/connect/reveal");
+  assert.equal(a.calls.at(-1).body.target, "st-shared");
+  assert.equal(a.copies.at(-1), a.element("connCode").value);
   a.context.hideConnResult();
   assert.equal(a.element("connCode").value, "");
   assert.equal(a.element("connTok").value, "");
@@ -102,5 +134,23 @@ function setup() {
   assert.equal(b.calls.length, 0);
   assert.equal(b.element("connMsg").textContent, "conn.need_pw");
   assert.equal(b.element("connNewSite").disabled, false);
-  console.log("onboarding UI: unsaved URL, named create, secret-free source commands, pending names and validation passed");
+
+  const c = setup({ clipboardBlocked: true });
+  await c.element("connNewSite").onclick();
+  assert.equal(c.element("connMsg").textContent, "conn.copy_manual", "execCommand false must not claim success");
+  assert.equal(c.element("connDetails").open, true);
+  assert.equal(c.element("connCode").focused, true);
+  assert.equal(c.element("connCode").selected, true);
+  assert.ok(c.element("connCode").value.startsWith("AMC1-"), "manual copying keeps the same packet available");
+  const d = setup({ clipboardBlocked: true, execCopyResult: true });
+  await d.element("connNewSite").onclick();
+  assert.equal(d.element("connMsg").textContent, "conn.copied", "legacy copy fallback can succeed");
+
+  const e = setup();
+  e.context.renderConnect({ ...e.state(), address_ready: false, address_error: "HTTPS is required" });
+  await e.element("connNewSite").onclick();
+  assert.equal(e.calls.length, 0, "unusable addresses never issue credentials");
+  assert.equal(e.element("connMsg").textContent, "HTTPS is required");
+  assert.equal(e.element("connAdvanced").open, true);
+  console.log("onboarding UI: one-copy packets, clipboard fallback, existing-site recopy, address validation and secret-free commands passed");
 })().catch((e) => { console.error(e); process.exitCode = 1; });

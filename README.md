@@ -85,6 +85,24 @@ curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | 
 Gitee 命令自动安装 Git 并从 Gitee 拉取源码。默认安装到 `/opt/antmonitor-cloud`；安装时设置 admin 密码，
 直接回车会生成强密码并显示一次。结束时显示面板地址和无域名模式的证书指纹。
 
+GitHub / Gitee 是代码下载来源，无需注册账号或安装它们的客户端。下载命令需要 `curl`；Ubuntu 没有时先运行
+`sudo apt-get update && sudo apt-get install -y curl ca-certificates`。
+
+<details><summary>自动判断 GitHub / Gitee，或者两边都打不开</summary>
+
+不确定哪个来源可访问时，复制下面的一条命令；先完整下载脚本，再执行一次。脚本内的 `auto` 也会尝试可用的源码来源。
+有域名时在末尾 `--source auto` 后追加 `--domain 你的域名`。
+
+```bash
+( f=$(mktemp) && trap 'rm -f "$f"' EXIT && { curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master/install.sh -o "$f" || curl -fsSL --connect-timeout 10 --max-time 60 https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh -o "$f"; } && sudo bash "$f" --source auto )
+```
+
+两边都不通时，可以把完整源码 ZIP 拷到服务器，解压并进入目录执行 `sudo bash install.sh --dir /opt/antmonitor-cloud`，不要指定 `--source`。
+系统包、Python 依赖和 HTTPS 所需资源仍需可用网络或事先准备。Python wheels 可放到项目 `offline/wheels`，或通过
+`ANTCLOUD_WHEELHOUSE` 指定目录；这会禁用在线 pip 索引，不代表已包含所有系统依赖。详见[本地源码部署](docs/DEPLOY.md#本地源码与受限网络)。
+
+</details>
+
 ### 后续更新与换源
 
 更新代码、Python 依赖并重启，按希望使用的来源选一条：
@@ -97,20 +115,29 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor-cloud/master
 curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | sudo bash -s -- update --source gitee
 ```
 
-已有官方 Git 部署可以用 `--source` 切换来源；不指定时沿用现有 `origin`，自定义仓库不会被自动改写。
+已有官方 Git 部署可以用 `--source github` / `--source gitee` 切换来源；不指定或 `--source auto` 时保留现有 `origin`。
+自动模式遇到官方来源 fetch 网络失败时，会尝试另一平台的同分支并仅接受快进更新，不回退到旧镜像；自定义仓库不会被切换到官方仓库。
 自定义安装目录需在安装和更新时都补 `--dir '/实际安装目录'`。
 系统软件、Python 依赖和域名证书仍需联网获取；两平台的版本同步与运维细节见[部署与运维](docs/DEPLOY.md)。
 
 ### 接入场地
 
-**名称和类型只填一次**：admin 登录 → 右上「🔌 场地接入」→ 在「添加场地」填写名称、类型和当前管理员密码 → **生成专属接入码**。
+**云端复制一次，本地粘贴一次，不用拆开填写地址和 token。**
 
-- 场地端已安装：在「☁ 连接云端」粘贴接入码，点 **「连接云端」**。名称、类型、云端地址、证书指纹和场地 ID 自动填好。
-- 场地端尚未安装：页面提供 **GitHub / Gitee** 两个安装命令复制按钮。在场地电脑运行其中一条；Ubuntu / Linux 提示时粘贴接入码，Windows 安装后在网页粘贴。Windows 的 Gitee 安装需先准备 Git for Windows。
-- 云端收到首次上报后，场地才从「等待首次上报」变成已接入。已有旧接入码仍可用；旧码没有名称/类型时，在场地端补填即可。
+1. admin 登录云端 →「🔌 场地接入」→ 填场地名称、类型和当前管理员密码 → **「生成并复制接入信息」**。
+2. 本地端打开「☁ 连接云端」→ **「粘贴接入信息并连接」**。局域网 HTTP 页面若提示不能自动读剪贴板，直接按 **Ctrl+V**，程序会继续验证和保存。
+3. 看到最近上报成功时间，并在云端看到该场地，即完成接入。尚未完成首轮扫描时，先在本地设置矿机网段并扫描。
 
-地址、证书和共享 token 收在「高级管理」；修改地址要先保存，再生成码。接入码只交给对应场地负责人，**不要把它写进安装命令**。
-2 分钟后自动隐藏只是清空页面显示，凭据不会过期；以后仍可在对应场地行查看或更换，保存的名称和类型不会丢失。详细步骤见[场地接入](docs/DEPLOY.md#4-场地接入每个场地一次)。
+复制的是同一份 `AMC1-…` 接入信息，已包含上报地址、token、证书指纹（需要时）、场地 ID、名称和类型；**网页和命令界面通用**。
+Ubuntu 首次安装时按提示粘贴；已安装后在安装目录运行 `sudo bash install.sh connect --dir .`。
+Windows 已安装后也可以双击 `connect-cloud.bat`，按提示粘贴；原监控仍在运行时，保存后按提示重启原窗口即可生效。
+
+场地端尚未安装时，展开结果区的安装说明，复制 **GitHub / Gitee** 安装命令。安装器会准备 Git / Python，无需用户先克隆仓库。
+已有场地再次复制用 **「复制接入信息」**，不会更换正在使用的 token；旧接入码仍兼容，缺少名称或类型时再补填。
+
+云端正常 HTTPS 地址可直接生成；经 SSH 隧道或 localhost 访问时，需要在「高级管理」先保存场地能够访问的地址。
+接入信息只交给对应场地负责人，**不要写进安装命令**。2 分钟后隐藏只清空页面显示，凭据不会过期。
+详细步骤见[场地接入](docs/DEPLOY.md#4-场地接入每个场地一次)。
 
 完整「简介 · 部署 · 使用」→ [选语言阅读](docs/guide/README.md)
 

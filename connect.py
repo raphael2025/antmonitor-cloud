@@ -60,6 +60,8 @@ def normalize_url(url):
     u = str(url or "").strip().rstrip("/")
     if not u:
         return ""
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in u):
+        return None
     try:
         sp = urlsplit(u)
         port = sp.port   # 端口不是数字会抛 ValueError
@@ -71,6 +73,30 @@ def normalize_url(url):
         return None
     del port
     return u
+
+
+def reporting_url_error(url, inferred=False):
+    """Match the site's reporting transport rules before issuing credentials.
+
+    A normal HTTPS page already supplies a usable address. A localhost page may
+    instead be an SSH tunnel: that address would point at the site itself when
+    pasted there, so an inferred loopback address needs an explicit replacement.
+    """
+    u = normalize_url(url)
+    if not u:
+        return "请填写场地能访问的上报地址，例如 https://cloud.example.com"
+    parsed = urlsplit(u)
+    host = parsed.hostname or ""
+    try:
+        ip = ipaddress.ip_address(host)
+        private, loopback = ip.is_private or ip.is_loopback, ip.is_loopback
+    except ValueError:
+        private = loopback = host.lower() == "localhost"
+    if inferred and loopback:
+        return "当前是本机或 SSH 转发地址，请在高级管理中填写场地能访问的云端地址"
+    if parsed.scheme == "http" and not private:
+        return "公网云端须使用 HTTPS；请用 HTTPS 打开面板，或在高级管理中填写正确的上报地址"
+    return ""
 
 
 def server_info(cfg):
@@ -86,7 +112,7 @@ def server_info(cfg):
 def mode_of(url, info):
     if not url:
         return "unset"
-    if url.startswith("http://"):
+    if urlsplit(url).scheme == "http":
         return "http"
     if info["self_signed"]:
         return "ip" if host_is_ip(url) else "self_signed"

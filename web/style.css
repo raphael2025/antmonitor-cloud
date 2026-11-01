@@ -178,6 +178,10 @@ table.mini td { font-size: 13px; }
 .conn-result input[readonly] { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
 .conn-current { margin: 10px 0; overflow-wrap: anywhere; }
 .conn-result-for { font-weight: 600; margin-bottom: 10px; overflow-wrap: anywhere; }
+.conn-copy-main { padding: 10px 18px; font-size: 14px; }
+.conn-help { margin-top: 14px; border-top: 1px solid #30363d; padding-top: 12px; }
+.conn-help > summary { cursor: pointer; font-size: 13px; }
+.conn-help > .formrow { margin-top: 10px; }
 #connectModal select { background: #0d1117; border: 1px solid #30363d; color: #e6e6e6; padding: 6px 8px; border-radius: 6px; }
 .conn-advanced, .conn-raw-token { margin-top: 16px; border-top: 1px solid #30363d; padding-top: 12px; }
 .conn-advanced summary, .conn-raw-token summary { cursor: pointer; font-size: 13px; color: #adbac7; }

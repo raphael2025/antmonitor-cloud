@@ -524,10 +524,8 @@ def _bearer(request: Request):
     return got[7:].strip() if got.startswith("Bearer ") else ""
 
 
-def _check_ingest_token(request: Request, site_id):
-    """每场地钥匙优先：ingest.tokens 里配了该 site_id 就必须用它自己的钥匙
-    (共享钥匙对它无效——防一个场地被攻破后冒充其它场地)；没配的场地用共享 ingest.token。
-    模板占位值(CHANGE_ME…)一律视为没配。"""
+def _ingest_tokens():
+    """接收上报与复制接入信息共用同一份钥匙规则；显式撤销不可退回共享钥匙。"""
     icfg = CFG.get("ingest") or {}
     # 专属钥匙是占位值 → 该场地无有效钥匙(拒收)，而不是悄悄退回共享钥匙
     per = {str(k): ("" if seccheck.is_placeholder(v) else str(v))
@@ -535,6 +533,15 @@ def _check_ingest_token(request: Request, site_id):
     shared = str(icfg.get("token") or "")
     if seccheck.is_placeholder(shared):
         shared = ""
+    return per, shared
+
+
+def _check_ingest_token(request: Request, site_id):
+    """每场地钥匙优先：ingest.tokens 里配了该 site_id 就必须用它自己的钥匙
+    (共享钥匙对它无效——防一个场地被攻破后冒充其它场地)；没配的场地用共享 ingest.token。
+    模板占位值(CHANGE_ME…)一律视为没配。"""
+    icfg = CFG.get("ingest") or {}
+    per, shared = _ingest_tokens()
     if not shared and not any(per.values()):
         raise HTTPException(404)   # 完全未配置则整组端点视为不存在(fail-closed)
     rate = int(icfg.get("rate_per_min") or 120)
@@ -738,6 +745,13 @@ def _connect_site_meta(site_id, sites=None):
             "type": kind if kind in ("air", "hydro", "mixed") else ""}
 
 
+def _site_connect_token(site_id, sites, per, shared):
+    """已登记专属钥匙优先；使用共享钥匙的已有推送场地可以原样复制。"""
+    if site_id in per:
+        return per[site_id]
+    return shared if (sites.get(site_id) or {}).get("mode") == "push" else ""
+
+
 def _new_site_meta(body):
     """用户输入不静默截断或换成默认值，以免安装的是另一个名称/类型。"""
     name = body.get("site_name")
@@ -763,8 +777,7 @@ def _public_url(request: Request):
 
 def _connect_payload(request: Request):
     icfg = CFG.get("ingest") or {}
-    per = icfg.get("tokens") if isinstance(icfg.get("tokens"), dict) else {}
-    shared = str(icfg.get("token") or "")
+    per, shared = _ingest_tokens()
     url, src = _public_url(request)
     info = connect.server_info(CFG)
     sites = {x["id"]: x for x in all_sites()}
@@ -779,19 +792,16 @@ def _connect_payload(request: Request):
                      "type": x.get("type") or meta["type"],
                      "mode": x.get("mode") or "push",
                      "own_token": _valid_token(tok), "hint": _hint(tok),
+                     "can_reveal": bool(_site_connect_token(sid, sites, per, shared)),
                      "revoked": sid in per and not _valid_token(tok),
                      # 网页换过/撤销过的就不再算 config.yaml 里的那把
                      "from_config": sid in _YAML_INGEST["tokens"] and sid not in over_tokens})
-    warnings = []
-    if src == "guess":
-        warnings.append("还没设置「云端地址」，下面按你当前访问的地址猜测，请确认各场地能访问到它")
-    if url.startswith("http://") and not connect.host_is_ip(url):
-        warnings.append("云端地址是 http://，token 会明文传输；有域名请用 https")
-    elif url.startswith("http://"):
-        warnings.append("云端地址是 http://(明文)：公网 IP 场地端会拒绝，请用一键安装的 IP 模式(自签 HTTPS)")
+    address_error = connect.reporting_url_error(url, inferred=src == "guess")
+    warnings = [address_error] if address_error else []
     if not _valid_token(shared) and not any(_valid_token(v) for v in per.values()):
         warnings.append("还没有任何有效的上报 token：上报接口处于关闭状态，场地无法接入")
     return {"ok": True, "public_url": url, "url_source": src,
+            "address_ready": not address_error, "address_error": address_error,
             "mode": connect.mode_of(url, info), "fingerprint": info["fingerprint"],
             "self_signed": info["self_signed"],
             "shared": {"set": _valid_token(shared), "hint": _hint(shared),
@@ -819,10 +829,11 @@ def _confirm_pw(request: Request, sess, body):
 
 
 def _code_for(request: Request, token, site_id="", meta=None):
-    url, _src = _public_url(request)
+    url, src = _public_url(request)
+    why = connect.reporting_url_error(url, inferred=src == "guess")
+    if why:
+        raise HTTPException(400, why)
     url = connect.normalize_url(url)
-    if not url:
-        raise HTTPException(400, "请先在高级管理中保存有效的云端地址")
     meta = _connect_site_meta(site_id) if meta is None and site_id else (meta or {})
     return connect.make_code(url, token, connect.server_info(CFG)["fingerprint"], site_id,
                              meta.get("name", ""), meta.get("type", ""))
@@ -870,22 +881,25 @@ def _target(body):
 
 @app.post("/api/connect/reveal")
 def api_connect_reveal(request: Request, body: dict = Body(...)):
-    """查看某把 token(共享或场地专属) + 对应接入码。"""
+    """复制当前有效的接入信息，不生成或更换共享/专属钥匙。"""
     sess = _require_admin(request)
     target = _target(body)
     _confirm_pw(request, sess, body)
-    icfg = CFG.get("ingest") or {}
+    per, shared = _ingest_tokens()
+    sites = {x["id"]: x for x in all_sites()}
     if target == "shared":
-        tok = str(icfg.get("token") or "")
+        tok = shared
         sid = ""
     else:
-        tok = str((icfg.get("tokens") or {}).get(target) or "")
+        tok = _site_connect_token(target, sites, per, shared)
         sid = target
     if not _valid_token(tok):
         raise HTTPException(404, "这把 token 还没生成")
     _audit(request, sess["user"], "token_reveal", target)
-    meta = _connect_site_meta(sid) if sid else {}
-    return {"ok": True, "target": target, "token": tok, "code": _code_for(request, tok, sid, meta),
+    meta = _connect_site_meta(sid, sites) if sid else {}
+    code = _code_for(request, tok, sid, meta)
+    return {"ok": True, "target": target, "token": tok, "code": code,
+            "public_url": connect.parse_code(code)["u"],
             "site_name": meta.get("name", ""), "site_type": meta.get("type", "")}
 
 
@@ -927,6 +941,7 @@ def api_connect_token(request: Request, body: dict = Body(...)):
         _save_ingest(save_site)
     _audit(request, sess["user"], "token_new_site" if action == "new_site" else "token_rotate", target)
     return {"ok": True, "target": target, "token": tok, "code": code,
+            "public_url": connect.parse_code(code)["u"],
             "site_name": "" if target == "shared" else meta["name"],
             "site_type": "" if target == "shared" else meta["type"]}
 

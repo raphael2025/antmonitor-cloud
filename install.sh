@@ -20,7 +20,7 @@
 set -euo pipefail
 
 REPO="${ANTCLOUD_REPO:-raphael2025/antmonitor-cloud}"
-SOURCE="${ANTCLOUD_SOURCE:-github}"
+SOURCE="${ANTCLOUD_SOURCE:-auto}"
 SOURCE_EXPLICIT=0
 [[ -n "${ANTCLOUD_SOURCE:-}" ]] && SOURCE_EXPLICIT=1
 BRANCH="${ANTCLOUD_BRANCH:-master}"
@@ -45,7 +45,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     install|update|uninstall|reset-password|info) ACTION="$1" ;;
     --source)
-      [[ $# -ge 2 ]] || { echo '--source requires github or gitee' >&2; exit 2; }
+      [[ $# -ge 2 ]] || { echo '--source requires auto, github or gitee' >&2; exit 2; }
       SOURCE="$2"; SOURCE_EXPLICIT=1; shift ;;
     --domain) DOMAIN="${2:-}"; MODE="domain"; shift ;;
     --ip) PUBLIC_IP="${2:-}"; [[ -z "$MODE" ]] && MODE="ip"; shift ;;
@@ -59,6 +59,8 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+[[ -n "$DIR" ]] || { echo '--dir must not be empty' >&2; exit 2; }
+[[ "$DIR" == /* ]] || DIR="$PWD/$DIR"
 [[ -z "$LANG_CODE" ]] && LANG_CODE="zh"
 
 # 未显式选择 --source 时，从解压/克隆目录运行会直接使用本地源码(pip 依赖仍需联网或镜像)
@@ -81,10 +83,14 @@ warn() { echo "${YLW}!${RST} $*"; }
 die()  { echo "${RED}✗${RST} $*" >&2; exit 1; }
 
 case "$SOURCE" in
-  github) REPO_URL="${GH_PROXY}https://github.com/${REPO}.git" ;;
+  auto|github) REPO_URL="${GH_PROXY}https://github.com/${REPO}.git" ;;
   gitee) REPO_URL="https://gitee.com/raphael01/antmonitor-cloud.git" ;;
-  *) die "$(L '--source 只支持 github 或 gitee' '--source must be github or gitee')" ;;
+  *) die "$(L '--source 只支持 auto、github 或 gitee' '--source must be auto, github or gitee')" ;;
 esac
+AUTO_SOURCE=0
+[[ "$SOURCE" != auto || "$REPO" != raphael2025/antmonitor-cloud ]] || AUTO_SOURCE=1
+export GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never
+export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}" GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-30}"
 
 # curl | bash 时标准输入是脚本本身：交互一律走 /dev/tty，没有终端(cloud-init 等)就用默认值
 has_tty() { ( exec </dev/tty ) 2>/dev/null; }
@@ -162,7 +168,7 @@ official_origin() {
 }
 
 select_origin() {
-  [[ "$SOURCE_EXPLICIT" -eq 1 ]] || return 0
+  [[ "$SOURCE_EXPLICIT" -eq 1 && "$SOURCE" != auto ]] || return 0
   local current
   current="$(git_dir remote get-url origin)" \
     || die "$(L '没有 origin，无法选择更新来源；请先配置 Git 远端' 'No origin; configure the Git remote before selecting a source')"
@@ -186,6 +192,7 @@ fetch_tarball() {
     rm -rf "$tmp"
     die "$(L '下载失败：检查服务器能否访问 GitHub；国内服务器可设 GH_PROXY 镜像前缀后重试' 'Download failed; check GitHub access or set GH_PROXY')"
   fi
+  [[ -f "$tmp/server.py" && -f "$tmp/requirements.txt" ]] || { rm -rf "$tmp"; die 'Downloaded source is incomplete; existing files were preserved.'; }
   prepare_dir
   give_tmp "$tmp"
   as_svc cp -a "$tmp"/. "$DIR"/      # config.yaml / 数据库 / 证书不在源码包里，不会被覆盖
@@ -194,6 +201,7 @@ fetch_tarball() {
 
 copy_local_src() {
   info "$(L '使用本地源码' 'Using local source') $SRC → $DIR"
+  [[ ! -e "$DIR/.git" ]] || die "$(L '目标已有 Git 版本信息，不能用本地源码覆盖；请使用 Git 快进更新，或安装到独立目录' 'Destination is a Git checkout; use a fast-forward Git update or a separate installation directory')"
   prepare_dir
   tar -C "$SRC" --exclude=./venv --exclude=./.venv --exclude=./.git --exclude=./config.yaml \
     --exclude=./cloud_settings.json --exclude='./*.db' --exclude='./*.db-*' --exclude=./certs \
@@ -215,10 +223,24 @@ fetch_code() {
       || die "$(L '现有安装是 Git 仓库，请安装 Git 后重试，避免覆盖更新来源' 'This installation is a Git checkout; install Git before updating')"
     select_origin
     info "$(L '更新代码' 'Updating code') (git, $BRANCH)"
-    if git_dir fetch -q origin "$BRANCH" && git_dir merge -q --ff-only FETCH_HEAD; then
-      return
+    if ! git_dir fetch -q origin "$BRANCH"; then
+      local origin alternate current
+      origin="$(git_dir remote get-url origin)"
+      [[ "$AUTO_SOURCE" == 1 ]] && official_origin "$origin" \
+        || die "$(L '现有来源不可达，代码保持不变' 'Origin unavailable; existing code was preserved')"
+      git_dir diff --quiet && git_dir diff --cached --quiet \
+        || die "$(L '工作区有本地改动，自动备用源更新已停止' 'Local changes prevent automatic fallback')"
+      current="$(git_dir rev-parse --abbrev-ref HEAD)"
+      [[ "$current" == "$BRANCH" ]] || die "$(L '备用源不能自动切换分支' 'Fallback cannot switch branches')"
+      if [[ "$origin" == *gitee.com* ]]; then alternate="${GH_PROXY}https://github.com/raphael2025/antmonitor-cloud.git"
+      else alternate="https://gitee.com/raphael01/antmonitor-cloud.git"; fi
+      info "$(L '尝试备用来源（保持 origin）' 'Trying alternate source (keeping origin)'): $alternate"
+      git_dir fetch -q "$alternate" "$BRANCH" \
+        || die "$(L '两个来源均不可达，现有代码和配置保留' 'Both sources unavailable; existing files were preserved')"
     fi
-    die "$(L 'git 更新失败，请检查所选仓库的连接、分支和本地改动' 'git update failed; check source access, branch and local changes')"
+    git_dir merge -q --ff-only FETCH_HEAD \
+      || die "$(L '无法快进，现有版本保留，不会回退或覆盖改动' 'Cannot fast-forward; no rollback or overwrite was performed')"
+    return
   fi
   if [[ -f "$DIR/server.py" && "$SOURCE" != "gitee" ]]; then   # GitHub 源码包安装沿用原更新方式
     fetch_tarball
@@ -236,6 +258,18 @@ fetch_code() {
       return
     fi
     rm -rf "$tmpc"
+    if [[ "$AUTO_SOURCE" == 1 ]]; then
+      tmpc="$(mktemp -d)"
+      info "$(L 'GitHub 不可达，尝试 Gitee' 'GitHub unavailable; trying Gitee')"
+      if git clone -q --branch "$BRANCH" https://gitee.com/raphael01/antmonitor-cloud.git "$tmpc/src"; then
+        prepare_dir
+        give_tmp "$tmpc"
+        as_svc cp -a "$tmpc/src"/. "$DIR"/
+        rm -rf "$tmpc"
+        return
+      fi
+      rm -rf "$tmpc"
+    fi
     [[ "$SOURCE" != "gitee" ]] \
       || die "$(L 'Gitee 克隆失败，请检查仓库连接和分支后重试；不会切换到 GitHub' 'Gitee clone failed; check access and branch. GitHub will not be used')"
     warn "$(L 'git clone 失败，改用源码包' 'git clone failed; trying tarball')"
@@ -246,8 +280,15 @@ fetch_code() {
 setup_venv() {
   info "$(L '安装 Python 依赖…' 'Installing Python dependencies…')"
   [[ -x "$PY" ]] || as_svc python3 -m venv "$DIR/venv"
-  as_svc "$DIR/venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
-  as_svc "$DIR/venv/bin/pip" install -q -r "$DIR/requirements.txt"
+  local wheels="${ANTCLOUD_WHEELHOUSE:-}" opts=()
+  [[ -n "$wheels" || ! -d "$DIR/offline/wheels" ]] || wheels="$DIR/offline/wheels"
+  if [[ -n "$wheels" ]]; then
+    [[ -d "$wheels" ]] || die "$(L '依赖缓存目录不存在' 'Wheel directory does not exist'): $wheels"
+    opts=(--no-index --find-links "$wheels")
+  else
+    as_svc "$DIR/venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
+  fi
+  as_svc "$DIR/venv/bin/pip" install -q "${opts[@]}" -r "$DIR/requirements.txt"
 }
 
 cfg_set() { as_svc "$PY" "$DIR/tools/configure.py" "$CONF" "$@"; }

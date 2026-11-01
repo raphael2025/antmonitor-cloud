@@ -11,6 +11,7 @@ __pycache__/
 *.py[cod]
 venv/
 .venv/
+offline/
 
 # 日志/编辑器
 *.log

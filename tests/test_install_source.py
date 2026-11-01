@@ -28,6 +28,9 @@ class InstallSourceTests(unittest.TestCase):
             entry = tarfile.TarInfo("fixture/server.py")
             entry.size = len(payload)
             archive.addfile(entry, io.BytesIO(payload))
+            entry = tarfile.TarInfo("fixture/requirements.txt")
+            entry.size = 0
+            archive.addfile(entry, io.BytesIO(b""))
 
         # Load the real argument parser and functions; omit only the root guard
         # and the final action dispatch, which would mutate the test machine.
@@ -70,6 +73,7 @@ git() {
   printf 'git %s\n' "$*" >> "$TEST_LOG"
   if [[ "$1" == "clone" ]]; then
     [[ "$TEST_CLONE_STATUS" == "0" ]] || return "$TEST_CLONE_STATUS"
+    [[ "${TEST_GITHUB_FAIL:-}" != 1 || "$*" != *github.com* ]] || return 1
     local target="${@: -1}"
     mkdir -p "$target/.git"
     printf '# cloned source\n' > "$target/server.py"
@@ -83,13 +87,18 @@ git() {
         set-url) TEST_ORIGIN="$4" ;;
         *) return 97 ;;
       esac ;;
-    fetch) return "$TEST_FETCH_STATUS" ;;
+    fetch)
+      [[ "${TEST_ORIGIN_FAIL:-}" != 1 || "$*" != *origin* ]] || return 1
+      return "$TEST_FETCH_STATUS" ;;
+    diff) return "${TEST_DIRTY:-0}" ;;
+    rev-parse) printf 'master\n' ;;
     merge) return 0 ;;
     *) return 98 ;;
   esac
 }
 curl() {
   printf 'curl %s\n' "$*" >> "$TEST_LOG"
+  [[ "${TEST_CURL_FAIL:-}" != 1 ]] || return 22
   cat "$TEST_ARCHIVE"
 }
 '''
@@ -117,6 +126,52 @@ command() {
         self.assertIn("git clone -q --branch release " + GITEE, self.requests())
         self.assertTrue((self.install_dir / ".git").is_dir())
         self.assertNotIn("github.com", self.requests())
+
+    def test_auto_uses_gitee_when_github_is_unreachable(self):
+        result = self.run_script("fetch_code", extra_env={"TEST_GITHUB_FAIL": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn(GITHUB, self.requests())
+        self.assertIn(GITEE, self.requests())
+        self.assertNotIn("curl ", self.requests())
+
+    def test_explicit_github_never_clones_gitee(self):
+        result = self.run_script("fetch_code", "--source", "github", extra_env={"TEST_GITHUB_FAIL": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn(GITEE, self.requests())
+
+    def test_auto_existing_fallback_preserves_origin_and_data(self):
+        self.existing_checkout()
+        for name in ("config.yaml", "cloud_settings.json", "cloud.db"):
+            (self.install_dir / name).write_bytes(b"data\x00\xff")
+        result = self.run_script('fetch_code\nprintf "ORIGIN=%s" "$TEST_ORIGIN"', extra_env={"TEST_ORIGIN_FAIL": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("ORIGIN=" + GITHUB, result.stdout)
+        self.assertIn("fetch -q " + GITEE, self.requests())
+        self.assertNotIn("remote set-url", self.requests())
+        for name in ("config.yaml", "cloud_settings.json", "cloud.db"):
+            self.assertEqual((self.install_dir / name).read_bytes(), b"data\x00\xff")
+
+    def test_auto_fallback_does_not_touch_custom_or_dirty_checkout(self):
+        self.existing_checkout()
+        for origin, dirty in (("https://example.org/team/cloud.git", "0"), (GITHUB, "1")):
+            self.log.unlink(missing_ok=True)
+            result = self.run_script("fetch_code", origin=origin, extra_env={"TEST_ORIGIN_FAIL": "1", "TEST_DIRTY": dirty})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(GITEE, self.requests())
+            self.assertNotIn("merge ", self.requests())
+
+    def test_both_sources_and_archive_failure_preserve_existing_files(self):
+        self.install_dir.mkdir()
+        (self.install_dir / "cloud_settings.json").write_bytes(b"keep")
+        result = self.run_script("fetch_code", clone_status=1, extra_env={"TEST_CURL_FAIL": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.install_dir / "cloud_settings.json").read_bytes(), b"keep")
+        self.assertFalse((self.install_dir / "server.py").exists())
+
+    def test_relative_directory_is_resolved_before_cd(self):
+        result = self.run_script('cd /\nprintf "%s" "$DIR"', "--dir", ".")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout).resolve(), self.root.resolve())
 
     def test_gitee_clone_failure_does_not_download_archive_or_github(self):
         result = self.run_script("fetch_code", "--source", "gitee", clone_status=1)

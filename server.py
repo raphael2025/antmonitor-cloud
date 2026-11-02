@@ -20,8 +20,9 @@ from contextlib import contextmanager
 
 import yaml
 from fastapi import Body, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from web_assets import index_html
 import uvicorn
 
 import appconfig
@@ -1485,7 +1486,9 @@ async def _security_mw(request: Request, call_next):
         h["Strict-Transport-Security"] = "max-age=31536000"
     if path.startswith("/api/"):
         h["Cache-Control"] = "no-store"
-    elif path.startswith("/web/") or path == "/":
+    elif path in ("/", "/web/index.html"):
+        h["Cache-Control"] = "no-store"
+    elif path.startswith("/web/"):
         # 前端文件禁强缓存(每次向服务器复核, 未变返回304)——否则版本更新后
         # 浏览器拿着旧 JS 渲染新接口, 要手动 Ctrl+F5 才恢复。文件只有几KB, 代价可忽略。
         h["Cache-Control"] = "no-cache"
@@ -1527,12 +1530,13 @@ app.add_middleware(_BodyLimit, limit=int(CFG.get("server", {}).get("max_body_byt
 
 # ---------- 静态面板 ----------
 
-app.mount("/web", StaticFiles(directory=os.path.join(BASE, "web")), name="web")
-
-
 @app.get("/")
+@app.api_route("/web/index.html", methods=["GET", "HEAD"], include_in_schema=False)
 def index():
-    return FileResponse(os.path.join(BASE, "web", "index.html"))
+    return HTMLResponse(index_html(os.path.join(BASE, "web")))
+
+
+app.mount("/web", StaticFiles(directory=os.path.join(BASE, "web")), name="web")
 
 
 def _print_seccheck():

@@ -118,6 +118,7 @@ curl -fsSL https://gitee.com/raphael01/antmonitor-cloud/raw/master/install.sh | 
 已有官方 Git 部署可以用 `--source github` / `--source gitee` 切换来源；不指定或 `--source auto` 时保留现有 `origin`。
 自动模式遇到官方来源 fetch 网络失败时，会尝试另一平台的同分支并仅接受快进更新，不回退到旧镜像；自定义仓库不会被切换到官方仓库。
 自定义安装目录需在安装和更新时都补 `--dir '/实际安装目录'`。
+更新并重启后，正常刷新网页即可加载新版按钮和语言文件；资源版本自动生成，ZIP 安装也适用。
 系统软件、Python 依赖和域名证书仍需联网获取；两平台的版本同步与运维细节见[部署与运维](docs/DEPLOY.md)。
 
 ### 接入场地

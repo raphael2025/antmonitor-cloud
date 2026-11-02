@@ -103,6 +103,7 @@
   </section>
 
   <!-- 客户 -->
+  <p id="customerRateNotice" class="customer-rate-notice hidden" role="status"></p>
   <section class="grid2">
     <div class="panel">
       <h2 data-i18n="cust.summary">客户汇总（跨场地）</h2>
@@ -120,7 +121,7 @@
     </div>
   </section>
 
-  <p class="customer-help muted" data-i18n="rate.help">实时算力为最近一次扫描的实测总和，默认统计近 24 小时平均；数据不足时仅显示已观测时段平均。旧版场地需更新后上报这些指标。</p>
+  <p class="customer-help muted" data-i18n="rate.help">实时算力是最近一次扫描的实测合计。平均值默认统计近 24 小时；覆盖不足时显示有效时段平均并标明时长，不能视为完整 24 小时结果。</p>
 
   <div id="deletedSitesModal" class="modal hidden">
     <div class="modal-box">
@@ -168,6 +169,7 @@
         <div class="chartbox"><h3 data-i18n="chart.power">功耗</h3><div class="cwrap"><canvas id="chPower"></canvas></div></div>
       </div>
       <h3 class="subhead" data-i18n="rate.site_customers">客户（该场地）</h3>
+      <p id="siteCustomerRateNotice" class="customer-rate-notice hidden" role="status"></p>
       <div class="tablewrap"><table class="mini" id="tblSiteCustomers">
         <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="rate.current">实时算力</th><th id="siteAverageHead">24h 平均算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
         <tbody></tbody>

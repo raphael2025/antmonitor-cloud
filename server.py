@@ -307,6 +307,9 @@ def _daily_payload(key, days):
 def _customer_rows(rows):
     """出库再清洗一遍数值列：修复前入库的脏行(数值列里存了字符串)不能再 500 或流到前端。"""
     out = []
+    metric_sites = set()
+    metric_fields = ("hashrate_ths", "avg_hashrate_ths", "hashrate_hours", "observed_hours",
+                     "coverage_pct", "hashrate_ts", "current_machines")
     now = int(time.time())
     stale_after = max(60, int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
     report_after = max(stale_after, 3 * int(CFG.get("poll", {}).get("customer_interval", 600)))
@@ -316,9 +319,12 @@ def _customer_rows(rows):
         for k in ("uptime_pct", "delivered_th_h", "power_kwh"):
             r[k] = validate.opt_num(r.get(k))
         clean = validate.customers([r])[0]
-        for k in ("hashrate_ths", "avg_hashrate_ths", "hashrate_hours", "observed_hours",
-                  "coverage_pct", "hashrate_ts", "current_machines"):
+        for k in metric_fields:
             r[k] = clean[k]
+        # 首扫前窗口/覆盖/当前台数也可证明新指标通道存在；不能只因无采样时间就断言旧端。
+        # 同场地某一客户缺字段，不代表整个场地未支持指标。旧库无需迁移或伪造零值。
+        if r.get("hashrate_source") == "summary" or any(clean[k] is not None for k in metric_fields):
+            metric_sites.add(r.get("site_id"))
         if not r["hashrate_hours"]:
             r["hashrate_hours"] = None
             r["avg_hashrate_ths"] = None
@@ -329,15 +335,18 @@ def _customer_rows(rows):
             r["coverage_pct"] is not None and r["coverage_pct"] >= 99.99 and
             r["observed_hours"] is not None and
             r["observed_hours"] >= r["hashrate_hours"] - 1 / 3600)
-        r["avg_unavailable_reason"] = "missing_data" if r["avg_hashrate_ths"] is None else None
         stamp = r["hashrate_ts"]
         r["hashrate_age_s"] = max(0, now - stamp) if stamp and stamp <= now + 300 else None
-        r["hashrate_stale"] = r["hashrate_age_s"] is None or r["hashrate_age_s"] > stale_after
+        r["hashrate_stale"] = r["hashrate_age_s"] is not None and r["hashrate_age_s"] > stale_after
         stamp = validate.measurement(r.get("updated_ts"), int)
         r["updated_ts"] = stamp
         r["report_age_s"] = max(0, now - stamp) if stamp and stamp <= now + 300 else None
-        r["report_stale"] = r["report_age_s"] is None or r["report_age_s"] > report_after
+        r["report_stale"] = r["report_age_s"] is not None and r["report_age_s"] > report_after
         out.append(r)
+    for r in out:
+        missing = "missing_data" if r.get("site_id") in metric_sites else "not_reported"
+        r["hashrate_unavailable_reason"] = missing if r["hashrate_ths"] is None else None
+        r["avg_unavailable_reason"] = missing if r["avg_hashrate_ths"] is None else None
     return out
 
 
@@ -365,6 +374,10 @@ def _customers_payload():
         a["hashrate_age_s"] = complete_reduce("hashrate_age_s", max)
         a["hashrate_stale"] = any(p["hashrate_stale"] for p in parts)
         a["hashrate_known_sites"] = sum(p["hashrate_ths"] is not None for p in parts)
+        a["hashrate_unavailable_reason"] = (None if a["hashrate_ths"] is not None else
+            "partial_sites" if a["hashrate_known_sites"] else
+            "not_reported" if all(p["hashrate_unavailable_reason"] == "not_reported" for p in parts)
+            else "missing_data")
         a["periods"] = sorted({p["hashrate_hours"] for p in parts if p["hashrate_hours"] is not None})
         same_period = len(a["periods"]) == 1 and all(p["hashrate_hours"] is not None for p in parts)
         a["hashrate_hours"] = a["periods"][0] if same_period else None
@@ -373,13 +386,16 @@ def _customers_payload():
         a["observed_hours"] = complete_reduce("observed_hours", min) if same_period else None
         a["coverage_pct"] = complete_reduce("coverage_pct", min) if same_period else None
         a["avg_complete"] = bool(same_period and all(p["avg_complete"] for p in parts))
+        a["avg_known_sites"] = sum(p["avg_hashrate_ths"] is not None for p in parts)
         a["avg_unavailable_reason"] = ("mixed_periods" if len(a["periods"]) > 1 else
-            "missing_data" if a["avg_hashrate_ths"] is None else None)
+            None if a["avg_hashrate_ths"] is not None else
+            "partial_sites" if 0 < a["avg_known_sites"] < len(parts) else
+            "not_reported" if all(p["avg_unavailable_reason"] == "not_reported" for p in parts)
+            else "missing_data")
         if len(parts) > 1 and a["avg_hashrate_ths"] is not None and not a["avg_complete"]:
             # 只有覆盖时长，不能证明两个场地的缺口重合；相加不同已观测时段的均值会造假。
             a["avg_hashrate_ths"] = None
             a["avg_unavailable_reason"] = "partial_coverage"
-        a["avg_known_sites"] = sum(p["avg_hashrate_ths"] is not None for p in parts)
         a["updated_ts"] = complete_reduce("updated_ts", min)
         a["report_age_s"] = complete_reduce("report_age_s", max)
         a["report_stale"] = any(p["report_stale"] for p in parts)

@@ -282,7 +282,17 @@ function renderOverview(o) {
   $("lastUpdate").textContent = t("overview.updated", { time: new Date(o.ts * 1000).toLocaleTimeString() });
 }
 
+function renderRateNotice(id, rows) {
+  const names = [...new Set((rows || [])
+    .filter(r => r.hashrate_unavailable_reason === "not_reported" || r.avg_unavailable_reason === "not_reported")
+    .map(r => r.site_name || r.site_id).filter(Boolean))];
+  const el = $(id);
+  el.textContent = names.length ? t("rate.missing_sites_help", { sites: names.join(", ") }) : "";
+  el.classList.toggle("hidden", !names.length);
+}
+
 function renderCustomers(d) {
+  renderRateNotice("customerRateNotice", d.rows);
   $("workerAverageHead").textContent = AntCustomerRates.header(d.by_worker, t);
   $("customerAverageHead").textContent = AntCustomerRates.header(d.rows, t);
   $("tblWorkers").querySelector("tbody").innerHTML = d.by_worker.map((w) => `<tr>
@@ -303,6 +313,7 @@ function renderCustomers(d) {
 }
 
 function renderSiteCustomers(rows) {
+  renderRateNotice("siteCustomerRateNotice", rows);
   $("siteAverageHead").textContent = AntCustomerRates.header(rows, t);
   $("tblSiteCustomers").querySelector("tbody").innerHTML = rows.map((r) => `<tr>
     <td>${esc(r.worker)}</td><td>${AntCustomerRates.machines(r, t)}</td>

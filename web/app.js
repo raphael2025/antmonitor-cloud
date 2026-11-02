@@ -227,14 +227,31 @@ if (localStorage.getItem("co_trend_hours")) $("trendRange").value = localStorage
 const pct = (a, b) => (num(a) != null && num(b) > 0 ? ((100 * num(a)) / num(b)).toFixed(1) + "%" : "–");
 
 function siteQuality(s) {
+  // Partial power/hashrate has its own short coverage beside the value.
+  const complete = s.metric_complete || {}, available = s.metric_available || {};
+  if (s.data_quality === "partial" && complete.online && complete.total &&
+      ["hashrate_ths", "power_kw"].every(k => complete[k] || available[k])) return "";
   const key = { partial: "quality.partial", stale: "quality.stale", legacy_unverified: "quality.legacy_site", missing: "quality.missing" }[s.data_quality];
   return key ? `<div class="site-warning">${esc(t(key))}</div>` : "";
+}
+
+function siteMetric(s, key) {
+  const observed = num((s.observed_metrics || {})[key]);
+  return (s.metric_available || {})[key] === true && observed != null ? observed : num(s[key]);
+}
+
+function siteMetricNote(s, key, countKey) {
+  if ((s.metric_available || {})[key] !== true || (s.metric_complete || {})[key] !== false) return "";
+  const known = num(s[countKey]), total = num(s.total);
+  return AntDataQuality.note(known != null && total != null && known < total
+    ? t("quality.counted_machines", { known, total }) : t("quality.partial_readings"), true);
 }
 
 function siteCard(s, color) {
   const st = STATE[s.state] || STATE.pending;
   const tp = TYPE[s.type] || TYPE.air;
   const hasData = num(s.total) != null;
+  const hashrate = siteMetric(s, "hashrate_ths");
   const cf = int0(s.containers_faulty), co = int0(s.containers_offline);
   const contRow = (s.type === "hydro" || s.type === "mixed" || int0(s.containers) > 0)
     ? `<div><span class="k">${t("card.containers")}</span><span class="num-tab">${intTxt(s.containers)}${cf || co ? ` <span style="color:#ec835a">${t("card.fault_offline", { cf, co })}</span>` : ""}${s.containers_unknown ? ` · ${esc(t("quality.unknown_count", { n: int0(s.containers_unknown) }))}` : ""}</span></div>`
@@ -248,12 +265,12 @@ function siteCard(s, color) {
       <span class="pill ${tp.cls}">${tp.txt()}</span>
       <span class="pill ${st.cls}">${st.txt(s)}</span>
     </div>
-    <div class="hr">${hasData ? fmtHash(num(s.hashrate_ths)).replace(/ (\w+)$/, ' <span class="unit">$1/s</span>') : "–"}</div>
+    <div class="hr">${hashrate != null ? fmtHash(hashrate).replace(/ (\w+)$/, ' <span class="unit">$1/s</span>') : "–"}</div>
     ${siteQuality(s)}
-    ${s.hashrate_complete === false && num(s.known_hashrate_ths) != null ? AntDataQuality.note(t("quality.known_part", { value: fmtHash(s.known_hashrate_ths, "/s") }), true) : ""}
+    ${siteMetricNote(s, "hashrate_ths", "hashrate_known_machines")}
     <div class="stats">
       <div><span class="k">${t("card.online")}</span><span class="num-tab">${hasData ? `${intTxt(s.online)}/${intTxt(s.total)} (${s.unknown ? "–" : pct(s.online, s.total)})` : "–"}</span></div>
-      <div><span class="k">${t("card.power")}</span><span class="num-tab">${hasData ? fmtPower(num(s.power_kw)) : "–"}</span></div>
+      <div><span class="k">${t("card.power")}</span><span class="num-tab">${fmtPower(siteMetric(s, "power_kw"))}${siteMetricNote(s, "power_kw", "power_known_machines")}</span></div>
       <div><span class="k">${t("card.alerts")}</span><span class="num-tab">${intTxt(s.active_alerts)}</span></div>
       <div><span class="k">${t("card.customers")}</span><span class="num-tab">${int0(s.customers)}</span></div>
       ${contRow}
@@ -266,24 +283,24 @@ function siteCard(s, color) {
 
 function renderOverview(o) {
   const totals = o.totals;
+  const online = AntDataQuality.totalValue(o, "machines_online");
+  const machines = AntDataQuality.totalValue(o, "machines_total");
+  const machinesNote = AntDataQuality.totalNote(o, "machines_total", t) || AntDataQuality.totalNote(o, "machines_online", t);
   $("kSites").textContent = `${totals.sites_ok}/${totals.sites}`;
-  $("kMachines").textContent = `${intTxt(totals.machines_online)}/${intTxt(totals.machines_total)}`;
-  $("kOnlinePct").textContent = pct(totals.machines_online, totals.machines_total);
+  $("kMachines").textContent = `${intTxt(online)}/${intTxt(machines)}`;
+  $("kMachinesNote").textContent = machinesNote;
+  $("kOnlinePct").textContent = pct(online, machines);
+  $("kOnlinePctNote").textContent = machinesNote;
   $("kHashrate").innerHTML = AntDataQuality.total(o, "hashrate_ths", t, n => fmtHash(n, "/s"));
   $("kPower").innerHTML = AntDataQuality.total(o, "power_kw", t, fmtPower);
   $("kAlerts").innerHTML = AntDataQuality.total(o, "active_alerts", t, intTxt);
-  $("kAlerts").className = "num" + (totals.active_alerts > 0 ? " hot" : "");
+  $("kAlerts").className = "num" + (AntDataQuality.totalValue(o, "active_alerts") > 0 ? " hot" : "");
   $("kContainers").innerHTML = `${intTxt(totals.containers)} (${intTxt(totals.containers_faulty)}/${intTxt(totals.containers_offline)})`
     + (totals.containers_unknown ? AntDataQuality.note(t("quality.unknown_count", { n: int0(totals.containers_unknown) }), true) : "");
   $("kContainers").className = "num" + (totals.containers_faulty + totals.containers_offline > 0 ? " hot" : "");
   $("kCustomers").textContent = totals.customers;
   $("kCustomers").title = t("quality.customer_identity");
-  const observed = o.observed_totals || {};
-  const knownMachines = num(observed.machines_online) != null && num(observed.machines_total) != null;
-  $("kMachinesNote").textContent = totals.machines_total == null && knownMachines
-    ? t("quality.known_sites", { value: `${intTxt(observed.machines_online)}/${intTxt(observed.machines_total)}`,
-        known: (o.metric_known_sites || {}).machines_total, total: totals.sites }) : "";
-  const affected = o.sites.filter(s => s.data_quality && s.data_quality !== "complete").map(s => s.name);
+  const affected = o.sites.filter(s => siteQuality(s)).map(s => s.name);
   $("overviewQuality").textContent = affected.length ? t("quality.overview_help", { sites: affected.join(", ") }) : "";
   $("overviewQuality").classList.toggle("hidden", !affected.length);
 

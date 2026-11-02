@@ -281,13 +281,18 @@ def scan_age(snap, now):
     return None
 
 
-def snapshot_quality(snap, now, stalled_after=1200):
-    """完整性与新鲜度分开；缺新协议证据不能默认成完整场地。"""
+def _snapshot_freshness(snap, now, stalled_after):
     age = scan_age(snap, now)
     fresh_scan = bool(snap.get("ok") and age is not None and age <= stalled_after)
     measured = validate.measurement(snap.get("measurement_ts"), int)
     fresh = bool(fresh_scan and snap.get("measurement_time_supported") == 1 and measured and
                  0 <= now - measured <= MAX_MEASUREMENT_AGE)
+    return fresh_scan, fresh
+
+
+def snapshot_quality(snap, now, stalled_after=1200):
+    """完整性与新鲜度分开；缺新协议证据不能默认成完整场地。"""
+    fresh_scan, fresh = _snapshot_freshness(snap, now, stalled_after)
     online = validate.measurement(snap.get("online"))
     total = validate.measurement(snap.get("total"))
     machines = (fresh and snap.get("unknown") == 0 and online is not None and
@@ -313,6 +318,27 @@ def snapshot_quality(snap, now, stalled_after=1200):
                     faulty + offline <= containers)
     for key in ("containers_faulty", "containers_offline"):
         out[key] = bool(container_evidence and unknown == 0 and counts_valid)
+    return out
+
+
+def snapshot_observed(snap, now, stalled_after=1200):
+    """当前可用读数；已知小计可展示，但不能冒充完整场地或用于完整耗电账。"""
+    quality = snapshot_quality(snap, now, stalled_after)
+    out = {key: snap.get(key) if complete else None for key, complete in quality.items()}
+    _fresh_scan, fresh = _snapshot_freshness(snap, now, stalled_after)
+    total = validate.measurement(snap.get("total"), int)
+    unknown = validate.measurement(snap.get("unknown"), int)
+    if not fresh or total is None or unknown is None or unknown > total:
+        return out
+    for prefix, field in (("hashrate", "hashrate_ths"), ("power", "power_kw")):
+        if out[field] is not None or snap.get(prefix + "_complete") not in (0, 1):
+            continue
+        count = validate.measurement(snap.get(prefix + "_known_machines"), int)
+        value = validate.measurement(snap.get("known_" + field))
+        # A positive number of observed machines proves that a zero subtotal is
+        # a real reading. Zero machines with missing readings cannot prove zero.
+        if count is not None and 0 < count <= total - unknown and value is not None:
+            out[field] = value
     return out
 
 

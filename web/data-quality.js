@@ -17,11 +17,18 @@
     return value(total, format) + (complete === false && number(known) != null
       ? note(t("quality.known_part", { value: format(number(known)) }), true) : "");
   }
+  function totalValue(o, key) {
+    return number((o.totals || {})[key]) ?? number((o.observed_totals || {})[key]);
+  }
+  function totalNote(o, key, t) {
+    if ((o.metrics_complete || {})[key] !== false || totalValue(o, key) == null) return "";
+    const known = number((o.metric_known_sites || {})[key]), sites = number((o.totals || {}).sites);
+    return known != null && sites != null && known < sites
+      ? t("quality.counted_sites", { known, total: sites }) : t("quality.partial_readings");
+  }
   function total(o, key, t, format) {
-    const complete = o.metrics_complete && o.metrics_complete[key];
-    const known = number((o.observed_totals || {})[key]);
-    return value((o.totals || {})[key], format) + (complete === false && known != null
-      ? note(t("quality.known_sites", { value: format(known), known: (o.metric_known_sites || {})[key], total: o.totals.sites }), true) : "");
+    const coverage = totalNote(o, key, t);
+    return value(totalValue(o, key), format) + (coverage ? note(coverage, true) : "");
   }
   function legacy(n, t, format) {
     if (number(n) == null) return "";
@@ -69,5 +76,5 @@
   function points(rows, x, y, divisor = 1) {
     return rows.map(r => ({ x: r[x], y: number(r[y]) == null ? null : number(r[y]) / divisor }));
   }
-  return { number, short, note, partial, total, legacy, billing, daily, points };
+  return { number, short, note, partial, totalValue, totalNote, total, legacy, billing, daily, points };
 });

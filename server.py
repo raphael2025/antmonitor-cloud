@@ -262,10 +262,15 @@ def _site_entry(scfg, latest, last_ok, cust_counts, now):
               "measurement_time_supported"):
         d[k] = snap.get(k) if snap else None
     d["scan_age_s"] = db.scan_age(snap, now) if snap else None
-    quality = db.snapshot_quality(snap or {}, now, int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
+    stalled_after = int(CFG.get("poll", {}).get("stalled_after_s", 1200))
+    quality = db.snapshot_quality(snap or {}, now, stalled_after)
+    observed = db.snapshot_observed(snap or {}, now, stalled_after)
     if state not in ("ok", "alert"):
         quality = {k: False for k in quality}
+        observed = {k: None for k in observed}
     d["metric_complete"] = quality
+    d["observed_metrics"] = observed
+    d["metric_available"] = {k: value is not None for k, value in observed.items()}
     d["data_complete"] = all(quality[k] for k in ("online", "total", "hashrate_ths", "power_kw"))
     d["data_quality"] = ("missing" if not snap else "stale" if state not in ("ok", "alert") else
                          "legacy_unverified" if not snap.get("measurement_time_supported") or any(snap.get(k) is None for k in
@@ -293,12 +298,12 @@ def _overview_payload():
               "containers_unknown": "containers_unknown"}
     observed, known, complete = {}, {}, {}
     for output, field in fields.items():
-        values = [s[field] for s in sites if s["metric_complete"][field]]
+        values = [s["observed_metrics"][field] for s in sites if s["metric_available"][field]]
         known[output] = len(values)
-        complete[output] = len(values) == len(sites)
+        complete[output] = all(s["metric_complete"][field] for s in sites)
         value = sum(values) if values or not sites else None
         if value is not None and output in ("hashrate_ths", "power_kw"):
-            value = round(value, 1)
+            value = round(value, 3 if output == "power_kw" else 1)
         observed[output] = value
         tot[output] = value if complete[output] else None
     return {"ok": True, "ts": now, "totals": tot, "sites": sites,

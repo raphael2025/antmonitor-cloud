@@ -42,6 +42,7 @@ class Notifier:
     def __init__(self, cfg, conn):
         a = cfg.get("alerts") or {}
         self.cfg = a
+        self.poll = cfg.get("poll") or {}
         self.conn = conn
         self.enabled = bool(a.get("enabled", True))
         self.cooldown = int(a.get("cooldown", 1800))
@@ -85,7 +86,8 @@ class Notifier:
         drop_pct = float(self.cfg.get("hashrate_drop_pct", 30) or 0)   # 现场读，见 tick() 注释
         if drop_pct > 0:
             for sid, (state, s) in cur.items():
-                if state in ("ok", "alert"):
+                if state in ("ok", "alert") and db.snapshot_quality(last_ok.get(sid) or {}, now,
+                        int(self.poll.get("stalled_after_s", 1200)))["hashrate_ths"]:
                     self._check_drop(sid, s, now)
         offline_threshold = int(self.cfg.get("offline_threshold", 0) or 0)   # 现场读
         if offline_threshold > 0:
@@ -102,9 +104,11 @@ class Notifier:
                     f"（{max(1, age)} 分钟前）" if snap else "，尚无历史数据")
             self._send(sid, "unreachable", f"⚠ 场地失联: {label} 收不到数据{tail}")
         elif new == "stalled":
+            age = db.scan_age(snap or {}, now)
+            minutes = str(age // 60) if age is not None else "未知"
             self._send(sid, "stalled",
                        f"⏸ 监控停滞: {label} 机器可达但本地扫描已 "
-                       f"{(snap.get('scan_age_s') or 0) // 60} 分钟未更新，请上场地机器检查监控进程")
+                       f"{minutes} 分钟未更新，请上场地机器检查监控进程")
         elif old in ("unreachable", "stalled") and new in ("ok", "alert"):
             tail = (f"，当前在线 {snap['online']}/{snap['total']}" if snap else "")
             self._send(sid, "recovered", f"✅ 场地恢复: {label}{tail}", recovery=True)
@@ -112,8 +116,9 @@ class Notifier:
     # ---- 算力骤降 ----
     def _check_drop(self, sid, s, now):
         drop_pct = float(self.cfg.get("hashrate_drop_pct", 30) or 0)   # 现场读，见 tick() 注释
-        base = db.avg_hashrate(self.conn, sid, now - 5400, now - 2700)   # 45~90分钟前
-        curr = db.avg_hashrate(self.conn, sid, now - 600, now)           # 最近10分钟
+        stalled_after = int(self.poll.get("stalled_after_s", 1200))
+        base = db.avg_hashrate(self.conn, sid, now - 5400, now - 2700, stalled_after)   # 45~90分钟前
+        curr = db.avg_hashrate(self.conn, sid, now - 600, now, stalled_after)           # 最近10分钟
         if base is None or curr is None or base < 1:
             return
         label = f"{s['name']}({_TYPE_LABEL.get(s['type'], s['type'])})"
@@ -135,7 +140,10 @@ class Notifier:
         threshold = int(self.cfg.get("offline_threshold", 0) or 0)   # 现场读，见 tick() 注释
         if threshold <= 0:
             return
-        total, online = snap.get("total") or 0, snap.get("online") or 0
+        quality = db.snapshot_quality(snap, now, int(self.poll.get("stalled_after_s", 1200)))
+        if not (quality["online"] and quality["total"]):
+            return  # 未知状态既不能触发掉线，也不能伪造恢复。
+        total, online = snap["total"], snap["online"]
         offline = max(0, total - online)
         label = f"{s['name']}({_TYPE_LABEL.get(s['type'], s['type'])})"
         if sid not in self.active_offline and offline >= threshold:

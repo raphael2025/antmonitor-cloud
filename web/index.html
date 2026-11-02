@@ -65,14 +65,16 @@
   <!-- 全网汇总 KPI -->
   <section class="cards">
     <div class="card"><div class="num" id="kSites">–</div><div class="lbl" data-i18n="kpi.sites">场地 在线 / 总数</div></div>
-    <div class="card"><div class="num" id="kMachines">–</div><div class="lbl" data-i18n="kpi.machines">矿机 在线 / 总数</div></div>
+    <div class="card"><div class="num" id="kMachines">–</div><span id="kMachinesNote" class="rate-note muted"></span><div class="lbl" data-i18n="kpi.machines">矿机 在线 / 总数</div></div>
     <div class="card"><div class="num" id="kOnlinePct">–</div><div class="lbl" data-i18n="kpi.online_pct">全网在线率</div></div>
     <div class="card"><div class="num" id="kHashrate">–</div><div class="lbl" data-i18n="kpi.hashrate">全网总算力</div></div>
-    <div class="card"><div class="num" id="kPower">–</div><div class="lbl" data-i18n="kpi.power">全网总功耗</div></div>
+    <div class="card" data-i18n-title="power.total_help" title="矿机当前功率按有效读数相加；集装箱配电读数单独展示，不重复加总。此数值不是全场电表读数。"><div class="num" id="kPower">–</div><div class="lbl" data-i18n="kpi.power">矿机当前总功率 (kW)</div></div>
     <div class="card alert"><div class="num" id="kAlerts">–</div><div class="lbl" data-i18n="kpi.alerts">活跃告警</div></div>
     <div class="card alert"><div class="num" id="kContainers">–</div><div class="lbl" data-i18n="kpi.containers">集装箱 (故障/离线)</div></div>
     <div class="card"><div class="num" id="kCustomers">–</div><div class="lbl" data-i18n="kpi.customers">客户数</div></div>
   </section>
+  <p id="overviewQuality" class="data-quality-notice muted hidden" role="status"></p>
+  <p class="data-quality-notice muted" data-i18n="power.units_help">kW 表示当前功率，kWh（度）表示统计期累计耗电。1 MW = 1000 kW；1 MWh = 1000 kWh。1000 kW 持续 1 小时，耗电 1000 kWh。</p>
 
   <!-- 场地卡片：风冷 / 水冷 -->
   <section class="sitegroup" id="grpAir">
@@ -108,14 +110,14 @@
     <div class="panel">
       <h2 data-i18n="cust.summary">客户汇总（跨场地）</h2>
       <div class="tablewrap"><table class="mini" id="tblWorkers">
-        <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.site">场地</th><th data-i18n="th.count">台数</th><th data-i18n="rate.current">实时算力</th><th id="workerAverageHead">24h 平均算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
+        <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.site">场地</th><th data-i18n="th.count">台数</th><th data-i18n="rate.current">实时算力</th><th id="workerAverageHead">24h 平均算力</th><th data-i18n="th.kwh">统计期耗电 (kWh，估算)</th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
     <div class="panel">
       <h2 data-i18n="cust.detail">客户明细（按场地）</h2>
       <div class="tablewrap"><table class="mini" id="tblCustomers">
-        <thead><tr><th data-i18n="th.site">场地</th><th data-i18n="th.cust">客户</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="rate.current">实时算力</th><th id="customerAverageHead">24h 平均算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
+        <thead><tr><th data-i18n="th.site">场地</th><th data-i18n="th.cust">客户</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="rate.current">实时算力</th><th id="customerAverageHead">24h 平均算力</th><th data-i18n="th.kwh">统计期耗电 (kWh，估算)</th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -166,17 +168,19 @@
       <div class="grid3">
         <div class="chartbox"><h3 data-i18n="chart.hashrate">算力</h3><div class="cwrap"><canvas id="chHr"></canvas></div></div>
         <div class="chartbox"><h3 data-i18n="chart.online">在线台数</h3><div class="cwrap"><canvas id="chOnline"></canvas></div></div>
-        <div class="chartbox"><h3 data-i18n="chart.power">功耗</h3><div class="cwrap"><canvas id="chPower"></canvas></div></div>
+        <div class="chartbox"><h3 data-i18n="chart.power">功率 (kW)</h3><div class="cwrap"><canvas id="chPower"></canvas></div></div>
       </div>
       <h3 class="subhead" data-i18n="rate.site_customers">客户（该场地）</h3>
       <p id="siteCustomerRateNotice" class="customer-rate-notice hidden" role="status"></p>
+      <p class="muted" data-i18n="power.energy_help">统计期耗电按有效功率随时间累计，单位 kWh（度），为监控估算；缺失时段不视为零耗电。</p>
       <div class="tablewrap"><table class="mini" id="tblSiteCustomers">
-        <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="rate.current">实时算力</th><th id="siteAverageHead">24h 平均算力</th><th data-i18n="th.kwh">耗电</th></tr></thead>
+        <thead><tr><th data-i18n="th.cust">客户 / 矿工名</th><th data-i18n="th.count">台数</th><th data-i18n="th.uptime">可用率</th><th data-i18n="rate.current">实时算力</th><th id="siteAverageHead">24h 平均算力</th><th data-i18n="th.kwh">统计期耗电 (kWh，估算)</th></tr></thead>
         <tbody></tbody>
       </table></div>
-      <h3 class="subhead">近 14 天日报（耗电为估算，精确对账以场地本地为准）</h3>
+      <h3 class="subhead" data-i18n="quality.daily_title">近 14 天日报（UTC+8）</h3>
+      <p class="muted" data-i18n="quality.daily_help">按有效时间加权；今天只统计已经经过的时间。耗电为监控估算，对账需电表。</p>
       <div class="tablewrap"><table class="mini" id="tblDaily">
-        <thead><tr><th>日期</th><th>平均算力</th><th>峰值算力</th><th>平均在线</th><th>在线率</th><th>耗电(估)</th></tr></thead>
+        <thead><tr><th>日期</th><th>平均算力</th><th>峰值算力</th><th>平均在线</th><th>在线率</th><th data-i18n="power.daily_energy">当日耗电 (kWh，估算)</th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -253,7 +257,7 @@
         <span style="flex:1"></span>
         <button id="connectClose">×</button>
       </div>
-      <div class="muted" data-i18n="conn.intro">填好场地名称和类型，复制一份场地接入信息。本地网页和命令行都能粘贴同一份内容，不用分别填写地址和 token。</div>
+      <div class="muted" data-i18n="conn.intro">填好场地名称和类型，复制完整接入信息。AMC1- 开头的一整段已包含上报地址、上报密钥和场地信息，本地网页或命令行粘贴一次即可自动拆分。</div>
       <div id="connWarn" class="conn-warn"></div>
       <div class="muted conn-current"><span data-i18n="conn.current_url">上报地址：</span><span id="connUrlCurrent"></span></div>
 
@@ -269,14 +273,15 @@
       <h3 data-i18n="conn.pw">输入云端管理员密码确认本次操作</h3>
       <div class="formrow">
         <input type="password" id="connPw" autocomplete="current-password" data-i18n-placeholder="conn.pw_ph" placeholder="输入你的登录密码">
-        <button id="connNewSite" class="primary" data-i18n="conn.new_site">生成并复制接入信息</button>
+        <button id="connNewSite" class="primary" data-i18n="conn.new_site">生成并复制完整接入信息</button>
       </div>
 
       <div id="connResult" class="conn-result hidden">
         <div id="connResultFor" class="conn-result-for"></div>
         <div class="conn-current"><span data-i18n="conn.current_url">上报地址：</span><code id="connResultUrl"></code></div>
+        <div id="connResultSiteRow" class="conn-current"><span data-i18n="conn.packet_site_id">场地 ID：</span><code id="connResultSiteId"></code></div>
         <p class="muted" id="connIncludes"></p>
-        <button id="connCodeCopy" class="primary conn-copy-main" data-i18n="conn.copy_info">复制场地接入信息</button>
+        <button id="connCodeCopy" class="primary conn-copy-main" data-i18n="conn.copy_info">复制完整接入信息（地址 + 上报密钥）</button>
         <p class="muted" data-i18n="conn.existing_help">在本地网页点击「☁ 连接云端 → 粘贴接入信息并连接」，或在终端绑定提示中粘贴同一份内容。连接测试通过后保存，上报状态会显示是否已收到数据。</p>
         <div class="conn-warn" data-i18n="conn.secret_warn">接入信息含上报凭据，只交给对应场地负责人。2 分钟后隐藏，凭据不会因此失效。</div>
         <details class="conn-help">
@@ -292,9 +297,12 @@
           <div class="conn-install-command"><div><strong>GitHub</strong><button id="connInstallGithubCopy" data-i18n="conn.copy_install">复制安装命令</button></div><code id="connInstallGithub"></code></div>
           <div class="conn-install-command"><div><strong>Gitee</strong><button id="connInstallGiteeCopy" data-i18n="conn.copy_install">复制安装命令</button></div><code id="connInstallGitee"></code></div>
         </details>
-        <details class="conn-help" id="connDetails"><summary data-i18n="conn.details">查看接入信息 / 手工复制</summary>
-          <div class="formrow"><label data-i18n="conn.code">场地接入信息</label><input type="text" id="connCode" class="wide" readonly spellcheck="false" autocomplete="off"></div>
-          <details class="conn-raw-token" id="connRawToken"><summary data-i18n="conn.raw_token">单独查看 token（高级）</summary><div class="formrow"><label>token</label><input type="text" id="connTok" class="wide" readonly><button id="connTokCopy" data-i18n="conn.copy">复制</button></div></details>
+        <details class="conn-help" id="connDetails"><summary data-i18n="conn.details">查看完整接入信息 / 手工复制</summary>
+          <div class="formrow"><label data-i18n="conn.code">完整接入信息（AMC1）</label><input type="text" id="connCode" class="wide" readonly spellcheck="false" autocomplete="off"></div>
+          <details class="conn-raw-token" id="connRawToken"><summary data-i18n="conn.raw_token">高级：单独查看上报密钥</summary>
+            <p class="muted" data-i18n="conn.token_only_help">此密钥仅用于高级手动配置，必须同时填写上报地址。一键绑定请用上方「复制完整接入信息」。</p>
+            <div class="formrow"><label>token</label><input type="text" id="connTok" class="wide" readonly><button id="connTokCopy" data-i18n="conn.copy_token">仅复制上报密钥</button></div>
+          </details>
         </details>
       </div>
       <div id="connMsg" class="notifymsg muted" role="status" aria-live="polite"></div>
@@ -369,6 +377,7 @@
   </div>
 
   <script src="/web/customer-rates.js"></script>
+  <script src="/web/data-quality.js"></script>
   <script src="/web/app.js"></script>
 </body>
 </html>

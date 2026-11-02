@@ -105,7 +105,7 @@ class Collector:
             # 告警评估(每轮)：失联/停滞/恢复/算力骤降
             self.notifier.tick(self.all_sites(), self.site_state)
             try:   # 日汇总每轮重算今天+昨天(聚合查询很轻)，日报最多滞后一个轮询周期
-                db.rollup_daily(self.conn)
+                db.rollup_daily(self.conn, stalled_after=int(self.cfg.get("poll", {}).get("stalled_after_s", 1200)))
             except Exception as e:
                 print(f"[collector] 日汇总异常: {e}")
             if t0 - last_hourly >= 3600:
@@ -144,20 +144,33 @@ class Collector:
         now = int(time.time())
         try:
             d = self._get(site, "/api/public/summary", {"lite": 1})
-            scan_ts = validate.num(d.get("scan_ts"), int, 0)
+            now = int(time.time())
+            if d.get("scanned") is False:
+                st.update(fails=0, last_err="", pending=True)
+                db.insert_snapshot(self.conn, {"ts": now, "site_id": sid, "ok": 0,
+                                               "error": "等待首次扫描"})
+                return
+            scan_ts = validate.scan_timestamp(d, now)
             customer_snapshot = validate.customer_snapshot(d, now)
+            if customer_snapshot is not None:
+                scan_ts = customer_snapshot[1]
             # 场地返回的数据同样不可信(场地机器可能被攻破)：数值列一律清洗，见 validate.py
             snap = validate.snapshot_fields({**d, "hashrate_ths": d.get("total_hashrate_ths"),
                                              "power_kw": d.get("total_power_kw")})
             snap.update({"ts": now, "site_id": sid, "ok": 1, "error": None,
+                         "scan_ts": scan_ts,
+                         "measurement_ts": validate.measurement_timestamp(d, scan_ts),
+                         **validate.source_time_fields(d),
                          "scan_age_s": max(0, now - scan_ts) if scan_ts else None})
-            db.insert_snapshot(self.conn, snap)
-            if customer_snapshot is not None:
+            stored = db.insert_snapshot(self.conn, snap)
+            if stored and customer_snapshot is not None:
                 db.replace_customer_hashrates(self.conn, sid, *customer_snapshot)
+            st["pending"] = False
             st["fails"] = 0
             st["last_ok_ts"] = now
             st["last_err"] = ""
         except Exception as e:
+            st["pending"] = False
             st["fails"] += 1
             st["last_err"] = str(e)[:300]
             db.insert_snapshot(self.conn, {"ts": now, "site_id": sid, "ok": 0,
@@ -166,10 +179,13 @@ class Collector:
     def poll_customers(self):
         for s in self.pull_sites():
             try:
-                d = self._get(s, "/api/public/customers", {"hours": self.customer_hours})
-                db.replace_customers(self.conn, s["id"], validate.customers(d.get("customers")),
+                d = self._get(s, "/api/public/customers", {"hours": self.customer_hours,
+                                                          "until_ts": int(time.time()) // 600 * 600})
+                rows = validate.customers(d.get("customers"), strict=True)
+                period = validate.customer_report_period(d, rows, int(time.time()))
+                db.replace_customers(self.conn, s["id"], rows,
                                      validate.num(d.get("hours"), int, self.customer_hours,
-                                                  hi=24 * 90) or self.customer_hours)
+                                                  hi=24 * 90) or self.customer_hours, period)
             except Exception as e:
                 print(f"[collector] {s['name']} 客户报表拉取失败: {e}")
 
@@ -188,12 +204,17 @@ class Collector:
                 return "unreachable"   # 超过 N 个上报周期没收到
         else:
             st = self.status.get(site_id) or {}
+            if st.get("pending"):
+                return "pending"
             if st.get("fails", 0) >= self.fail_offline:
                 return "unreachable"
             if not snap_ok:
                 return "pending" if st.get("fails", 0) == 0 else "unreachable"
+            if now - snap_ok["ts"] > self.interval * self.fail_offline:
+                return "unreachable"
         stalled_after = int(self.cfg.get("poll", {}).get("stalled_after_s", 1200))
-        if (snap_ok.get("scan_age_s") or 0) > stalled_after:
+        age = db.scan_age(snap_ok, now)
+        if age is not None and age > stalled_after:
             return "stalled"
         # 告警口径与场地本地完全一致：只看本地活跃告警数。
         # 集装箱真故障/箱体离线在本地会生成告警计入 active_alerts；

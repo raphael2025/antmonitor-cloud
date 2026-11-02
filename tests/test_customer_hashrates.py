@@ -14,10 +14,16 @@ from test_site_management import cloud, login, write  # noqa: F401
 
 def customer(worker="customer", rate=293, mean=293, hours=24, observed=None, machines=1):
     observed = hours if observed is None else observed
+    end = int(time.time()) // 600 * 600
     return {"worker": worker, "machines": machines, "current_machines": machines,
             "uptime_pct": 100, "delivered_th_h": rate * hours, "power_kwh": 120,
             "hashrate_ths": rate, "avg_hashrate_ths": mean, "hashrate_hours": hours,
             "observed_hours": observed, "coverage_pct": observed / hours * 100,
+            "billing_source": "observed", "billing_hours": hours,
+            "delivery_observed_hours": observed, "power_observed_hours": observed,
+            "uptime_observed_hours": observed,
+            "period_start_ts": end - hours * 3600, "period_end_ts": end,
+            "billing_period_start_ts": end - hours * 3600, "billing_period_end_ts": end,
             "hashrate_ts": int(time.time())}
 
 
@@ -79,10 +85,9 @@ def test_realtime_snapshot_does_not_trust_future_client_clock():
     rows, stamp = validate.customer_snapshot({"scan_ts": 253402300799, "scan_age_s": 120,
         "customer_hashrates": [{"worker": "c", "machines": 1,
                                 "hashrate_ths": 293, "hashrate_ts": 253402300799}]}, 2000000000)
-    assert stamp == 1999999880
-    assert rows[0]["hashrate_ts"] == stamp
-    with pytest.raises(ValueError):
-        validate.customer_snapshot({"scan_ts": 253402300799, "customer_hashrates": []}, 2000000000)
+    assert stamp is None
+    assert rows[0]["hashrate_ts"] is None
+    assert validate.customer_snapshot({"scan_ts": 253402300799, "customer_hashrates": []}, 2000000000) == ([], None)
     assert validate.customer_snapshot({}, 2000000000) is None
 
 
@@ -170,7 +175,8 @@ def test_legacy_report_never_converts_integral_into_unknown_average(cloud):
     _, client = cloud
     post_customers(client, [{"worker": "c", "machines": 1, "delivered_th_h": 7032}])
     row = payload(client)["rows"][0]
-    assert row["delivered_th_h"] == 7032
+    assert row["delivered_th_h"] is None
+    assert row["legacy_delivered_th_h"] == 7032
     assert row["hashrate_ths"] is None
     assert row["avg_hashrate_ths"] is None
     assert row["current_machines"] is None
@@ -202,7 +208,8 @@ def test_fresh_site_summary_with_legacy_customer_report_is_not_expired(cloud, mo
     assert detail["site"]["online"] == detail["site"]["total"] == 1330
     assert detail["site"]["hashrate_ths"] == 400100
     assert detail["site"]["data_age_s"] == 37
-    assert detail["site"]["scan_age_s"] == 120
+    assert detail["site"]["scan_age_s"] is None  # no source timestamp: age alone cannot prove transport delay
+    assert detail["site"]["data_quality"] == "legacy_unverified"
     for row in (detail["customers"][0], result["rows"][0], result["by_worker"][0]):
         assert row["machines"] == 465
         assert row["current_machines"] is None
@@ -214,8 +221,10 @@ def test_fresh_site_summary_with_legacy_customer_report_is_not_expired(cloud, mo
         assert row["avg_unavailable_reason"] == "not_reported"
         assert row["report_age_s"] == 360
         assert row["report_stale"] is False
-        assert row["delivered_th_h"] == 3360000
-        assert row["power_kwh"] == 59940
+        assert row["delivered_th_h"] is None
+        assert row["power_kwh"] is None
+        assert row["legacy_delivered_th_h"] == 3360000
+        assert row["legacy_power_kwh"] == 59940
 
 
 def test_new_report_waiting_for_first_scan_is_missing_not_unreported(cloud):

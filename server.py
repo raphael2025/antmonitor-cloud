@@ -210,9 +210,20 @@ def _find_site(key):
     return matches[0] if matches else None
 
 
-def _managed_site(key):
+def _managed_site(key, include_pending=False):
     """修改操作仅接受稳定 ID，不能因重名或拼错 ID 操作另一场地。"""
     site = next((s for s in all_sites() if s["id"] == key), None)
+    if not site and include_pending:
+        # 发码只写入接入配置，首报前还没有 sites 行；撤销 token 也不等于删除。
+        # 已删除 ID 始终由墓碑管理，不能因 YAML/覆盖层还保留拒收记录而重新列出。
+        deleted = db.site_management(CONN).get(key, {}).get("deleted_ts")
+        ingest = CFG.get("ingest") or {}
+        meta = ingest.get("site_meta")
+        if not deleted and (key in _ingest_tokens()[0]
+                            or (isinstance(meta, dict) and key in meta)):
+            saved = _connect_site_meta(key)
+            site = {"id": key, "name": saved["name"] or key,
+                    "type": saved["type"] or "air", "mode": "push"}
     if not site:
         raise HTTPException(404, "无此场地")
     return site
@@ -653,6 +664,15 @@ def _ingest_tokens():
     return per, shared
 
 
+def _verify_ingest_credential(request, site_id):
+    """只核验当前钥匙，不重复限流；写入前调用可挡住删除/恢复前已鉴权的旧包。"""
+    per, shared = _ingest_tokens()
+    expected = per.get(site_id, shared)
+    got = _bearer(request)
+    if not expected or not got or not hmac.compare_digest(got.encode(), expected.encode()):
+        raise HTTPException(401, "上报 token 错误")
+
+
 def _check_ingest_token(request: Request, site_id):
     """每场地钥匙优先：ingest.tokens 里配了该 site_id 就必须用它自己的钥匙
     (共享钥匙对它无效——防一个场地被攻破后冒充其它场地)；没配的场地用共享 ingest.token。
@@ -664,10 +684,7 @@ def _check_ingest_token(request: Request, site_id):
     rate = int(icfg.get("rate_per_min") or 120)
     if not _rate_ok(_ingest_rate, _client_ip(request), rate):   # 错 token 也计数，挡穷举
         raise HTTPException(429, f"上报太频繁(每来源每分钟 {rate} 次)")
-    expected = per.get(site_id, shared)
-    got = _bearer(request)
-    if not expected or not got or not hmac.compare_digest(got.encode(), expected.encode()):
-        raise HTTPException(401, "上报 token 错误")
+    _verify_ingest_credential(request, site_id)
     if db.site_management(CONN).get(site_id, {}).get("deleted_ts"):
         raise HTTPException(410, "场地已删除，请管理员恢复后再上报")
     if not db.site_exists(CONN, site_id):
@@ -722,6 +739,7 @@ def api_ingest_summary(request: Request, body: dict = Body(...)):
                  **validate.source_time_fields(body),
                  "scan_ts": stamp, "scan_age_s": now - stamp if stamp else None})
     with _ingest_write(sid):
+        _verify_ingest_credential(request, sid)
         if not db.insert_snapshot(CONN, snap):
             return {"ok": True, "ts": now, "stored": False, "reason": "older_scan"}
         db.upsert_site(CONN, sid, name, site_type, now)
@@ -786,6 +804,7 @@ def api_ingest_customers(request: Request, body: dict = Body(...)):
         raise HTTPException(400, str(exc)) from exc
     now = int(time.time())
     with _ingest_write(sid):
+        _verify_ingest_credential(request, sid)
         if not db.replace_customers(CONN, sid, rows, _num(body.get("hours"), int, 24, hi=24 * 90) or 24, period):
             return {"ok": True, "ts": now, "stored": False, "reason": "older_or_unverified_report"}
         db.upsert_site(CONN, sid, name if body.get("site") else None, None, now)
@@ -798,11 +817,16 @@ def api_delete_site(request: Request, key: str):
     sess = _require_login(request)
     if sess.get("role") != "admin":
         raise HTTPException(403, "需要 admin")
-    scfg = _managed_site(key)
-    if scfg and scfg.get("mode") == "pull":
-        raise HTTPException(400, "该场地在 config.yaml 的 sites 里(拉取模式)，请改配置文件")
-    sid = scfg["id"]
-    db.delete_site(CONN, sid, scfg["name"])
+    # 与发码/恢复共用配置锁，再取数据库写锁；先持久化撤销，失败不删除原数据。
+    with appconfig._LOCK:
+        scfg = _managed_site(key, include_pending=True)
+        if scfg.get("mode") == "pull":
+            raise HTTPException(400, "该场地在 config.yaml 的 sites 里(拉取模式)，请改配置文件")
+        sid = scfg["id"]
+        with _ingest_write(sid):
+            with _disabled_site_binding(sid, {"name": scfg["name"], "type": scfg["type"]},
+                                        was_deleted=False, action="删除"):
+                db.delete_site(CONN, sid, scfg["name"])
     _audit(request, sess["user"], "site_delete", sid)
     return {"ok": True}
 
@@ -837,10 +861,20 @@ def api_deleted_sites(request: Request):
 @app.post("/api/site/{key}/restore")
 def api_restore_site(request: Request, key: str):
     sess = _require_admin(request)
-    if not db.restore_site(CONN, key):
-        raise HTTPException(404, "无此已删除场地")
+    with appconfig._LOCK:
+        deleted = db.site_management(CONN).get(key)
+        if not deleted or not deleted.get("deleted_ts"):
+            raise HTTPException(404, "无此已删除场地")
+        meta = _connect_site_meta(key)
+        meta["name"] = deleted.get("deleted_name") or meta["name"] or key
+        meta["type"] = meta["type"] or "air"
+        # 旧版删除只删数据库，可能还保留有效专属/YAML/共享凭据。恢复也先撤销，
+        # 让管理员明确生成新接入码，不能因取消墓碑就让旧终端自动重新接入。
+        with _disabled_site_binding(key, meta, was_deleted=True, action="恢复"):
+            if not db.restore_site(CONN, key):
+                raise HTTPException(404, "无此已删除场地")
     _audit(request, sess["user"], "site_restore", key)
-    return {"ok": True}
+    return {"ok": True, "requires_new_token": True}
 
 
 # ---------- 场地接入(云端地址/上报 token/证书指纹/接入码；仅 admin) ----------
@@ -911,7 +945,8 @@ def _connect_payload(request: Request):
     over = appconfig.load_settings().get("ingest") or {}
     over_tokens = over.get("tokens") if isinstance(over.get("tokens"), dict) else {}
     rows = []
-    for sid in sorted(set(sites) | set(per)):
+    deleted = {sid for sid, m in db.site_management(CONN).items() if m.get("deleted_ts")}
+    for sid in sorted((set(sites) | set(per)) - deleted):
         tok = str(per.get(sid) or "")
         x = sites.get(sid) or {}
         meta = _connect_site_meta(sid, sites)
@@ -998,6 +1033,69 @@ def _save_ingest_locked(mutate):
         icfg["auto_register"] = bool(cur["auto_register"])
 
 
+def _disable_site_binding(site_id, meta):
+    """保留空串拒收覆盖与非敏感描述；删除/YAML/共享 token 都不能隐式恢复权限。"""
+    def disable(cur):
+        cur["tokens"][site_id] = ""
+        if not isinstance(cur.get("site_meta"), dict):
+            cur["site_meta"] = {}
+        cur["site_meta"][site_id] = dict(meta)
+    _save_ingest(disable)
+
+
+@contextmanager
+def _disabled_site_binding(site_id, meta, was_deleted, action):
+    """协调设置文件和数据库操作；可确认回滚时补偿，崩溃/补偿失败保持拒收。
+
+    调用方持配置锁（删除还持数据库写锁），补偿只恢复该 ID 的两个覆盖字段，
+    不覆盖其他场地或通知等设置。两个存储不是跨介质原子事务；先停用钥匙确保
+    任一步中断都不会让旧凭据绕过删除，再由明确失败响应或重试收敛状态。
+    """
+    try:
+        current = appconfig._read_settings().get("ingest")
+    except (appconfig.SettingsError, OSError) as exc:
+        raise HTTPException(500, str(exc)) from exc
+    current = current if isinstance(current, dict) else {}
+    previous = {}
+    for field in ("tokens", "site_meta"):
+        values = current.get(field)
+        previous[field] = (site_id in values, copy.deepcopy(values.get(site_id))) \
+            if isinstance(values, dict) else (False, None)
+    _disable_site_binding(site_id, meta)
+    try:
+        yield
+    except Exception as exc:
+        def undo(cur):
+            for field, (present, value) in previous.items():
+                if not isinstance(cur.get(field), dict):
+                    cur[field] = {}
+                if present:
+                    cur[field][site_id] = value
+                else:
+                    cur[field].pop(site_id, None)
+        try:
+            # SQLite 操作自身带事务：删除标记仍是原状态才确认可以恢复原钥匙。
+            # 无法确认提交结果时宁可保持停用，不能对已经完成的恢复重新放开旧钥匙。
+            deleted_now = bool(db.site_management(CONN).get(site_id, {}).get("deleted_ts"))
+            if deleted_now != was_deleted:
+                raise RuntimeError("数据库操作结果尚未确认")
+            _save_ingest(undo)
+        except Exception as undo_error:
+            raise HTTPException(500, f"场地{action}未能完成确认，原凭据已停用；请刷新后重试") from undo_error
+        raise HTTPException(500, f"场地{action}失败，原场地状态和接入配置已保留；请重试") from exc
+
+
+@contextmanager
+def _connect_access(target):
+    """发码/复制与删除串行，已删除 ID 不能拿到看似有效、实际被墓碑拒收的码。"""
+    with appconfig._LOCK:
+        if target == "shared":
+            yield
+        else:
+            with _ingest_write(target):
+                yield
+
+
 def _target(body):
     t = str(body.get("target") or "")
     # 老版本场地端没有 site_id 时用场地名当 ID(可能含中文/空格)，按上报接口同一规则校验
@@ -1012,19 +1110,20 @@ def api_connect_reveal(request: Request, body: dict = Body(...)):
     sess = _require_admin(request)
     target = _target(body)
     _confirm_pw(request, sess, body)
-    per, shared = _ingest_tokens()
-    sites = {x["id"]: x for x in all_sites()}
-    if target == "shared":
-        tok = shared
-        sid = ""
-    else:
-        tok = _site_connect_token(target, sites, per, shared)
-        sid = target
-    if not _valid_token(tok):
-        raise HTTPException(404, "这把 token 还没生成")
+    with _connect_access(target):
+        per, shared = _ingest_tokens()
+        sites = {x["id"]: x for x in all_sites()}
+        if target == "shared":
+            tok = shared
+            sid = ""
+        else:
+            tok = _site_connect_token(target, sites, per, shared)
+            sid = target
+        if not _valid_token(tok):
+            raise HTTPException(404, "这把 token 还没生成")
+        meta = _connect_site_meta(sid, sites) if sid else {}
+        code = _code_for(request, tok, sid, meta)
     _audit(request, sess["user"], "token_reveal", target)
-    meta = _connect_site_meta(sid, sites) if sid else {}
-    code = _code_for(request, tok, sid, meta)
     return {"ok": True, "target": target, "token": tok, "code": code,
             "public_url": connect.parse_code(code)["u"],
             "site_name": meta.get("name", ""), "site_type": meta.get("type", "")}
@@ -1040,6 +1139,11 @@ def api_connect_token(request: Request, body: dict = Body(...)):
         raise HTTPException(400, "action 须为 rotate / revoke / new_site")
     target = "st-" + secrets.token_hex(6) if action == "new_site" else _target(body)
     _confirm_pw(request, sess, body)
+    with _connect_access(target):
+        return _change_connect_token(request, sess, body, action, target)
+
+
+def _change_connect_token(request, sess, body, action, target):
     meta = _new_site_meta(body) if action == "new_site" else _connect_site_meta(target)
     if action == "new_site" and db.site_count(CONN) >= int((CFG.get("ingest") or {}).get("max_sites") or 200):
         raise HTTPException(403, "场地数已达上限(ingest.max_sites)")

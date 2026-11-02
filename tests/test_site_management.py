@@ -69,14 +69,14 @@ def test_reinstallation_delete_only_old_id_and_no_resurrection(cloud):
     assert sites[0]["duplicate_name"] is False
     assert client.get("/api/customers").json()["rows"][0]["site_id"] == "st-new"
     for kind in ("summary", "customers"):
-        assert report(client, "st-old", kind=kind).status_code == 410
+        assert report(client, "st-old", kind=kind).status_code == 401
         assert report(client, "st-new", kind=kind).status_code == 200
     assert not db.site_exists(server.CONN, "st-old")
     assert server.CONN.execute("SELECT COUNT(*) FROM snapshots WHERE site_id='st-old'").fetchone()[0] == 0
     assert client.get("/api/sites/deleted").json()["sites"][0]["id"] == "st-old"
 
 
-def test_tombstone_survives_restart_and_restore_accepts_new_reports(cloud):
+def test_tombstone_survives_restart_and_restore_requires_new_binding(cloud):
     server, client = cloud
     login(client)
     report(client, "st-old")
@@ -85,13 +85,36 @@ def test_tombstone_survives_restart_and_restore_accepts_new_reports(cloud):
     with pytest.raises(db.SiteDeletedError):
         db.upsert_site(second, "st-old", "renamed", "air", int(time.time()))
     second.close()
-    assert write(client, "POST", "/api/site/st-old/restore").status_code == 200
+    restored = write(client, "POST", "/api/site/st-old/restore")
+    assert restored.status_code == 200 and restored.json()["requires_new_token"]
     assert client.get("/api/sites/deleted").json()["sites"] == []
     assert client.get("/api/overview").json()["sites"] == []
-    assert report(client, "st-old").status_code == 200
+    assert report(client, "st-old").status_code == 401
+    row = next(s for s in client.get("/api/connect").json()["sites"] if s["id"] == "st-old")
+    assert not row["registered"] and row["revoked"] and row["name"] == "云海二期"
+    server.CFG.setdefault("server", {})["public_url"] = "https://cloud.example.com"
+    new = write(client, "POST", "/api/connect/token", json={
+        "target": "st-old", "action": "rotate", "password": "admin-test-password"})
+    assert new.status_code == 200
+    assert client.post("/api/ingest/summary", headers={
+        "Authorization": "Bearer " + new.json()["token"]},
+        json={"site_id": "st-old", "site": "云海二期", "hashrate_ths": 416360,
+              "online": 1341, "total": 1341}).status_code == 200
     points = client.get("/api/site/st-old").json()["trend"]
     assert sum(p["legacy_hashrate_ths"] is not None for p in points) == 1
     assert server.CONN.execute("SELECT COUNT(*) FROM snapshots WHERE site_id='st-old'").fetchone()[0] == 1
+
+
+def test_delete_unknown_id_or_name_does_not_create_a_tombstone(cloud):
+    server, client = cloud
+    login(client)
+    report(client, "st-real", "Shared display name")
+    before = server.appconfig.load_settings()
+    for key in ("st-unknown", "Shared display name"):
+        assert write(client, "DELETE", "/api/site/" + key).status_code == 404
+    assert server.appconfig.load_settings() == before
+    assert db.site_management(server.CONN) == {}
+    assert db.site_exists(server.CONN, "st-real")
 
 
 def test_rename_persists_on_reports_and_customer_names_match(cloud):
@@ -182,3 +205,33 @@ def test_inflight_report_cannot_recreate_deleted_site(cloud):
     assert not thread.is_alive()
     assert responses[0].status_code == 410
     assert not db.site_exists(server.CONN, "st-a")
+
+
+@pytest.mark.parametrize("kind", ["summary", "customers"])
+def test_inflight_old_report_remains_rejected_after_delete_and_restore(cloud, kind):
+    server, client = cloud
+    login(client)
+    assert report(client, "st-a").status_code == 200
+    authenticated, finish = threading.Event(), threading.Event()
+    original = server._check_ingest_token
+    def pause(request, sid):
+        original(request, sid)
+        authenticated.set()
+        assert finish.wait(5)
+    server._check_ingest_token = pause
+    responses = []
+    thread = threading.Thread(target=lambda: responses.append(report(client, "st-a", kind=kind)))
+    thread.start()
+    try:
+        assert authenticated.wait(5)
+        assert write(client, "DELETE", "/api/site/st-a").status_code == 200
+        assert write(client, "POST", "/api/site/st-a/restore").status_code == 200
+    finally:
+        finish.set()
+        thread.join(5)
+        server._check_ingest_token = original
+    assert not thread.is_alive()
+    assert responses[0].status_code == 401
+    assert not db.site_exists(server.CONN, "st-a")
+    for table in ("snapshots", "site_customers", "site_customer_current", "site_customer_report_state"):
+        assert server.CONN.execute("SELECT COUNT(*) FROM " + table + " WHERE site_id='st-a'").fetchone()[0] == 0

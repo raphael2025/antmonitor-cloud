@@ -132,7 +132,7 @@
         <span style="flex:1"></span>
         <button id="deletedSitesClose">×</button>
       </div>
-      <p class="muted" data-i18n="site.restore_help">恢复后允许该场地重新上报，已删除的历史数据不会恢复。</p>
+      <p class="muted" data-i18n="site.restore_help">恢复后请在「场地接入」为该场地生成新的完整接入信息，再粘贴到本地端。旧接入信息和已删除的历史数据不会恢复。</p>
       <div id="deletedSitesList"></div>
       <div id="deletedSitesMsg" role="status" class="site-warning"></div>
     </div>
@@ -308,6 +308,7 @@
       <div id="connMsg" class="notifymsg muted" role="status" aria-live="polite"></div>
 
       <h3 data-i18n="conn.sites_title">已分配的场地</h3>
+      <p class="muted" data-i18n="conn.delete_help">撤销密钥会保留场地记录；不用的测试场地可以直接删除。删除后旧接入信息失效，该场地的历史数据也会删除。</p>
       <div class="tablewrap"><table class="mini" id="tblConnSites">
         <thead><tr><th data-i18n="conn.col_site">场地</th><th>ID</th><th data-i18n="conn.col_token">专属 token</th><th data-i18n="conn.col_ops">操作</th></tr></thead>
         <tbody></tbody>

@@ -258,16 +258,21 @@ curl -X POST https://overview.example.com/api/ingest/summary \
 
 | 字段 | 含义 |
 |---|---|
-| `hashrate_age_s` / `hashrate_stale` | 实时采样距现在的秒数／是否过期；过期时应明确标为旧数据 |
-| `hashrate_source` | 明细的实时值来源：`summary`（摘要）、`report`（报表）、`legacy`（旧端没有新指标） |
+| `hashrate_age_s` / `hashrate_stale` | 实时采样距现在的秒数／是否过期；没有可信时间时龄期为 `null`，单场地不因此标为过期 |
+| `hashrate_source` | 明细的实时值来源：`summary`（摘要）、`report`（含采样时间的报表）、`legacy`（缺采样时间的报表兼容路径）；单凭此字段不能确定场地端版本 |
+| `hashrate_unavailable_reason` | `not_reported`（同场地没有新指标证据）、`missing_data`（新指标通道存在，但本项未知）、`partial_sites`（汇总缺少部分场地）；有值时为 `null` |
 | `avg_complete` | 是否具有完整统计窗口的平均值；仅为 `true` 时可直接作为该周期完整平均展示 |
-| `avg_unavailable_reason` | `missing_data`（缺少指标）、`mixed_periods`（跨场地窗口不同）、`partial_coverage`（多场地覆盖不足）；可用时为 `null` |
+| `avg_unavailable_reason` | `not_reported`、`missing_data`、`partial_sites` 的含义同上；另有 `mixed_periods`（跨场地窗口不同）、`partial_coverage`（多场地覆盖不足）；平均值可用时为 `null` |
 | `updated_ts` / `report_age_s` / `report_stale` | 历史报表接收时间／龄期／是否过期，与实时采样时间分开 |
 | `periods` | `by_worker` 涉及的平均统计窗口列表，单位小时 |
 | `hashrate_known_sites` / `avg_known_sites` | `by_worker` 中有对应指标的场地数，缺少部分场地不补成零 |
 
 默认实时过期阈值取 `poll.stalled_after_s`（1,200 秒）；平均报表过期阈值至少是该值，且不短于 `poll.customer_interval` 的三倍（默认 1,800 秒）。
 `avg_complete` 描述覆盖，`report_stale` 描述新鲜度；展示时两者都需要检查。
+单场地有平均值但 `avg_complete=false` 时，页面显示数值并常显「按有效时段计算」和覆盖时长，不能将其称为完整 24 小时平均。
+`not_reported` 只说明未收到指标，不证明具体软件版本；页面建议检查场地端是否已经更新并重启。
+`hashrate_age_s` / `report_age_s` 显式为 `null` 时，前端不得再从原始时间戳重算为“0 秒前”；超过云端时间 300 秒的时间戳不可信。
+跨场地 `stale` 取各场地的任一过期状态：即使另一个场地的时间未知导致合计龄期为 `null`，已知的过期警告仍应保留。
 
 ### 5. `GET /api/daily?site=<id>&days=14` — 单场地日级汇总
 

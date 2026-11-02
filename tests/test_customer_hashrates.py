@@ -127,6 +127,7 @@ def test_unknown_site_rate_is_not_treated_as_zero_in_total(cloud):
     total = payload(client)["by_worker"][0]
     assert total["hashrate_ths"] is None
     assert total["hashrate_known_sites"] == 1
+    assert total["hashrate_unavailable_reason"] == "partial_sites"
     assert total["avg_hashrate_ths"] == 293
 
 
@@ -174,6 +175,153 @@ def test_legacy_report_never_converts_integral_into_unknown_average(cloud):
     assert row["avg_hashrate_ths"] is None
     assert row["current_machines"] is None
     assert row["avg_complete"] is False
+    assert row["hashrate_unavailable_reason"] == "not_reported"
+    assert row["avg_unavailable_reason"] == "not_reported"
+    assert row["hashrate_age_s"] is None
+    assert row["hashrate_stale"] is False
+
+
+def test_fresh_site_summary_with_legacy_customer_report_is_not_expired(cloud, monkeypatch):
+    """Screenshot regression: live 400.1 PH/s site, six-minute-old bill, no customer rates."""
+    _, client = cloud
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now - 360)
+    old = {"worker": "customer", "machines": 465, "uptime_pct": 98.8,
+           "delivered_th_h": 3360000, "power_kwh": 59940}
+    assert post_customers(client, [old]).status_code == 200
+    monkeypatch.setattr(time, "time", lambda: now - 37)
+    response = client.post("/api/ingest/summary", headers={
+        "Authorization": "Bearer reporting-test-token"}, json={
+        "site_id": "st-a", "site": "st-a", "online": 1330, "total": 1330,
+        "hashrate_ths": 400100, "scan_age_s": 120})
+    assert response.status_code == 200
+    monkeypatch.setattr(time, "time", lambda: now)
+    result = payload(client)
+    detail = client.get("/api/site/st-a").json()
+    assert detail["site"]["state"] == "ok"
+    assert detail["site"]["online"] == detail["site"]["total"] == 1330
+    assert detail["site"]["hashrate_ths"] == 400100
+    assert detail["site"]["data_age_s"] == 37
+    assert detail["site"]["scan_age_s"] == 120
+    for row in (detail["customers"][0], result["rows"][0], result["by_worker"][0]):
+        assert row["machines"] == 465
+        assert row["current_machines"] is None
+        assert row["hashrate_ths"] is None
+        assert row["avg_hashrate_ths"] is None
+        assert row["hashrate_age_s"] is None
+        assert row["hashrate_stale"] is False
+        assert row["hashrate_unavailable_reason"] == "not_reported"
+        assert row["avg_unavailable_reason"] == "not_reported"
+        assert row["report_age_s"] == 360
+        assert row["report_stale"] is False
+        assert row["delivered_th_h"] == 3360000
+        assert row["power_kwh"] == 59940
+
+
+def test_new_report_waiting_for_first_scan_is_missing_not_unreported(cloud):
+    _, client = cloud
+    pending = {"worker": "customer", "machines": 1, "current_machines": 1,
+               "hashrate_hours": 24, "observed_hours": 0, "coverage_pct": 0}
+    assert post_customers(client, [pending]).status_code == 200
+    result = payload(client)
+    for row in (result["rows"][0], result["by_worker"][0]):
+        assert row["current_machines"] == 1
+        assert row["hashrate_ths"] is None
+        assert row["avg_hashrate_ths"] is None
+        assert row["hashrate_unavailable_reason"] == "missing_data"
+        assert row["avg_unavailable_reason"] == "missing_data"
+        assert row["hashrate_age_s"] is None
+        assert row["hashrate_stale"] is False
+        assert row["avg_complete"] is False
+
+
+def test_customer_missing_fields_do_not_mark_metric_capable_site_unreported(cloud):
+    _, client = cloud
+    post_customers(client, [customer(worker="known"), {"worker": "unknown", "machines": 1}])
+    unknown = next(r for r in payload(client)["rows"] if r["worker"] == "unknown")
+    assert unknown["hashrate_ths"] is None
+    assert unknown["hashrate_unavailable_reason"] == "missing_data"
+    assert unknown["avg_unavailable_reason"] == "missing_data"
+
+
+def test_current_snapshot_with_unknown_reading_and_no_history_is_not_expired(cloud):
+    _, client = cloud
+    assert post_summary(client, [{"worker": "customer", "machines": 1}]).status_code == 200
+    result = payload(client)
+    for row in (result["rows"][0], result["by_worker"][0]):
+        assert row["current_machines"] == 1
+        assert row["hashrate_ths"] is None
+        assert row["hashrate_unavailable_reason"] == "missing_data"
+        assert row["hashrate_age_s"] is not None
+        assert row["hashrate_stale"] is False
+        assert row["avg_unavailable_reason"] == "missing_data"
+        assert row["report_age_s"] is None
+        assert row["report_stale"] is False
+
+
+@pytest.mark.parametrize("stamp", [None, 0, "invalid", 3600])
+def test_unknown_or_untrusted_timestamps_do_not_expire_known_rates(cloud, monkeypatch, stamp):
+    server, client = cloud
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    stamp = now + stamp if isinstance(stamp, int) and stamp else stamp
+    report = {**customer(), "hashrate_ts": stamp}
+    assert post_customers(client, [report]).status_code == 200
+    # Cover unreadable timestamps already stored by an older version as well as absent reports.
+    server.CONN.execute("UPDATE site_customers SET updated_ts=?", (stamp,))
+    server.CONN.commit()
+    result = payload(client)
+    for row in (result["rows"][0], result["by_worker"][0]):
+        assert row["hashrate_ths"] == 293
+        assert row["avg_hashrate_ths"] == 293
+        assert row["hashrate_unavailable_reason"] is None
+        assert row["avg_unavailable_reason"] is None
+        assert row["hashrate_age_s"] is None
+        assert row["hashrate_stale"] is False
+        assert row["report_age_s"] is None
+        assert row["report_stale"] is False
+
+
+def test_old_report_with_new_snapshot_waits_for_mean_without_upgrade_claim(cloud):
+    _, client = cloud
+    post_customers(client, [{"worker": "customer", "machines": 1, "delivered_th_h": 7032}])
+    post_summary(client, [{"worker": "customer", "machines": 1, "hashrate_ths": 293}])
+    result = payload(client)
+    for row in (result["rows"][0], result["by_worker"][0]):
+        assert row["hashrate_ths"] == 293
+        assert row["hashrate_unavailable_reason"] is None
+        assert row["avg_hashrate_ths"] is None
+        assert row["avg_unavailable_reason"] == "missing_data"
+
+
+def test_all_unknown_sites_distinguish_unreported_from_missing_readings(cloud):
+    _, client = cloud
+    old = {"worker": "customer", "machines": 1, "delivered_th_h": 7032}
+    post_customers(client, [old], "st-a")
+    post_customers(client, [old], "st-b")
+    total = payload(client)["by_worker"][0]
+    assert total["hashrate_ths"] is None
+    assert total["hashrate_unavailable_reason"] == "not_reported"
+    assert total["avg_unavailable_reason"] == "not_reported"
+    # A new channel with an unknown reading still does not justify a made-up total of zero.
+    post_summary(client, [{"worker": "customer", "machines": 1}], "st-b")
+    total = payload(client)["by_worker"][0]
+    assert total["hashrate_ths"] is None
+    assert total["hashrate_known_sites"] == 0
+    assert total["hashrate_unavailable_reason"] == "missing_data"
+    assert total["avg_unavailable_reason"] == "missing_data"
+
+
+def test_partly_reported_cross_site_mean_is_explicitly_incomplete(cloud):
+    _, client = cloud
+    post_customers(client, [customer()], "st-a")
+    post_customers(client, [{"worker": "customer", "machines": 1, "delivered_th_h": 7032}], "st-b")
+    total = payload(client)["by_worker"][0]
+    assert total["sites"] == 2
+    assert total["avg_known_sites"] == 1
+    assert total["avg_hashrate_ths"] is None
+    assert total["avg_complete"] is False
+    assert total["avg_unavailable_reason"] == "partial_sites"
 
 
 def test_realtime_summary_visible_before_history_and_slow_report_cannot_rollback(cloud, monkeypatch):
@@ -256,6 +404,8 @@ def test_old_measurements_are_flagged_stale_not_silently_zeroed(cloud, monkeypat
         assert row["hashrate_ths"] == 300
         assert row["hashrate_age_s"] == 3600
         assert row["hashrate_stale"] is True
+        assert row["hashrate_unavailable_reason"] is None
+        assert row["avg_unavailable_reason"] is None
         assert row["report_age_s"] == 3600
         assert row["report_stale"] is True
 
@@ -282,6 +432,32 @@ def test_pull_mode_keeps_new_rates_and_actual_mean_window(cloud, monkeypatch):
     assert row["hashrate_hours"] == 48
     assert row["observed_hours"] == 6
     assert row["avg_complete"] is False
+
+
+def test_pull_mode_fresh_legacy_data_is_unreported_not_expired(cloud, monkeypatch):
+    server, client = cloud
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    site = {"id": "pull-a", "name": "Pull", "url": "https://unused.invalid", "token": "test"}
+    server.COLLECTOR.cfg["sites"] = [site]
+    db.upsert_site(server.CONN, site["id"], site["name"], "air", now)
+
+    def get(_site, path, _params):
+        if path.endswith("summary"):
+            return {"ok": True, "scan_ts": now - 120, "total_hashrate_ths": 400100}
+        return {"ok": True, "hours": 24, "customers": [
+            {"worker": "customer", "machines": 465, "delivered_th_h": 3360000}]}
+
+    monkeypatch.setattr(server.COLLECTOR, "_get", get)
+    server.COLLECTOR._poll_site(site)
+    server.COLLECTOR.poll_customers()
+    row = payload(client)["rows"][0]
+    assert row["hashrate_ths"] is None
+    assert row["avg_hashrate_ths"] is None
+    assert row["hashrate_unavailable_reason"] == "not_reported"
+    assert row["avg_unavailable_reason"] == "not_reported"
+    assert row["hashrate_stale"] is False
+    assert row["report_stale"] is False
 
 
 def test_deleting_site_removes_current_roster_and_its_empty_state(cloud):

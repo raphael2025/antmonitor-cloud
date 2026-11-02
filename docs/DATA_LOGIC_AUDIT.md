@@ -222,10 +222,13 @@ period_start = period_end - requested_hours × 3600
 | 独立覆盖 | `delivery_observed_hours / delivery_coverage_pct`、`power_observed_hours / power_coverage_pct`、`uptime_observed_hours / uptime_coverage_pct` |
 | 来源与旧记录 | `billing_source=observed/legacy_only/missing`；`legacy_delivered_th_h`、`legacy_power_kwh`、`legacy_uptime_pct`；本地同时返回 `billing_method=time_weighted_v2` |
 | 台数 | `machines` 为已观测历史同时峰值或旧报表台数，须结合 `machines_source=observed/legacy`；`current_machines` 是另一时间口径 |
-| 云端全网汇总 | `totals`、`observed_totals`、`metrics_complete`、`metric_known_sites`，不把部分场地小计伪装成完整总量 |
+| 云端场地当前值 | `observed_metrics`、`metric_available` 提供经采集时间校验的有效读数；`metric_complete` 单独表明是否覆盖全部机器 |
+| 云端全网汇总 | `totals` 保留严格完整总量；`observed_totals` 包含有效的部分矿机小计，`metrics_complete` 表示完整性，`metric_known_sites` 表示有有效读数的场地数。网页把有效合计放在主数值并标明部分覆盖 |
 | 云端客户合计 | `window_alignment` 与 `billing_window_alignment` 独立；未验证、不齐窗、过期、部分覆盖有明确不可用原因 |
 | 云端日报 | `method`、`elapsed_hours`、`metric_observed_hours`、`metric_coverage_pct`、`legacy_*` |
 | 容器 | `data_status`、`data_complete`、`observed_fault_flags`、`last_observed_ts`、`containers_unknown` |
+
+采集时间 `measurement_ts` 接受合法的 Unix 小数秒，按原始扫描时间校正后向下取整，不会延长读数的有效期。旧库中已被清空的采集时间不以接收时间补造；修复后的新上报恢复有效当前值和新趋势点，原有历史缺口仍保留。
 
 `billing_source=observed` 只表示存在有效观测，**不表示每个指标都有完整覆盖**。调用方仍须逐项检查值、覆盖、窗口和来源。新增 `null` 是有意的数据语义；API 消费方不得使用 `value or 0`、`value || 0` 之类的默认零替换。
 

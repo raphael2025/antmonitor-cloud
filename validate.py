@@ -281,7 +281,9 @@ def source_time_fields(src):
 
 def measurement_timestamp(src, scan_ts):
     """用原始整轮时间的相对差校正最早单机采样，不延长该读数的有效寿命。"""
-    measured = measurement(src.get("measurement_ts"), int, hi=253402300799)
+    # Real probes use time.time(), so valid measurement clocks contain fractions
+    # of a second. Counts remain strict integers; clocks must not use that rule.
+    measured = measurement(src.get("measurement_ts"), hi=253402300799)
     raw_scan = measurement(src.get("scan_ts"), int, hi=253402300799)
     if not raw_scan:
         sent = measurement(src.get("ts"), int, hi=253402300799)
@@ -290,7 +292,9 @@ def measurement_timestamp(src, scan_ts):
             raw_scan = sent - age
     if not measured or not scan_ts or not raw_scan or measured > raw_scan + 60:
         return None
-    corrected = scan_ts - max(0, raw_scan - measured)
+    # Storage uses whole seconds. Floor after correction so normalization can
+    # only make a measurement slightly older, never refresh an old reading.
+    corrected = math.floor(scan_ts - max(0, raw_scan - measured))
     return corrected if corrected > 0 else None
 
 

@@ -447,6 +447,119 @@ def test_measurement_time_clock_correction_preserves_age_difference():
     assert validate.measurement_timestamp(source, START) is None
 
 
+def test_fractional_probe_time_is_a_clock_not_an_integer_count():
+    source = {"scan_ts": START + 3600, "measurement_ts": START + 3300.875}
+    assert validate.measurement_timestamp(source, START) == START - 300
+    assert validate.measurement(539.5, int) is None  # Do not weaken machine counts.
+    for bad in (None, True, False, 0, -1, float("nan"), float("inf"), "bad", START + 3660.01):
+        assert validate.measurement_timestamp(dict(source, measurement_ts=bad), START) is None
+    assert validate.measurement_timestamp(source, None) is None
+
+
+@pytest.mark.parametrize("mode", ["push", "pull"])
+def test_real_fractional_probe_clock_keeps_online_hashrate_and_trend_available(cloud, monkeypatch, mode):
+    server, client = cloud
+    now = int(time.time()) // 60 * 60
+    monkeypatch.setattr(time, "time", lambda: now)
+    for sid, machines, rate, power in (("a", 539, 161560, 2859.426), ("b", 1329, 401820, 7202.3)):
+        body = dict(ts=now, scan_ts=now, scan_age_s=0, measurement_ts=now - 30.123,
+                    online=machines, total=machines, unknown=0,
+                    hashrate_ths=rate, known_hashrate_ths=rate,
+                    hashrate_complete=True, hashrate_known_machines=machines,
+                    power_kw=None, known_power_kw=power,
+                    power_complete=False, power_known_machines=machines - 1,
+                    active_alerts=0, containers=0, containers_unknown=0,
+                    containers_faulty=0, containers_offline=0)
+        if mode == "push":
+            assert send_summary(client, sid, customer_hashrates=[], **body).status_code == 200
+        else:
+            site = {"id": sid, "name": sid, "url": "http://fixture.invalid"}
+            server.CFG.setdefault("sites", []).append(site)
+            response = dict(body, ok=True, scanned=True, total_hashrate_ths=rate, total_power_kw=None)
+            monkeypatch.setattr(server.COLLECTOR, "_get", lambda *a, _response=response, **k: _response)
+            server.COLLECTOR._poll_site(site)
+        stored = db.latest_ok_snapshots(server.CONN)[sid]
+        assert stored["measurement_ts"] == now - 31
+        assert stored["known_power_kw"] == power
+    overview = server._overview_payload()
+    assert overview["totals"]["machines_online"] == overview["totals"]["machines_total"] == 1868
+    assert overview["totals"]["hashrate_ths"] == 563380
+    assert overview["totals"]["power_kw"] is None
+    assert overview["observed_totals"]["power_kw"] == 10061.726
+    assert overview["metric_known_sites"]["power_kw"] == 2
+    assert not overview["metrics_complete"]["power_kw"]
+    assert all(s["metric_complete"]["online"] and s["metric_complete"]["hashrate_ths"]
+               and not s["metric_complete"]["power_kw"] for s in overview["sites"])
+    assert [s["observed_metrics"]["power_kw"] for s in overview["sites"]] == [2859.426, 7202.3]
+    assert all(s["metric_available"]["power_kw"] for s in overview["sites"])
+    monkeypatch.setattr(time, "time", lambda: now + 60)
+    for sid, rate in (("a", 161560), ("b", 401820)):
+        points = db.trend(server.CONN, sid, hours=1, points=60)
+        current = next(p for p in points if p["ts"] == now)
+        assert current["hashrate_ths"] == rate
+        assert current["legacy_hashrate_ths"] is None
+        assert current["power_kw"] is None  # A known subset is not complete-site energy.
+
+
+@pytest.mark.parametrize("extra", [
+    {"measurement_ts": None}, {"measurement_ts": "bad"},
+    {"measurement_ts": True}, {"measurement_ts": -1},
+    {"power_known_machines": 0}, {"power_known_machines": 3},
+    {"power_known_machines": 1.5}, {"power_known_machines": True},
+    {"unknown": 2}, {"unknown": 3}, {"power_complete": None},
+])
+def test_unproven_power_subtotal_is_never_current(cloud, extra):
+    server, client = cloud
+    args = dict(total=2, online=2, unknown=0, power_kw=None, power_complete=False,
+                known_power_kw=3, power_known_machines=1)
+    args.update(extra)
+    assert send_summary(client, **args).status_code == 200
+    overview = server._overview_payload()
+    assert overview["observed_totals"]["power_kw"] is None
+    assert overview["metric_known_sites"]["power_kw"] == 0
+    site = overview["sites"][0]
+    assert site["observed_metrics"]["power_kw"] is None
+    assert not site["metric_available"]["power_kw"]
+
+
+def test_zero_known_power_is_visible_but_unknown_machine_fraction_is_not_invented(cloud, monkeypatch):
+    server, client = cloud
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    assert send_summary(client, "partial", online=1, total=2, unknown=1,
+                        hashrate_ths=None, hashrate_complete=False, known_hashrate_ths=293,
+                        hashrate_known_machines=1, power_kw=None, power_complete=False,
+                        known_power_kw=0, power_known_machines=1).status_code == 200
+    assert send_summary(client, "full", rate=300).status_code == 200
+    overview = server._overview_payload()
+    partial = next(s for s in overview["sites"] if s["id"] == "partial")
+    assert partial["observed_metrics"]["power_kw"] == 0
+    assert partial["metric_available"]["power_kw"]
+    assert partial["observed_metrics"]["online"] is partial["observed_metrics"]["total"] is None
+    assert overview["observed_totals"]["hashrate_ths"] == 593
+    assert overview["totals"]["hashrate_ths"] is None
+    assert overview["observed_totals"]["machines_online"] == overview["observed_totals"]["machines_total"] == 1
+    assert overview["totals"]["machines_online"] is overview["totals"]["machines_total"] is None
+    monkeypatch.setattr(time, "time", lambda: now + 901)
+    stale = server._overview_payload()
+    assert stale["observed_totals"]["hashrate_ths"] is stale["observed_totals"]["power_kw"] is None
+    assert all(not s["metric_available"]["power_kw"] for s in stale["sites"])
+
+
+def test_fractional_old_or_future_measurement_never_refreshes_known_power(cloud, monkeypatch):
+    server, client = cloud
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    for sid, stamp in (("old", now - 900.1), ("future", now + 60.01)):
+        assert send_summary(client, sid, measurement_ts=stamp, total=2, online=2,
+                            power_kw=None, power_complete=False,
+                            known_power_kw=3, power_known_machines=1).status_code == 200
+    overview = server._overview_payload()
+    assert overview["observed_totals"]["power_kw"] is None
+    assert overview["observed_totals"]["hashrate_ths"] is None
+    assert overview["observed_totals"]["machines_online"] is None
+
+
 def test_old_time_protocol_stays_legacy_but_explicit_unknown_is_not_legacy(conn):
     snapshot(conn, START, measurement_ts=None, measurement_time_supported=False)
     snapshot(conn, START + 60, measurement_ts=None, measurement_time_supported=True)

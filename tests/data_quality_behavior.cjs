@@ -81,8 +81,8 @@ test("today's coverage uses elapsed hours; old daily values stay explicitly lega
 test("partial totals and plotting never manufacture measured zero",()=>{
   const cell=q.total({totals:{sites:2,power_kw:null},observed_totals:{power_kw:3},
     metric_known_sites:{power_kw:1},metrics_complete:{power_kw:false}},"power_kw",t,format);
-  assert.match(cell,/rate-value">—/);
-  assert.match(cell,/已知部分：3 kWh（1\/2 个场地）/);
+  assert.match(cell,/rate-value">3 kWh/);
+  assert.match(cell,/已统计 1\/2 个场地/);
   assert.deepEqual(q.points([[1,null],[2,0],[3,293],[4,true]],0,1),[
     {x:1,y:null},{x:2,y:0},{x:3,y:293},{x:4,y:null}]);
 });
@@ -198,10 +198,12 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
       observed_totals:{machines_online:1,machines_total:1,hashrate_ths:293,power_kw:3},
       metrics_complete:{hashrate_ths:false,power_kw:false,machines_total:false},metric_known_sites:{hashrate_ths:1,power_kw:1,machines_total:1},
       sites:[{id:"a",name:"<旧场地>",type:"air",state:"stalled",data_quality:"stale",online:100,total:100,hashrate_ths:29300}]});
-    assert.equal(h.el("kMachines").textContent,"–/–");
-    assert.match(h.el("kMachinesNote").textContent,/1\/1.*1\/2/);
-    assert.match(h.el("kHashrate").innerHTML,/rate-value">—/);
-    assert.match(h.el("kHashrate").innerHTML,/已知部分：293 TH\/s/);
+    assert.equal(h.el("kMachines").textContent,"1/1");
+    assert.equal(h.el("kOnlinePct").textContent,"100.0%");
+    assert.match(h.el("kMachinesNote").textContent,/已统计 1\/2 个场地/);
+    assert.equal(h.el("kOnlinePctNote").textContent,h.el("kMachinesNote").textContent);
+    assert.match(h.el("kHashrate").innerHTML,/rate-value">293 TH\/s/);
+    assert.match(h.el("kHashrate").innerHTML,/已统计 1\/2 个场地/);
     assert.match(h.el("gridAir").innerHTML,/最后记录已过期/);
     assert.doesNotMatch(h.el("gridAir").innerHTML,/<旧场地>/);
     h.ctx.renderCustomers({rows:[{worker:"A",site_id:"a",...observed,power_kwh:null,uptime_pct:null}],by_worker:[]});
@@ -248,4 +250,53 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
     assert.match(h.ctx.containerFaultBadge({flag:"leakage_fault",sev:"crit",observed:false,measured_ts:100}),/尚未确认恢复/);
 
   }
+});
+
+test("fresh sites retain complete online and hashrate totals while partial power stays visible",()=>{
+  const h=setup();
+  const site=(id,total,rate,power)=>({id,name:id,type:"hydro",state:"ok",data_quality:"partial",
+    total,online:total,unknown:0,hashrate_ths:rate,power_kw:null,
+    hashrate_complete:1,power_complete:0,power_known_machines:total-1,
+    known_power_kw:power,observed_metrics:{online:total,total,hashrate_ths:rate,power_kw:power},
+    metric_complete:{online:true,total:true,hashrate_ths:true,power_kw:false},
+    metric_available:{online:true,total:true,hashrate_ths:true,power_kw:true}});
+  h.ctx.renderOverview({ts:1800000000,
+    totals:{sites:2,sites_ok:2,machines_online:1868,machines_total:1868,hashrate_ths:563380,power_kw:null},
+    observed_totals:{machines_online:1868,machines_total:1868,hashrate_ths:563380,power_kw:10054.926},
+    metrics_complete:{machines_online:true,machines_total:true,hashrate_ths:true,power_kw:false},
+    metric_known_sites:{machines_online:2,machines_total:2,hashrate_ths:2,power_kw:2},
+    sites:[site("A",539,161560,2859.426),site("B",1329,401820,7195.5)]});
+  assert.equal(h.el("kMachines").textContent.replace(/,/g,""),"1868/1868");
+  assert.equal(h.el("kOnlinePct").textContent,"100.0%");
+  assert.equal(h.el("kMachinesNote").textContent,"");
+  assert.equal(h.el("kOnlinePctNote").textContent,"");
+  assert.match(h.el("kHashrate").innerHTML,/rate-value">563.38 PH\/s/);
+  assert.match(h.el("kPower").innerHTML.replace(/,/g,""),/rate-value">10054.926 kW/);
+  assert.match(h.el("kPower").innerHTML,/部分读数/);
+  assert.doesNotMatch(h.el("kPower").innerHTML,/2\/2 个场地/);
+  const cards=h.el("gridHydro").innerHTML.replace(/,/g,"");
+  assert.match(cards,/2859.426 kW/);
+  assert.match(cards,/7195.5 kW/);
+  assert.match(cards,/已统计 538\/539 台/);
+  assert.match(cards,/已统计 1328\/1329 台/);
+  assert.doesNotMatch(cards,/数据不完整/);
+  assert.equal(h.el("overviewQuality").classList.contains("hidden"),true);
+
+  const stale=site("Old",539,161560,9999);
+  stale.state="stalled";stale.data_quality="stale";
+  stale.observed_metrics={power_kw:null};stale.metric_available={power_kw:false};
+  const oldCard=h.ctx.siteCard(stale,"#3987e5");
+  assert.doesNotMatch(oldCard,/9999|已统计/);
+  assert.match(oldCard,/最后记录已过期/);
+});
+
+test("available zero power is a number and absent power stays unknown",()=>{
+  const packet={totals:{sites:1,power_kw:null},observed_totals:{power_kw:0},
+    metrics_complete:{power_kw:false},metric_known_sites:{power_kw:1}};
+  assert.match(q.total(packet,"power_kw",t,n=>n+" kW"),/rate-value">0 kW/);
+  assert.match(q.total(packet,"power_kw",t,n=>n+" kW"),/部分读数/);
+  packet.observed_totals.power_kw=null;
+  const cell=q.total(packet,"power_kw",t,n=>n+" kW");
+  assert.match(cell,/rate-value">—/);
+  assert.doesNotMatch(cell,/0 kW|部分读数/);
 });

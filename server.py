@@ -244,8 +244,21 @@ def _site_entry(scfg, latest, last_ok, cust_counts, now):
          "data_age_s": (now - snap["ts"]) if snap else None,
          "customers": cust_counts.get(sid, 0)}
     for k in ("online", "total", "hashrate_ths", "power_kw", "active_alerts",
-              "containers", "containers_faulty", "containers_offline", "scan_age_s"):
+              "containers", "containers_faulty", "containers_offline", "containers_unknown", "scan_age_s",
+              "unknown", "hashrate_complete", "power_complete", "hashrate_known_machines",
+              "power_known_machines", "known_hashrate_ths", "known_power_kw", "measurement_ts",
+              "measurement_time_supported"):
         d[k] = snap.get(k) if snap else None
+    d["scan_age_s"] = db.scan_age(snap, now) if snap else None
+    quality = db.snapshot_quality(snap or {}, now, int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
+    if state not in ("ok", "alert"):
+        quality = {k: False for k in quality}
+    d["metric_complete"] = quality
+    d["data_complete"] = all(quality[k] for k in ("online", "total", "hashrate_ths", "power_kw"))
+    d["data_quality"] = ("missing" if not snap else "stale" if state not in ("ok", "alert") else
+                         "legacy_unverified" if not snap.get("measurement_time_supported") or any(snap.get(k) is None for k in
+                             ("unknown", "hashrate_complete", "power_complete")) else
+                         "complete" if d["data_complete"] else "partial")
     return d
 
 
@@ -256,28 +269,39 @@ def _overview_payload():
     cust_counts = db.customer_count_by_site(CONN)
     sites = [_site_entry(s, latest, last_ok, cust_counts, now)
              for s in all_sites()]
+    customer_rows = db.customers(CONN)
     tot = {"sites": len(sites),
            "sites_ok": sum(1 for s in sites if s["state"] in ("ok", "alert")),
            "sites_unreachable": sum(1 for s in sites if s["state"] == "unreachable"),
-           "machines_total": sum(s["total"] or 0 for s in sites),
-           "machines_online": sum(s["online"] or 0 for s in sites),
-           "hashrate_ths": round(sum(s["hashrate_ths"] or 0 for s in sites), 1),
-           "power_kw": round(sum(s["power_kw"] or 0 for s in sites), 1),
-           "active_alerts": sum(s["active_alerts"] or 0 for s in sites),
-           "containers": sum(s["containers"] or 0 for s in sites),
-           "containers_faulty": sum(s["containers_faulty"] or 0 for s in sites),
-           "containers_offline": sum(s["containers_offline"] or 0 for s in sites),
-           "customers": sum(s["customers"] or 0 for s in sites)}
+           "customers": len({r["worker"] for r in customer_rows}),
+           "customer_site_pairs": len({(r["site_id"], r["worker"]) for r in customer_rows})}
+    fields = {"machines_total": "total", "machines_online": "online", "hashrate_ths": "hashrate_ths",
+              "power_kw": "power_kw", "active_alerts": "active_alerts", "containers": "containers",
+              "containers_faulty": "containers_faulty", "containers_offline": "containers_offline",
+              "containers_unknown": "containers_unknown"}
+    observed, known, complete = {}, {}, {}
+    for output, field in fields.items():
+        values = [s[field] for s in sites if s["metric_complete"][field]]
+        known[output] = len(values)
+        complete[output] = len(values) == len(sites)
+        value = sum(values) if values or not sites else None
+        if value is not None and output in ("hashrate_ths", "power_kw"):
+            value = round(value, 1)
+        observed[output] = value
+        tot[output] = value if complete[output] else None
     return {"ok": True, "ts": now, "totals": tot, "sites": sites,
+            "observed_totals": observed, "metric_known_sites": known, "metrics_complete": complete,
             "poll_interval": COLLECTOR.interval}
 
 
 def _trend_payload(hours, points):
     out = []
     for s in all_sites():
-        pts = db.trend(CONN, s["id"], hours=hours, points=points)
+        pts = db.trend(CONN, s["id"], hours=hours, points=points,
+                       stalled_after=int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
         out.append({"id": s["id"], "name": s["name"], "type": s.get("type", "air"),
-                    "points": [[p["ts"], p["hashrate_ths"]] for p in pts]})
+                    "points": [[p["ts"], p["hashrate_ths"]] for p in pts],
+                    "legacy_points": [[p["ts"], p.get("legacy_hashrate_ths")] for p in pts]})
     return {"ok": True, "ts": int(time.time()), "hours": hours, "sites": out}
 
 
@@ -290,7 +314,8 @@ def _site_payload(key, hours):
     last_ok = db.latest_ok_snapshots(CONN)
     cust_counts = db.customer_count_by_site(CONN)
     entry = _site_entry(scfg, latest, last_ok, cust_counts, now)
-    pts = db.trend(CONN, scfg["id"], hours=hours)
+    pts = db.trend(CONN, scfg["id"], hours=hours,
+                   stalled_after=int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
     return {"ok": True, "ts": now, "site": entry, "hours": hours,
             "trend": pts, "customers": _customer_rows(db.customers(CONN, site_id=scfg["id"])),
             "alert_summary": db.get_alert_summary(CONN, scfg["id"])}
@@ -311,7 +336,8 @@ def _customer_rows(rows):
     metric_fields = ("hashrate_ths", "avg_hashrate_ths", "hashrate_hours", "observed_hours",
                      "coverage_pct", "hashrate_ts", "current_machines")
     now = int(time.time())
-    stale_after = max(60, int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
+    stale_after = min(db.MAX_MEASUREMENT_AGE,
+                      max(60, int(CFG.get("poll", {}).get("stalled_after_s", 1200))))
     report_after = max(stale_after, 3 * int(CFG.get("poll", {}).get("customer_interval", 600)))
     for r in rows:
         r = dict(r)
@@ -319,6 +345,8 @@ def _customer_rows(rows):
         for k in ("uptime_pct", "delivered_th_h", "power_kwh"):
             r[k] = validate.opt_num(r.get(k))
         clean = validate.customers([r])[0]
+        for k in validate.REPORT_FIELDS:
+            r[k] = clean[k]
         for k in metric_fields:
             r[k] = clean[k]
         # 首扫前窗口/覆盖/当前台数也可证明新指标通道存在；不能只因无采样时间就断言旧端。
@@ -336,17 +364,30 @@ def _customer_rows(rows):
             r["observed_hours"] is not None and
             r["observed_hours"] >= r["hashrate_hours"] - 1 / 3600)
         stamp = r["hashrate_ts"]
-        r["hashrate_age_s"] = max(0, now - stamp) if stamp and stamp <= now + 300 else None
+        r["hashrate_age_s"] = max(0, now - stamp) if stamp and stamp <= now + 60 else None
         r["hashrate_stale"] = r["hashrate_age_s"] is not None and r["hashrate_age_s"] > stale_after
         stamp = validate.measurement(r.get("updated_ts"), int)
         r["updated_ts"] = stamp
-        r["report_age_s"] = max(0, now - stamp) if stamp and stamp <= now + 300 else None
+        r["report_age_s"] = max(0, now - stamp) if stamp and stamp <= now + 60 else None
         r["report_stale"] = r["report_age_s"] is not None and r["report_age_s"] > report_after
+        period_end = r.get("period_end_ts")
+        r["period_age_s"] = max(0, now - period_end) if period_end and period_end <= now + 60 else None
+        billing_end = r.get("billing_period_end_ts")
+        r["billing_period_age_s"] = max(0, now - billing_end) if billing_end and billing_end <= now + 60 else None
+        r["report_stale"] = r["report_stale"] or any(age is not None and age > report_after
+            for age in (r["period_age_s"], r["billing_period_age_s"]))
+        if period_end and period_end > now + 60:
+            r["avg_hashrate_ths"] = None
+            r["avg_complete"] = False
+            r["avg_unavailable_reason"] = "unverified_windows"
+        if billing_end and billing_end > now + 60:
+            r["delivered_th_h"] = r["power_kwh"] = r["uptime_pct"] = None
+            r["delivery_unavailable_reason"] = r["power_unavailable_reason"] = "unverified_windows"
         out.append(r)
     for r in out:
         missing = "missing_data" if r.get("site_id") in metric_sites else "not_reported"
         r["hashrate_unavailable_reason"] = missing if r["hashrate_ths"] is None else None
-        r["avg_unavailable_reason"] = missing if r["avg_hashrate_ths"] is None else None
+        r["avg_unavailable_reason"] = r.get("avg_unavailable_reason") or (missing if r["avg_hashrate_ths"] is None else None)
     return out
 
 
@@ -355,29 +396,79 @@ def _customers_payload():
     agg = {}
     for r in rows:
         a = agg.setdefault(r["worker"], {"worker": r["worker"], "sites": 0, "machines": 0,
-                                         "delivered_th_h": 0.0, "power_kwh": 0.0, "_rows": []})
+                                         "_rows": []})
         a["sites"] += 1
         a["machines"] += r["machines"] or 0
-        a["delivered_th_h"] += r["delivered_th_h"] or 0
-        a["power_kwh"] += r["power_kwh"] or 0
         a["_rows"].append(r)
     for a in agg.values():
         parts = a.pop("_rows")
+        a["machines_source"] = "observed" if all(p["machines_source"] == "observed" for p in parts) else "legacy"
 
         def complete_reduce(key, reducer):
             values = [p.get(key) for p in parts]
             return reducer(values) if all(v is not None for v in values) else None
+
+        def alignment(prefix):
+            windows = [(p.get(prefix + "_start_ts"), p.get(prefix + "_end_ts")) for p in parts]
+            now = int(time.time())
+            if not all(start and end and start < end <= now + 60 for start, end in windows):
+                return "unverified", None
+            return ("aligned", windows[0]) if len(set(windows)) == 1 else ("unaligned", None)
+
+        a["window_alignment"], rate_window = alignment("period")
+        a["billing_window_alignment"], billing_window = alignment("billing_period")
+        for prefix, window in (("period", rate_window), ("billing_period", billing_window)):
+            a[prefix + "_start_ts"] = window[0] if window else None
+            a[prefix + "_end_ts"] = window[1] if window else None
+        stale_reports = any(p["report_stale"] for p in parts)
+
+        billing_periods = sorted({p["billing_hours"] for p in parts if p["billing_hours"]})
+        same_billing_period = len(billing_periods) == 1 and all(p["billing_hours"] for p in parts)
+        a["billing_hours"] = billing_periods[0] if same_billing_period else None
+        a["billing_source"] = ("observed" if all(p["billing_source"] == "observed" for p in parts) else
+                               "legacy_only" if all(p["billing_source"] == "legacy_only" for p in parts) else "missing")
+        for key, prefix in (("delivered_th_h", "delivery"), ("power_kwh", "power")):
+            values = [p[key] for p in parts if p[key] is not None]
+            a["observed_" + key] = sum(values) if values else None
+            a["legacy_" + key] = complete_reduce("legacy_" + key, sum)
+            all_known = len(values) == len(parts)
+            complete = all((p.get(prefix + "_coverage_pct") or 0) >= 99.99 and
+                           p.get(prefix + "_observed_hours") is not None and
+                           p[prefix + "_observed_hours"] >= (p.get("billing_hours") or 0) - 1 / 3600 for p in parts)
+            permitted = same_billing_period and all_known and (len(parts) == 1 or
+                        (complete and a["billing_window_alignment"] == "aligned" and not stale_reports))
+            a[key] = sum(values) if permitted else None
+            a[prefix + "_observed_hours"] = complete_reduce(prefix + "_observed_hours", min) if permitted else None
+            a[prefix + "_coverage_pct"] = complete_reduce(prefix + "_coverage_pct", min) if permitted else None
+            a[prefix + "_unavailable_reason"] = (None if permitted else "mixed_periods" if len(billing_periods) > 1 else
+                "unverified_windows" if any(p.get(prefix + "_unavailable_reason") == "unverified_windows" for p in parts) else
+                "unverified_windows" if all_known and a["billing_window_alignment"] == "unverified" else
+                "unaligned_windows" if all_known and a["billing_window_alignment"] == "unaligned" else
+                "stale_reports" if all_known and stale_reports else
+                "partial_coverage" if all_known and same_billing_period else "partial_sites" if values else
+                "legacy_only" if a["billing_source"] == "legacy_only" else "missing_data")
 
         a["current_machines"] = complete_reduce("current_machines", sum)
         a["hashrate_ths"] = complete_reduce("hashrate_ths", sum)
         a["hashrate_ts"] = complete_reduce("hashrate_ts", min)
         a["hashrate_age_s"] = complete_reduce("hashrate_age_s", max)
         a["hashrate_stale"] = any(p["hashrate_stale"] for p in parts)
-        a["hashrate_known_sites"] = sum(p["hashrate_ths"] is not None for p in parts)
+        fresh_rates = [p["hashrate_ths"] for p in parts if p["hashrate_ths"] is not None and
+                       p["hashrate_age_s"] is not None and not p["hashrate_stale"]]
+        a["observed_hashrate_ths"] = sum(fresh_rates) if fresh_rates else None
+        a["hashrate_known_sites"] = len(fresh_rates)
+        a["hashrate_complete"] = len(fresh_rates) == len(parts)
         a["hashrate_unavailable_reason"] = (None if a["hashrate_ths"] is not None else
             "partial_sites" if a["hashrate_known_sites"] else
             "not_reported" if all(p["hashrate_unavailable_reason"] == "not_reported" for p in parts)
             else "missing_data")
+        if len(parts) > 1 and not a["hashrate_complete"]:
+            # 旧场地值留在 rows；不能把过期/时间未知的最后读数加进当前全账户总量。
+            a["hashrate_ths"] = None
+            if a["hashrate_stale"]:
+                a["hashrate_unavailable_reason"] = "stale_sites"
+            elif any(p["hashrate_ths"] is not None and p["hashrate_age_s"] is None for p in parts):
+                a["hashrate_unavailable_reason"] = "unverified_time"
         a["periods"] = sorted({p["hashrate_hours"] for p in parts if p["hashrate_hours"] is not None})
         same_period = len(a["periods"]) == 1 and all(p["hashrate_hours"] is not None for p in parts)
         a["hashrate_hours"] = a["periods"][0] if same_period else None
@@ -388,6 +479,7 @@ def _customers_payload():
         a["avg_complete"] = bool(same_period and all(p["avg_complete"] for p in parts))
         a["avg_known_sites"] = sum(p["avg_hashrate_ths"] is not None for p in parts)
         a["avg_unavailable_reason"] = ("mixed_periods" if len(a["periods"]) > 1 else
+            "unverified_windows" if any(p["avg_unavailable_reason"] == "unverified_windows" for p in parts) else
             None if a["avg_hashrate_ths"] is not None else
             "partial_sites" if 0 < a["avg_known_sites"] < len(parts) else
             "not_reported" if all(p["avg_unavailable_reason"] == "not_reported" for p in parts)
@@ -396,6 +488,15 @@ def _customers_payload():
             # 只有覆盖时长，不能证明两个场地的缺口重合；相加不同已观测时段的均值会造假。
             a["avg_hashrate_ths"] = None
             a["avg_unavailable_reason"] = "partial_coverage"
+        a["reported_avg_hashrate_ths"] = complete_reduce("avg_hashrate_ths", sum) if same_period else None
+        if len(parts) > 1 and a["avg_hashrate_ths"] is not None:
+            reason = ("unverified_windows" if a["window_alignment"] == "unverified" else
+                      "unaligned_windows" if a["window_alignment"] == "unaligned" else
+                      "stale_reports" if stale_reports else None)
+            if reason:
+                a["avg_hashrate_ths"] = None
+                a["avg_complete"] = False
+                a["avg_unavailable_reason"] = reason
         a["updated_ts"] = complete_reduce("updated_ts", min)
         a["report_age_s"] = complete_reduce("report_age_s", max)
         a["report_stale"] = any(p["report_stale"] for p in parts)
@@ -613,12 +714,17 @@ def api_ingest_summary(request: Request, body: dict = Body(...)):
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     snap = validate.snapshot_fields(body)
+    stamp = validate.scan_timestamp(body, now)
+    if customer_snapshot is not None:
+        stamp = customer_snapshot[1]
     snap.update({"ts": now, "site_id": sid, "ok": 1, "error": None,
-                 "scan_age_s": (_num(body.get("scan_age_s"), int, None, hi=10**7)
-                                if body.get("scan_age_s") is not None else None)})
+                 "measurement_ts": validate.measurement_timestamp(body, stamp),
+                 **validate.source_time_fields(body),
+                 "scan_ts": stamp, "scan_age_s": now - stamp if stamp else None})
     with _ingest_write(sid):
+        if not db.insert_snapshot(CONN, snap):
+            return {"ok": True, "ts": now, "stored": False, "reason": "older_scan"}
         db.upsert_site(CONN, sid, name, site_type, now)
-        db.insert_snapshot(CONN, snap)
         if customer_snapshot is not None:
             db.replace_customer_hashrates(CONN, sid, *customer_snapshot)
         if "alert_summary" in body:   # 字段缺失(旧版场地端)不动已存数据；显式空列表=清空
@@ -670,15 +776,20 @@ def api_ingest_customers(request: Request, body: dict = Body(...)):
     """场地客户报表上报(默认每10分钟一次，整表替换)。"""
     sid, name = _ingest_identity(body)
     _check_ingest_token(request, sid)
-    rows = body.get("customers") or []
+    rows = body.get("customers")
     if not isinstance(rows, list) or len(rows) > 5000:
         raise HTTPException(400, "customers 非法")
-    rows = validate.customers(rows)   # 数值列只进数字、文本去控制符截长(防存储型XSS/500)
+    try:
+        rows = validate.customers(rows, strict=True)
+        period = validate.customer_report_period(body, rows, int(time.time()))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     now = int(time.time())
     with _ingest_write(sid):
+        if not db.replace_customers(CONN, sid, rows, _num(body.get("hours"), int, 24, hi=24 * 90) or 24, period):
+            return {"ok": True, "ts": now, "stored": False, "reason": "older_or_unverified_report"}
         db.upsert_site(CONN, sid, name if body.get("site") else None, None, now)
-        db.replace_customers(CONN, sid, rows, _num(body.get("hours"), int, 24, hi=24 * 90) or 24)
-    return {"ok": True, "ts": now, "count": len(rows)}
+    return {"ok": True, "ts": now, "count": len(rows), "stored": True}
 
 
 @app.delete("/api/site/{key}")

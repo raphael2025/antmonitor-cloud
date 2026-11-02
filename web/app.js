@@ -16,7 +16,7 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 // 数值字段一律过 num() 再拼进 innerHTML：场地来数不可信，数值列里若混进字符串
 // (如 "<img onerror=...>")，这里变成 null/0，绝不会被当成 HTML 执行。
-const num = (v) => (v == null || v === "" || !isFinite(Number(v)) ? null : Number(v));
+const num = (v) => AntDataQuality.number(v);
 const int0 = (v) => Math.round(num(v) || 0);
 const intTxt = (v) => (num(v) == null ? "–" : int0(v).toLocaleString());
 
@@ -32,15 +32,12 @@ function fmtHash(th, suffix) {
   return (Number(th) / u.div).toLocaleString(undefined, { maximumFractionDigits: 2 }) + " " + u.unit + (suffix || "");
 }
 function fmtPower(kw) {
-  if (kw == null) return "–";
-  if (Math.abs(kw) >= 1000) return (kw / 1000).toLocaleString(undefined, { maximumFractionDigits: 2 }) + " MW";
-  return Number(kw).toLocaleString(undefined, { maximumFractionDigits: 1 }) + " kW";
+  const v = num(kw);
+  return v == null ? "–" : v.toLocaleString(undefined, { maximumFractionDigits: 3 }) + " kW";
 }
 function fmtEnergy(kwh) {
-  if (kwh == null) return "–";
-  if (Math.abs(kwh) >= 1e6) return (kwh / 1e6).toLocaleString(undefined, { maximumFractionDigits: 2 }) + " GWh";
-  if (Math.abs(kwh) >= 1e3) return (kwh / 1e3).toLocaleString(undefined, { maximumFractionDigits: 2 }) + " MWh";
-  return Number(kwh).toLocaleString(undefined, { maximumFractionDigits: 1 }) + " kWh";
+  const v = num(kwh);
+  return v == null ? "–" : v.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " kWh";
 }
 function fmtAgo(s) {
   if (s == null) return "—";
@@ -162,7 +159,11 @@ const endLabels = {  // 多序列时在线尾直接标注场地名(文字用墨�
     chart.data.datasets.forEach((ds, i) => {
       const meta = chart.getDatasetMeta(i);
       if (meta.hidden || !meta.data.length) return;
-      const last = meta.data[meta.data.length - 1];
+      let index = ds.data.length - 1;
+      while (index >= 0 && num(ds.data[index].y) == null) index--;
+      if (index < 0) return;
+      const last = meta.data[index];
+      if (!last || !Number.isFinite(last.x) || !Number.isFinite(last.y)) return;
       ctx.fillText(ds.label, Math.min(last.x + 6, chart.chartArea.right + 2), last.y);
     });
     ctx.restore();
@@ -186,7 +187,7 @@ function mkLine(canvasId, datasets, { hours, yUnit, padRight }) {
         tooltip: {
           callbacks: {
             title: (items) => items.length ? fmtFull(items[0].parsed.x) : "",
-            label: (item) => ` ${item.dataset.label}: ${Number(item.parsed.y).toLocaleString(undefined, { maximumFractionDigits: 1 })} ${yUnit || ""}`,
+            label: (item) => ` ${item.dataset.label}: ${item.parsed.y == null ? "—" : Number(item.parsed.y).toLocaleString(undefined, { maximumFractionDigits: 1 })} ${yUnit || ""}`,
           },
         },
       },
@@ -204,12 +205,16 @@ function mkLine(canvasId, datasets, { hours, yUnit, padRight }) {
 async function loadTrend() {
   const hours = Number($("trendRange").value);
   const d = await api(`/api/trend?hours=${hours}`);
-  const maxTh = Math.max(1, ...d.sites.flatMap((s) => s.points.map((p) => p[1] || 0)));
+  const maxTh = Math.max(1, ...d.sites.flatMap((s) => [...s.points, ...(s.legacy_points || [])].map(p => num(p[1]) || 0)));
   const u = hashUnit(maxTh);
-  const datasets = d.sites.map((s, i) => ({
-    label: s.name, borderColor: SERIES[i % SERIES.length], backgroundColor: SERIES[i % SERIES.length],
-    data: withGaps(s.points.map((p) => ({ x: p[0], y: (p[1] || 0) / u.div }))),
-  }));
+  const datasets = d.sites.flatMap((s, i) => {
+    const base = { label: s.name, borderColor: SERIES[i % SERIES.length], backgroundColor: SERIES[i % SERIES.length],
+      data: withGaps(AntDataQuality.points(s.points, 0, 1, u.div)) };
+    const old = s.legacy_points || [];
+    return old.some(p => num(p[1]) != null) ? [base, { ...base,
+      label: s.name + " · " + t("quality.legacy"), borderDash: [5, 4],
+      data: withGaps(AntDataQuality.points(old, 0, 1, u.div)) }] : [base];
+  });
   mkLine("trendChart", datasets, { hours, yUnit: u.unit + "/s", padRight: 70 });
 }
 $("trendRange").onchange = () => {
@@ -219,7 +224,12 @@ $("trendRange").onchange = () => {
 if (localStorage.getItem("co_trend_hours")) $("trendRange").value = localStorage.getItem("co_trend_hours");
 
 // ---- 总览渲染 ----
-const pct = (a, b) => (b ? ((100 * a) / b).toFixed(1) + "%" : "–");
+const pct = (a, b) => (num(a) != null && num(b) > 0 ? ((100 * num(a)) / num(b)).toFixed(1) + "%" : "–");
+
+function siteQuality(s) {
+  const key = { partial: "quality.partial", stale: "quality.stale", legacy_unverified: "quality.legacy_site", missing: "quality.missing" }[s.data_quality];
+  return key ? `<div class="site-warning">${esc(t(key))}</div>` : "";
+}
 
 function siteCard(s, color) {
   const st = STATE[s.state] || STATE.pending;
@@ -227,7 +237,7 @@ function siteCard(s, color) {
   const hasData = num(s.total) != null;
   const cf = int0(s.containers_faulty), co = int0(s.containers_offline);
   const contRow = (s.type === "hydro" || s.type === "mixed" || int0(s.containers) > 0)
-    ? `<div><span class="k">${t("card.containers")}</span><span class="num-tab">${intTxt(s.containers)}${cf || co ? ` <span style="color:#ec835a">${t("card.fault_offline", { cf, co })}</span>` : ""}</span></div>`
+    ? `<div><span class="k">${t("card.containers")}</span><span class="num-tab">${intTxt(s.containers)}${cf || co ? ` <span style="color:#ec835a">${t("card.fault_offline", { cf, co })}</span>` : ""}${s.containers_unknown ? ` · ${esc(t("quality.unknown_count", { n: int0(s.containers_unknown) }))}` : ""}</span></div>`
     : "";
   const err = (s.state === "unreachable" || s.state === "stalled") && s.error
     ? `<div class="err">${esc(s.error)}</div>` : "";
@@ -239,8 +249,10 @@ function siteCard(s, color) {
       <span class="pill ${st.cls}">${st.txt(s)}</span>
     </div>
     <div class="hr">${hasData ? fmtHash(num(s.hashrate_ths)).replace(/ (\w+)$/, ' <span class="unit">$1/s</span>') : "–"}</div>
+    ${siteQuality(s)}
+    ${s.hashrate_complete === false && num(s.known_hashrate_ths) != null ? AntDataQuality.note(t("quality.known_part", { value: fmtHash(s.known_hashrate_ths, "/s") }), true) : ""}
     <div class="stats">
-      <div><span class="k">${t("card.online")}</span><span class="num-tab">${hasData ? `${int0(s.online)}/${int0(s.total)} (${pct(int0(s.online), int0(s.total))})` : "–"}</span></div>
+      <div><span class="k">${t("card.online")}</span><span class="num-tab">${hasData ? `${intTxt(s.online)}/${intTxt(s.total)} (${s.unknown ? "–" : pct(s.online, s.total)})` : "–"}</span></div>
       <div><span class="k">${t("card.power")}</span><span class="num-tab">${hasData ? fmtPower(num(s.power_kw)) : "–"}</span></div>
       <div><span class="k">${t("card.alerts")}</span><span class="num-tab">${intTxt(s.active_alerts)}</span></div>
       <div><span class="k">${t("card.customers")}</span><span class="num-tab">${int0(s.customers)}</span></div>
@@ -255,15 +267,25 @@ function siteCard(s, color) {
 function renderOverview(o) {
   const totals = o.totals;
   $("kSites").textContent = `${totals.sites_ok}/${totals.sites}`;
-  $("kMachines").textContent = `${totals.machines_online.toLocaleString()}/${totals.machines_total.toLocaleString()}`;
+  $("kMachines").textContent = `${intTxt(totals.machines_online)}/${intTxt(totals.machines_total)}`;
   $("kOnlinePct").textContent = pct(totals.machines_online, totals.machines_total);
-  $("kHashrate").textContent = fmtHash(totals.hashrate_ths, "/s");
-  $("kPower").textContent = fmtPower(totals.power_kw);
-  $("kAlerts").textContent = totals.active_alerts;
+  $("kHashrate").innerHTML = AntDataQuality.total(o, "hashrate_ths", t, n => fmtHash(n, "/s"));
+  $("kPower").innerHTML = AntDataQuality.total(o, "power_kw", t, fmtPower);
+  $("kAlerts").innerHTML = AntDataQuality.total(o, "active_alerts", t, intTxt);
   $("kAlerts").className = "num" + (totals.active_alerts > 0 ? " hot" : "");
-  $("kContainers").textContent = `${totals.containers} (${totals.containers_faulty}/${totals.containers_offline})`;
+  $("kContainers").innerHTML = `${intTxt(totals.containers)} (${intTxt(totals.containers_faulty)}/${intTxt(totals.containers_offline)})`
+    + (totals.containers_unknown ? AntDataQuality.note(t("quality.unknown_count", { n: int0(totals.containers_unknown) }), true) : "");
   $("kContainers").className = "num" + (totals.containers_faulty + totals.containers_offline > 0 ? " hot" : "");
   $("kCustomers").textContent = totals.customers;
+  $("kCustomers").title = t("quality.customer_identity");
+  const observed = o.observed_totals || {};
+  const knownMachines = num(observed.machines_online) != null && num(observed.machines_total) != null;
+  $("kMachinesNote").textContent = totals.machines_total == null && knownMachines
+    ? t("quality.known_sites", { value: `${intTxt(observed.machines_online)}/${intTxt(observed.machines_total)}`,
+        known: (o.metric_known_sites || {}).machines_total, total: totals.sites }) : "";
+  const affected = o.sites.filter(s => s.data_quality && s.data_quality !== "complete").map(s => s.name);
+  $("overviewQuality").textContent = affected.length ? t("quality.overview_help", { sites: affected.join(", ") }) : "";
+  $("overviewQuality").classList.toggle("hidden", !affected.length);
 
   const groups = { air: [], hydro: [], mixed: [] };
   o.sites.forEach((s, i) => {
@@ -299,14 +321,14 @@ function renderCustomers(d) {
     <td>${esc(w.worker)}</td><td>${int0(w.sites)}</td><td>${AntCustomerRates.machines(w, t)}</td>
     <td>${AntCustomerRates.cell(w, "current", t, fmtHash, fmtAgo)}</td>
     <td>${AntCustomerRates.cell(w, "average", t, fmtHash, fmtAgo)}</td>
-    <td>${fmtEnergy(num(w.power_kwh))}</td></tr>`).join("")
+    <td>${AntDataQuality.billing(w, "power", t, fmtEnergy)}</td></tr>`).join("")
     || `<tr><td colspan="6" class="muted">${t("empty.customers")}</td></tr>`;
   $("tblCustomers").querySelector("tbody").innerHTML = d.rows.map((r) => `<tr>
     <td>${esc(r.site_name)}</td><td>${esc(r.worker)}</td><td>${AntCustomerRates.machines(r, t)}</td>
-    <td>${num(r.uptime_pct) != null ? num(r.uptime_pct).toFixed(1) + "%" : "–"}</td>
+    <td>${AntDataQuality.billing(r, "uptime", t, n => n.toFixed(1) + "%")}</td>
     <td>${AntCustomerRates.cell(r, "current", t, fmtHash, fmtAgo)}</td>
     <td>${AntCustomerRates.cell(r, "average", t, fmtHash, fmtAgo)}</td>
-    <td>${fmtEnergy(num(r.power_kwh))}</td></tr>`).join("")
+    <td>${AntDataQuality.billing(r, "power", t, fmtEnergy)}</td></tr>`).join("")
     || `<tr><td colspan="7" class="muted">${t("empty.none")}</td></tr>`;
   if (curSite && !$("siteModal").classList.contains("hidden"))
     renderSiteCustomers(d.rows.filter(r => r.site_id === curSite));
@@ -317,10 +339,10 @@ function renderSiteCustomers(rows) {
   $("siteAverageHead").textContent = AntCustomerRates.header(rows, t);
   $("tblSiteCustomers").querySelector("tbody").innerHTML = rows.map((r) => `<tr>
     <td>${esc(r.worker)}</td><td>${AntCustomerRates.machines(r, t)}</td>
-    <td>${num(r.uptime_pct) != null ? num(r.uptime_pct).toFixed(1) + "%" : "–"}</td>
+    <td>${AntDataQuality.billing(r, "uptime", t, n => n.toFixed(1) + "%")}</td>
     <td>${AntCustomerRates.cell(r, "current", t, fmtHash, fmtAgo)}</td>
     <td>${AntCustomerRates.cell(r, "average", t, fmtHash, fmtAgo)}</td>
-    <td>${fmtEnergy(num(r.power_kwh))}</td></tr>`).join("")
+    <td>${AntDataQuality.billing(r, "power", t, fmtEnergy)}</td></tr>`).join("")
     || `<tr><td colspan="6" class="muted">${t("empty.none")}</td></tr>`;
 }
 
@@ -462,18 +484,22 @@ async function loadSite() {
   $("siteMeta").innerHTML =
     t("site.meta", { data: fmtAgo(s.data_age_s), scan: fmtAgo(s.scan_age_s) }) +
     (int0(s.fails) ? t("site.fails", { n: int0(s.fails) }) : "") +
-    (s.error ? `<br><span style="color:#f0a0a0">${esc(s.error)}</span>` : "");
+    (s.error ? `<br><span style="color:#f0a0a0">${esc(s.error)}</span>` : "") + siteQuality(s);
   renderSiteAlerts(d.alert_summary);
 
   const tr = d.trend;
-  const maxTh = Math.max(1, ...tr.map((p) => p.hashrate_ths || 0));
+  const maxTh = Math.max(1, ...tr.flatMap(p => [num(p.hashrate_ths) || 0, num(p.legacy_hashrate_ths) || 0]));
   const u = hashUnit(maxTh);
-  mkLine("chHr", [{ label: t("chart.hashrate"), borderColor: METRIC.hashrate, backgroundColor: METRIC.hashrate,
-    data: withGaps(tr.map((p) => ({ x: p.ts, y: (p.hashrate_ths || 0) / u.div }))) }], { hours, yUnit: u.unit + "/s" });
-  mkLine("chOnline", [{ label: t("chart.online"), borderColor: METRIC.online, backgroundColor: METRIC.online,
-    data: withGaps(tr.map((p) => ({ x: p.ts, y: p.online || 0 }))) }], { hours, yUnit: t("chart.unit_machines") });
-  mkLine("chPower", [{ label: t("chart.power"), borderColor: METRIC.power, backgroundColor: METRIC.power,
-    data: withGaps(tr.map((p) => ({ x: p.ts, y: p.power_kw || 0 }))) }], { hours, yUnit: "kW" });
+  const series = (key, label, color, div = 1) => {
+    const base = { label: t(label), borderColor: color, backgroundColor: color,
+      data: withGaps(AntDataQuality.points(tr, "ts", key, div)) };
+    return tr.some(p => num(p["legacy_" + key]) != null) ? [base, { ...base,
+      label: t("quality.legacy"), borderDash: [5, 4],
+      data: withGaps(AntDataQuality.points(tr, "ts", "legacy_" + key, div)) }] : [base];
+  };
+  mkLine("chHr", series("hashrate_ths", "chart.hashrate", METRIC.hashrate, u.div), { hours, yUnit: u.unit + "/s" });
+  mkLine("chOnline", series("online", "chart.online", METRIC.online), { hours, yUnit: t("chart.unit_machines") });
+  mkLine("chPower", series("power_kw", "chart.power", METRIC.power), { hours, yUnit: "kW" });
 
   renderSiteCustomers(d.customers);
 
@@ -482,12 +508,14 @@ async function loadSite() {
 
 async function loadDaily(id) {
   const d = await api(`/api/daily?site=${encodeURIComponent(id)}&days=14`);
+  if (curSite !== id) return;
   $("tblDaily").querySelector("tbody").innerHTML = d.days.map((r) => `<tr>
-    <td>${esc(r.day)}</td><td>${fmtHash(num(r.avg_hashrate_ths), "/s")}</td>
-    <td>${fmtHash(num(r.max_hashrate_ths), "/s")}</td>
-    <td>${intTxt(r.avg_online)}</td>
-    <td>${num(r.avg_total) ? (100 * num(r.avg_online) / num(r.avg_total)).toFixed(1) + "%" : "–"}</td>
-    <td>${fmtEnergy(num(r.power_kwh))}</td></tr>`).join("")
+    <td>${esc(r.day)}</td><td>${AntDataQuality.daily(r, "avg_hashrate_ths", "hashrate_ths", t, n => fmtHash(n, "/s"))}</td>
+    <td>${AntDataQuality.daily(r, "max_hashrate_ths", "hashrate_ths", t, n => fmtHash(n, "/s"))}</td>
+    <td>${AntDataQuality.daily(r, "avg_online", "online", t, n => n.toLocaleString(undefined, { maximumFractionDigits: 1 }))}</td>
+    <td>${AntDataQuality.daily({ ...r, online_pct: num(r.avg_online) != null && num(r.avg_total) > 0 ? r.avg_online / r.avg_total * 100 : null,
+      legacy_online_pct: num(r.legacy_avg_online) != null && num(r.legacy_avg_total) > 0 ? r.legacy_avg_online / r.legacy_avg_total * 100 : null }, "online_pct", "online", t, n => n.toFixed(1) + "%")}</td>
+    <td>${AntDataQuality.daily(r, "power_kwh", "power_kw", t, fmtEnergy)}</td></tr>`).join("")
     || `<tr><td colspan="6" class="muted">${t("empty.daily")}</td></tr>`;
 }
 
@@ -694,15 +722,15 @@ function connMsg(text, bad) {
   el.textContent = text || "";
   el.style.color = bad ? "var(--theme-danger, #ff9b9b)" : "";
 }
-async function copyText(text, manualField) {
+async function copyText(text, manualField, successKey = "conn.copied") {
   if (!text) { connMsg(t("conn.copy_empty"), true); return false; }
-  try { await navigator.clipboard.writeText(text); connMsg(t("conn.copied")); return true; } catch (e) {}
+  try { await navigator.clipboard.writeText(text); connMsg(t(successKey)); return true; } catch (e) {}
   const ta = document.createElement("textarea");   // 非安全上下文/老浏览器兜底
   ta.value = text; document.body.appendChild(ta); ta.select();
   let copied = false;
   try { copied = document.execCommand("copy") === true; } catch (e) {}
   ta.remove();
-  if (copied) { connMsg(t("conn.copied")); return true; }
+  if (copied) { connMsg(t(successKey)); return true; }
   if (manualField) {
     if (manualField === $("connCode")) $("connDetails").open = true;
     manualField.focus();
@@ -711,25 +739,69 @@ async function copyText(text, manualField) {
   connMsg(t("conn.copy_manual"), true);
   return false;
 }
+function readConnPacket(value) {
+  const raw = String(value || "").trim();
+  if (raw.length > 16384) return null;
+  const match = raw.match(/^AMC1-([A-Za-z0-9_-]+)$/);
+  if (!match) return null;
+  try {
+    const encoded = match[1].replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(encoded + "=".repeat((4 - encoded.length % 4) % 4));
+    const d = JSON.parse(new TextDecoder("utf-8", { fatal: true })
+      .decode(Uint8Array.from(binary, c => c.charCodeAt(0))));
+    if (!d || Array.isArray(d) || typeof d.u !== "string" || !d.u.trim()
+        || typeof d.t !== "string" || !d.t.trim()) return null;
+    if (/[\s\x00-\x1f\x7f]/.test(d.u.trim()) || /[\x00-\x1f\x7f]/.test(d.t.trim())
+        || !/^https?:\/\//i.test(d.u.trim())) return null;
+    const url = new URL(d.u.trim());
+    if (!url.hostname || url.username || url.password || url.search || url.hash) return null;
+    for (const key of ["s", "n", "y", "f"]) {
+      if (d[key] != null && typeof d[key] !== "string") return null;
+    }
+    if (d.y && !["air", "hydro", "mixed"].includes(d.y)) return null;
+    for (const key of ["s", "n"]) {
+      if (d[key] && ([...d[key]].length > 64 || /[\x00-\x1f\x7f]/.test(d[key]))) return null;
+    }
+    return { ...d, u: d.u.trim(), t: d.t.trim() };
+  } catch (e) { return null; }
+}
+async function copyConnInfo() {
+  if (!connAddressReady()) return false;
+  const code = $("connCode").value, packet = readConnPacket(code);
+  if (!packet || connUrlValue(packet.u) !== connUrlValue(_connSavedUrl)) {
+    hideConnResult(); connMsg(t("conn.invalid_code"), true); return false;
+  }
+  return copyText(code, $("connCode"), "conn.copied_info");
+}
 function hideConnResult() {
   $("connResult").classList.add("hidden");
   $("connCode").value = ""; $("connTok").value = "";
   $("connResultUrl").textContent = "";
+  $("connResultSiteId").textContent = "";
   $("connDetails").open = false;
   $("connRawToken").open = false;
   if (_connHideTimer) { clearTimeout(_connHideTimer); _connHideTimer = null; }
 }
 function showConnResult(label, d) {
-  const kind = ["air", "hydro", "mixed"].includes(d.site_type) ? t("type." + d.site_type) : "";
-  $("connResultFor").textContent = [d.site_name, kind, label].filter(Boolean).join(" · ");
-  $("connCode").value = d.code || "";
-  $("connTok").value = d.token || "";
-  $("connResultUrl").textContent = d.public_url || _connSavedUrl || "";
-  $("connIncludes").textContent = t(d.site_name && d.site_type ? "conn.includes" : "conn.includes_basic");
+  // Preview the actual packet that will be pasted locally, never a separate
+  // metadata response or a raw token that cannot identify the destination.
+  const packet = readConnPacket(d.code);
+  if (!packet || connUrlValue(packet.u) !== connUrlValue(_connSavedUrl)) {
+    hideConnResult(); connMsg(t("conn.invalid_code"), true); return false;
+  }
+  const kind = packet.y ? t("type." + packet.y) : "";
+  $("connResultFor").textContent = [packet.n, kind, label].filter(Boolean).join(" · ");
+  $("connCode").value = d.code;
+  $("connTok").value = packet.t;
+  $("connResultUrl").textContent = packet.u;
+  $("connResultSiteId").textContent = packet.s || "";
+  $("connResultSiteRow").classList.toggle("hidden", !packet.s);
+  $("connIncludes").textContent = t(packet.s && packet.n && packet.y ? "conn.includes" : "conn.includes_basic");
   $("connResult").classList.remove("hidden");
   renderConnInstall();
   if (_connHideTimer) clearTimeout(_connHideTimer);
   _connHideTimer = setTimeout(hideConnResult, 120000);
+  return true;
 }
 const MODE_TXT = {
   domain: ["ok", "conn.mode_domain"], ip: ["ok", "conn.mode_ip"], self_signed: ["ok", "conn.mode_selfsigned"],
@@ -829,8 +901,8 @@ async function connAction(act, target) {
   if (act === "reveal") {
     const d = await connPost("/api/connect/reveal", { target });
     if (d) {
-      showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: target }), d);
-      await copyText(d.code, $("connCode"));
+      if (showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: target }), d))
+        await copyConnInfo();
     }
     return;
   }
@@ -858,8 +930,7 @@ $("connNewSite").onclick = async () => {
   try {
     const d = await connPost("/api/connect/token", { action: "new_site", site_name: name, site_type: $("connSiteType").value });
     if (!d) return;
-    showConnResult(t("conn.for_new_site", { id: d.target }), d);
-    await copyText(d.code, $("connCode"));
+    if (showConnResult(t("conn.for_new_site", { id: d.target }), d)) await copyConnInfo();
     await loadConnect();
   } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); }
   finally { $("connNewSite").disabled = false; }
@@ -877,8 +948,8 @@ $("connAutoReg").onchange = async () => {
   const d = await connPost("/api/connect/settings", { auto_register: want });
   if (d) { renderConnect(d); connMsg(t("conn.saved")); } else $("connAutoReg").checked = !want;
 };
-$("connCodeCopy").onclick = () => copyText($("connCode").value, $("connCode"));
-$("connTokCopy").onclick = () => copyText($("connTok").value, $("connTok"));
+$("connCodeCopy").onclick = copyConnInfo;
+$("connTokCopy").onclick = () => copyText($("connTok").value, $("connTok"), "conn.token_copied");
 $("connFpCopy").onclick = () => copyText($("connFp").textContent);
 $("connUrl").oninput = hideConnResult;
 $("connSiteName").oninput = hideConnResult;

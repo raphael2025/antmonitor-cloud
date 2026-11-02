@@ -198,3 +198,10 @@ table.mini td { font-size: 13px; }
 .grid2 > .panel { min-width: 0; }
 .customer-help { margin: -10px 22px 22px; line-height: 1.7; }
 .customer-rate-notice { margin: 0 0 16px; padding: 10px 12px; border: 1px solid currentColor; border-radius: 6px; color: var(--theme-warning, #fab219); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+
+/* Explicit quality notes also apply to cards, energy, availability and archived rows. */
+.card .rate-note { font-size: 11px; font-weight: normal; }
+.legacy-data { margin-top: 4px; font-size: 11px; font-weight: normal; }
+.legacy-data summary { cursor: pointer; color: var(--theme-warning, #fab219); }
+.data-quality-notice { margin: 0 18px 14px; font-size: 12px; }
+.site .rate-note { font-size: 11px; }

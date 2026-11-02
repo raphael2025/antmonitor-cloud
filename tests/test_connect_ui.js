@@ -32,7 +32,7 @@ function setup(options = {}) {
     address_ready: true, address_error: "",
     shared: { set: true, hint: "tail" }, auto_register: false, sites: [] };
   const calls = [], copies = [];
-  const context = vm.createContext({ $: element, t: (key) => key,
+  const context = vm.createContext({ $: element, t: (key) => key, atob, TextDecoder, URL,
     esc: (s) => String(s).replace(/[&<>"']/g, (x) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[x])),
     api: async () => state,
     send: async (method, url, body) => {
@@ -44,7 +44,8 @@ function setup(options = {}) {
       const code = "AMC1-" + Buffer.from(JSON.stringify({ u: state.public_url, t: "secret-test-token",
         s: "st-test", n: body.site_name || "北场 / 一期", y: body.site_type || "hydro" })).toString("base64url");
       return { ok: true, json: async () => ({ target: "st-test", token: "secret-test-token", code,
-        public_url: state.public_url, site_name: body.site_name || "北场 / 一期", site_type: body.site_type || "hydro" }) };
+        public_url: state.public_url, site_name: body.site_name || "北场 / 一期", site_type: body.site_type || "hydro",
+        ...options.response }) };
     },
     errText: async () => "request failed", confirm: () => true,
     navigator: { clipboard: { writeText: async (value) => {
@@ -85,6 +86,15 @@ function setup(options = {}) {
   const decoded = JSON.parse(Buffer.from(a.copies.at(-1).slice(5), "base64url").toString());
   assert.deepEqual(decoded, { u: "https://new.example.com", t: "secret-test-token", s: "st-test", n: "北场 / 一期", y: "hydro" });
   assert.equal(a.element("connResultUrl").textContent, decoded.u);
+  assert.equal(a.element("connResultSiteId").textContent, decoded.s);
+  assert.equal(a.element("connMsg").textContent, "conn.copied_info");
+  await a.element("connCodeCopy").onclick();
+  assert.equal(a.copies.at(-1), a.element("connCode").value);
+  await a.element("connTokCopy").onclick();
+  assert.equal(a.copies.at(-1), decoded.t, "advanced copy is explicitly the token only");
+  assert.equal(a.element("connMsg").textContent, "conn.token_copied");
+  assert.match(html, /id="connTokCopy" data-i18n="conn.copy_token"/);
+  assert.match(html, /data-i18n="conn.token_only_help"/);
   await a.context.connAction("reveal", "st-test");
   assert.equal(a.calls.at(-1).url, "/api/connect/reveal", "recopying an existing site does not rotate credentials");
   assert.equal(a.copies.at(-1), a.element("connCode").value, "existing-site action copies in one operation");
@@ -144,7 +154,39 @@ function setup(options = {}) {
   assert.ok(c.element("connCode").value.startsWith("AMC1-"), "manual copying keeps the same packet available");
   const d = setup({ clipboardBlocked: true, execCopyResult: true });
   await d.element("connNewSite").onclick();
-  assert.equal(d.element("connMsg").textContent, "conn.copied", "legacy copy fallback can succeed");
+  assert.equal(d.element("connMsg").textContent, "conn.copied_info", "legacy copy fallback can succeed");
+
+  const packet = values => "AMC1-" + Buffer.from(JSON.stringify(values)).toString("base64url");
+  for (const code of ["secret-test-token", packet({t: "secret-test-token"}),
+    packet({u: "https://cloud.example.com"}), packet({u: "https://user:secret@cloud.example.com", t: "test"}),
+    packet({u: "https://wrong-destination.example.com", t: "test"}), "AMC1-broken"]) {
+    const invalid = setup({response: {code}});
+    await invalid.element("connNewSite").onclick();
+    assert.equal(invalid.copies.length, 0, "incomplete packets and raw tokens must never be copied as connection info");
+    assert.equal(invalid.element("connMsg").textContent, "conn.invalid_code");
+    assert.equal(invalid.element("connResult").classList.contains("hidden"), true);
+    assert.equal(invalid.element("connCode").value, "");
+  }
+  const modified = setup();
+  await modified.element("connNewSite").onclick();
+  modified.element("connCode").value = "secret-test-token";
+  await modified.element("connCodeCopy").onclick();
+  assert.equal(modified.copies.length, 1, "the repeat-copy button also validates its packet");
+  assert.equal(modified.element("connMsg").textContent, "conn.invalid_code");
+
+  const metadata = setup({response: {public_url: "https://wrong-display.example.com", token: "wrong-display-token",
+    site_name: "Wrong display name", site_type: "air"}});
+  await metadata.element("connNewSite").onclick();
+  assert.equal(metadata.element("connResultUrl").textContent, "https://cloud.example.com");
+  assert.equal(metadata.element("connTok").value, "secret-test-token");
+  assert.ok(metadata.element("connResultFor").textContent.includes("北场 / 一期 · type.hydro"),
+    "visible destination and site details come from the actual copied packet");
+
+  const legacy = setup({response: {code: packet({u: "https://cloud.example.com", t: "old-shared-token"})}});
+  await legacy.context.connAction("reveal", "shared");
+  assert.equal(legacy.copies.length, 1, "legacy AMC1 packets still work");
+  assert.equal(legacy.element("connIncludes").textContent, "conn.includes_basic");
+  assert.equal(legacy.element("connResultSiteRow").classList.contains("hidden"), true);
 
   const e = setup();
   e.context.renderConnect({ ...e.state(), address_ready: false, address_error: "HTTPS is required" });

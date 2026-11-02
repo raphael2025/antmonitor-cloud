@@ -89,7 +89,9 @@ def test_tombstone_survives_restart_and_restore_accepts_new_reports(cloud):
     assert client.get("/api/sites/deleted").json()["sites"] == []
     assert client.get("/api/overview").json()["sites"] == []
     assert report(client, "st-old").status_code == 200
-    assert len(client.get("/api/site/st-old").json()["trend"]) == 1
+    points = client.get("/api/site/st-old").json()["trend"]
+    assert sum(p["legacy_hashrate_ths"] is not None for p in points) == 1
+    assert server.CONN.execute("SELECT COUNT(*) FROM snapshots WHERE site_id='st-old'").fetchone()[0] == 1
 
 
 def test_rename_persists_on_reports_and_customer_names_match(cloud):

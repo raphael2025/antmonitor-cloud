@@ -17,6 +17,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 import time
+import validate
 
 _lock = threading.RLock()
 
@@ -29,8 +30,15 @@ CREATE TABLE IF NOT EXISTS snapshots(
   online INTEGER, total INTEGER,
   hashrate_ths REAL, power_kw REAL,
   active_alerts INTEGER,
-  containers INTEGER, containers_faulty INTEGER, containers_offline INTEGER,
+  containers INTEGER, containers_faulty INTEGER, containers_offline INTEGER, containers_unknown INTEGER,
   scan_age_s INTEGER,                  -- 场地本地上次扫描龄期(判「监控停滞」)
+  scan_ts INTEGER,
+  source_scan_ts INTEGER, source_sent_ts INTEGER,
+  measurement_ts INTEGER, measurement_time_supported INTEGER,
+  unknown INTEGER,
+  hashrate_complete INTEGER, power_complete INTEGER,
+  hashrate_known_machines INTEGER, power_known_machines INTEGER,
+  known_hashrate_ths REAL, known_power_kw REAL,
   error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snap_site_ts ON snapshots(site_id, ts);
@@ -67,6 +75,14 @@ CREATE TABLE IF NOT EXISTS site_customer_current(
 CREATE TABLE IF NOT EXISTS site_customer_current_state(
   site_id TEXT PRIMARY KEY,
   scan_ts INTEGER NOT NULL,
+  updated_ts INTEGER NOT NULL
+);
+
+-- 独立全场报表水位；合法空报表也保留时段，迟到旧包不能复活或清掉新客户。
+CREATE TABLE IF NOT EXISTS site_customer_report_state(
+  site_id TEXT PRIMARY KEY,
+  period_start_ts INTEGER NOT NULL, period_end_ts INTEGER NOT NULL,
+  billing_period_start_ts INTEGER NOT NULL, billing_period_end_ts INTEGER NOT NULL,
   updated_ts INTEGER NOT NULL
 );
 
@@ -111,6 +127,17 @@ CREATE TABLE IF NOT EXISTS daily(
   PRIMARY KEY(site_id, day)
 );
 
+-- v2 使用真实观测区间；旧 daily 估算账本保留，不原地改写。
+CREATE TABLE IF NOT EXISTS daily_observed_v2(
+  site_id TEXT NOT NULL, day TEXT NOT NULL, samples INTEGER,
+  avg_hashrate_ths REAL, max_hashrate_ths REAL,
+  avg_online REAL, avg_total REAL, avg_power_kw REAL, power_kwh REAL,
+  elapsed_hours REAL, observed_hours REAL, coverage_pct REAL,
+  hashrate_observed_hours REAL, machines_observed_hours REAL, power_observed_hours REAL,
+  method TEXT NOT NULL DEFAULT 'time_weighted_v2',
+  PRIMARY KEY(site_id, day)
+);
+
 CREATE TABLE IF NOT EXISTS notify_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -136,6 +163,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 _SNAP_FIELDS = ("ts", "site_id", "ok", "online", "total", "hashrate_ths", "power_kw",
                 "active_alerts", "containers", "containers_faulty",
                 "containers_offline", "scan_age_s", "error")
+_SNAP_FIELDS += ("scan_ts", "unknown", "hashrate_complete", "power_complete")
+_SNAP_FIELDS += ("hashrate_known_machines", "power_known_machines", "known_hashrate_ths", "known_power_kw")
+_SNAP_FIELDS += ("measurement_ts", "measurement_time_supported", "containers_unknown")
+_SNAP_FIELDS += ("source_scan_ts", "source_sent_ts")
 
 
 def _migrate_v1(conn):
@@ -174,6 +205,23 @@ def connect(path):
                          ("current_machines", "INTEGER")):
         if column not in customer_cols:
             conn.execute(f"ALTER TABLE site_customers ADD COLUMN {column} {kind}")
+    for table, additions in (("snapshots", (("scan_ts", "INTEGER"), ("unknown", "INTEGER"),
+                              ("hashrate_complete", "INTEGER"), ("power_complete", "INTEGER"),
+                              ("hashrate_known_machines", "INTEGER"), ("power_known_machines", "INTEGER"),
+                              ("known_hashrate_ths", "REAL"), ("known_power_kw", "REAL"),
+                              ("measurement_ts", "INTEGER"), ("measurement_time_supported", "INTEGER"),
+                              ("source_scan_ts", "INTEGER"), ("source_sent_ts", "INTEGER"),
+                              ("containers_unknown", "INTEGER"))),):
+        columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for column, kind in additions:
+            if column not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    conn.execute("UPDATE snapshots SET scan_ts=ts-scan_age_s WHERE scan_ts IS NULL "
+                 "AND typeof(scan_age_s) IN ('integer','real') AND scan_age_s>=0 AND ts>scan_age_s")
+    for column in validate.REPORT_FIELDS:
+        if column not in customer_cols:
+            conn.execute(f"ALTER TABLE site_customers ADD COLUMN {column} " +
+                         ("TEXT" if column in ("billing_source", "machines_source") else "REAL"))
     conn.commit()
     return conn
 
@@ -181,10 +229,20 @@ def connect(path):
 def insert_snapshot(conn, snap):
     row = [snap.get(f) for f in _SNAP_FIELDS]
     with _lock:
+        if snap.get("ok") and snap.get("scan_ts"):
+            previous = conn.execute("SELECT scan_ts,source_scan_ts,source_sent_ts FROM snapshots WHERE site_id=? AND ok=1 "
+                                    "AND scan_ts IS NOT NULL ORDER BY id DESC LIMIT 1",
+                                    (snap["site_id"],)).fetchone()
+            if previous and previous[0] > snap["scan_ts"]:
+                return False
+            if previous and any(snap.get(k) is not None and previous[k] is not None and
+                                snap[k] < previous[k] for k in ("source_scan_ts", "source_sent_ts")):
+                return False
         conn.execute(
             f"INSERT INTO snapshots({','.join(_SNAP_FIELDS)}) "
             f"VALUES({','.join('?' * len(_SNAP_FIELDS))})", row)
         conn.commit()
+    return True
 
 
 def _rows_to_map(rows):
@@ -208,48 +266,177 @@ def latest_ok_snapshots(conn):
     return _rows_to_map(rows)
 
 
-def trend(conn, site_id, hours=24, points=288):
-    """单场地趋势(按时间桶降采样均值)。"""
-    hours = max(1, min(int(hours), 24 * 90))
-    bucket = max(60, int(hours * 3600 / max(24, points)))
-    since = int(time.time()) - hours * 3600
-    rows = conn.execute(
-        "SELECT (ts/?)*? AS t, ROUND(AVG(online)) AS online, ROUND(AVG(total)) AS total,"
-        " AVG(hashrate_ths) AS hashrate_ths, AVG(power_kw) AS power_kw,"
-        " ROUND(AVG(active_alerts)) AS active_alerts"
-        " FROM snapshots WHERE site_id=? AND ok=1 AND ts>=?"
-        " GROUP BY t ORDER BY t", (bucket, bucket, site_id, since)).fetchall()
-    return [{"ts": int(r["t"]), "online": r["online"], "total": r["total"],
-             "hashrate_ths": round(r["hashrate_ths"] or 0.0, 1),
-             "power_kw": round(r["power_kw"] or 0.0, 1),
-             "active_alerts": r["active_alerts"]} for r in rows]
+MAX_OBSERVATION_GAP = 300
+MAX_MEASUREMENT_AGE = 900
 
 
-def avg_hashrate(conn, site_id, t1, t2):
-    """[t1,t2) 内成功快照的平均算力(TH/s)；无数据返回 None。算力骤降检测用。"""
-    r = conn.execute("SELECT AVG(hashrate_ths) FROM snapshots"
-                     " WHERE site_id=? AND ok=1 AND ts>=? AND ts<?",
-                     (site_id, t1, t2)).fetchone()
-    return r[0]
+def scan_age(snap, now):
+    stamp = validate.measurement(snap.get("scan_ts"), int)
+    if stamp and stamp <= now + 300:
+        return max(0, now - stamp)
+    age = validate.measurement(snap.get("scan_age_s"), int)
+    received = validate.measurement(snap.get("ts"), int)
+    if age is not None and received and received <= now + 300:
+        return age + max(0, now - received)
+    return None
 
 
-def replace_customers(conn, site_id, customers, hours):
-    now = int(time.time())
+def snapshot_quality(snap, now, stalled_after=1200):
+    """完整性与新鲜度分开；缺新协议证据不能默认成完整场地。"""
+    age = scan_age(snap, now)
+    fresh_scan = bool(snap.get("ok") and age is not None and age <= stalled_after)
+    measured = validate.measurement(snap.get("measurement_ts"), int)
+    fresh = bool(fresh_scan and snap.get("measurement_time_supported") == 1 and measured and
+                 0 <= now - measured <= MAX_MEASUREMENT_AGE)
+    online = validate.measurement(snap.get("online"))
+    total = validate.measurement(snap.get("total"))
+    machines = (fresh and snap.get("unknown") == 0 and online is not None and
+                total is not None and online <= total)
+    out = {"online": bool(machines), "total": bool(machines),
+           "hashrate_ths": bool(fresh and snap.get("hashrate_complete") == 1 and
+                                validate.measurement(snap.get("hashrate_ths")) is not None),
+           "power_kw": bool(fresh and snap.get("power_complete") == 1 and
+                            validate.measurement(snap.get("power_kw")) is not None)}
+    for prefix, field in (("hashrate", "hashrate_ths"), ("power", "power_kw")):
+        known_count = snap.get(prefix + "_known_machines")
+        if (snap.get("unknown") is not None and snap["unknown"] > 0) or (
+                known_count is not None and known_count != total):
+            out[field] = False
+    out["active_alerts"] = bool(fresh_scan and validate.measurement(snap.get("active_alerts")) is not None)
+    containers = validate.measurement(snap.get("containers"), int)
+    unknown = validate.measurement(snap.get("containers_unknown"), int)
+    container_evidence = (fresh_scan and containers is not None and unknown is not None and unknown <= containers)
+    out["containers"] = out["containers_unknown"] = bool(container_evidence)
+    faulty = validate.measurement(snap.get("containers_faulty"), int)
+    offline = validate.measurement(snap.get("containers_offline"), int)
+    counts_valid = (faulty is not None and offline is not None and containers is not None and
+                    faulty + offline <= containers)
+    for key in ("containers_faulty", "containers_offline"):
+        out[key] = bool(container_evidence and unknown == 0 and counts_valid)
+    return out
+
+
+def _observation_intervals(conn, begin, end, site_id=None, stalled_after=1200):
+    """左值保持，真实时长加权；失败/重复/午夜/过期/当前时刻都明确切断区间。"""
+    args = [begin - MAX_OBSERVATION_GAP, end]
+    query = "SELECT * FROM snapshots WHERE ts>=? AND ts<=?"
+    if site_id is not None:
+        query += " AND site_id=?"
+        args.append(site_id)
+    query += " ORDER BY site_id,ts,id"
+
+    def segment(row, following):
+        start = max(begin, row["ts"])
+        stop = min(end, following, row["ts"] + MAX_OBSERVATION_GAP)
+        age = scan_age(row, row["ts"])
+        if age is not None:
+            stop = min(stop, row["ts"] + max(0, stalled_after - age))
+        measured = validate.measurement(row.get("measurement_ts"), int)
+        if row.get("measurement_time_supported") == 1 and measured:
+            stop = min(stop, measured + MAX_MEASUREMENT_AGE)
+        quality = snapshot_quality(row, row["ts"], stalled_after)
+        return row, start, max(start, stop), quality
+
     with _lock:
+        previous = None
+        for raw in conn.execute(query, args):
+            row = dict(raw)
+            if previous is not None:
+                same_site = row["site_id"] == previous["site_id"]
+                if same_site and row["ts"] == previous["ts"]:
+                    previous = row  # 同一接收秒最后一条为准，不重复增加时长或权重。
+                    continue
+                yield segment(previous, row["ts"] if same_site else end)
+            previous = row
+        if previous is not None:
+            yield segment(previous, end)
+
+
+def trend(conn, site_id, hours=24, points=288, stalled_after=1200):
+    """按真实观测秒数降采样，未知/失败区间为 null，不能画成零算力。"""
+    hours = max(1, min(int(hours), 24 * 90))
+    points = max(24, min(int(points), 2000))
+    bucket = max(60, int(hours * 3600 / points))
+    now = int(time.time())
+    begin = now - hours * 3600
+    keys = ("online", "total", "hashrate_ths", "power_kw", "active_alerts")
+    bins = {}
+    for row, left, right, quality in _observation_intervals(conn, begin, now, site_id, stalled_after):
+        while left <= right:
+            stamp = left // bucket * bucket
+            stop = min(right, stamp + bucket)
+            slot = bins.setdefault(stamp, {key: [0.0, 0, None] for key in
+                                           (*keys, *("legacy_" + k for k in keys))})
+            for key in keys:
+                value = validate.measurement(row.get(key))
+                if quality[key] and value is not None:
+                    slot[key][0] += value * (stop - left)
+                    slot[key][1] += stop - left
+                    if stop > left or row["ts"] == left:
+                        slot[key][2] = value
+                flag = {"hashrate_ths": "hashrate_complete", "power_kw": "power_complete",
+                        "online": "unknown", "total": "unknown"}.get(key)
+                legacy_evidence = row.get(flag) is None or not row.get("measurement_time_supported")
+                if row.get("ok") and flag and legacy_evidence and value is not None:
+                    legacy = slot["legacy_" + key]
+                    legacy[0] += value * (stop - left)
+                    legacy[1] += stop - left
+                    if stop > left or row["ts"] == left:
+                        legacy[2] = value
+            if stop >= right:
+                break
+            left = stop
+    result = []
+    # 没有快照的长缺口也必须有 null 点，否则折线会直接连接缺口两端，伪装连续观测。
+    for stamp in range(begin // bucket * bucket, now // bucket * bucket + 1, bucket):
+        slot = bins.get(stamp, {key: [0.0, 0, None] for key in
+                                (*keys, *("legacy_" + k for k in keys))})
+        point = {"ts": stamp}
+        for key, (integral, duration, instant) in slot.items():
+            point[key] = round(integral / duration, 1) if duration else instant
+        result.append(point)
+    return result
+
+
+def avg_hashrate(conn, site_id, t1, t2, stalled_after=1200):
+    """已观测时段的时间加权平均，告警不把缺测当零。"""
+    integral = duration = 0.0
+    for row, left, right, quality in _observation_intervals(conn, t1, min(t2, int(time.time())), site_id, stalled_after):
+        if quality["hashrate_ths"] and right > left:
+            integral += row["hashrate_ths"] * (right - left)
+            duration += right - left
+    return integral / duration if duration else None
+
+
+def replace_customers(conn, site_id, customers, hours, period=None):
+    now = int(time.time())
+    period = validate.customer_report_period({"hours": hours, **(period or {})}, customers, now)
+    extra = [k for k in validate.REPORT_FIELDS if k not in ("delivered_th_h", "power_kwh", "uptime_pct")]
+    with _lock, conn:
+        previous = conn.execute("SELECT * FROM site_customer_report_state WHERE site_id=?", (site_id,)).fetchone()
+        if previous and (period is None or any(period[k] < previous[k]
+                         for k in ("period_end_ts", "billing_period_end_ts"))):
+            return False
         conn.execute("DELETE FROM site_customers WHERE site_id=?", (site_id,))
         conn.executemany(
             "INSERT OR REPLACE INTO site_customers"
             "(site_id,worker,machines,uptime_pct,delivered_th_h,power_kwh,"
             "hashrate_ths,avg_hashrate_ths,hashrate_hours,observed_hours,coverage_pct,"
-            "hashrate_ts,current_machines,hours,updated_ts)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "hashrate_ts,current_machines,hours,updated_ts," + ",".join(extra) + ")"
+            " VALUES(" + ",".join("?" for _ in range(15 + len(extra))) + ")",
             [(site_id, str(c.get("worker") or "(未知)")[:128], c.get("machines") or 0,
               c.get("uptime_pct"), c.get("delivered_th_h"), c.get("power_kwh"),
               c.get("hashrate_ths"), c.get("avg_hashrate_ths"), c.get("hashrate_hours"),
               c.get("observed_hours"), c.get("coverage_pct"), c.get("hashrate_ts"),
               c.get("current_machines"),
-              hours, now) for c in customers])
-        conn.commit()
+              hours, now, *(c.get(k) for k in extra)) for c in customers])
+        if period is not None:
+            conn.execute("INSERT INTO site_customer_report_state VALUES(?,?,?,?,?,?) "
+                         "ON CONFLICT(site_id) DO UPDATE SET period_start_ts=excluded.period_start_ts,"
+                         "period_end_ts=excluded.period_end_ts,billing_period_start_ts=excluded.billing_period_start_ts,"
+                         "billing_period_end_ts=excluded.billing_period_end_ts,updated_ts=excluded.updated_ts",
+                         (site_id, *(period[k] for k in validate.PERIOD_FIELDS), now))
+    return True
 
 
 def replace_customer_hashrates(conn, site_id, rows, scan_ts):
@@ -267,7 +454,7 @@ def replace_customer_hashrates(conn, site_id, rows, scan_ts):
             "INSERT INTO site_customer_current(site_id,worker,machines,hashrate_ths,hashrate_ts)"
             " VALUES(?,?,?,?,?)",
             [(site_id, c["worker"], c.get("machines"), c.get("hashrate_ths"),
-              c.get("hashrate_ts") or scan_ts) for c in rows])
+              c.get("hashrate_ts") if "hashrate_ts" in c else scan_ts) for c in rows])
         conn.execute("INSERT INTO site_customer_current_state(site_id,scan_ts,updated_ts)"
                      " VALUES(?,?,?) ON CONFLICT(site_id) DO UPDATE SET "
                      "scan_ts=excluded.scan_ts,updated_ts=excluded.updated_ts", (site_id, scan_ts, now))
@@ -428,8 +615,8 @@ def delete_site(conn, site_id, name=None):
                      "deleted_name=excluded.deleted_name, deleted_ts=excluded.deleted_ts",
                      (site_id, name or site_id, int(time.time())))
         for t in ("sites", "snapshots", "site_customers", "site_customer_current",
-                  "site_customer_current_state", "site_alert_summary",
-                  "daily", "notify_log"):
+                  "site_customer_current_state", "site_customer_report_state", "site_alert_summary",
+                  "daily", "daily_observed_v2", "notify_log"):
             conn.execute(f"DELETE FROM {t} WHERE {'id' if t == 'sites' else 'site_id'}=?",
                          (site_id,))
 
@@ -455,39 +642,90 @@ def cleanup(conn, retention_days):
 _TZ8 = 8 * 3600
 
 
-def rollup_daily(conn, day_offsets=(0, 1)):
-    """重算指定天(0=今天,1=昨天)的日汇总。幂等 REPLACE，每轮跑一次成本可忽略。
-
-    耗电按**实际时间积分**：每个样本的功率 × 到下一个样本的实际间隔(封顶300秒)，
-    与各场地上报/拉取节奏无关(5秒的mock和60秒的真实场地都算得对)；
-    断档超过5分钟的时段不计电量(场地断电断网时本来也测不到)。"""
+def rollup_daily(conn, day_offsets=(0, 1), stalled_after=1200):
+    """只写 v2 观测日报，旧 daily 估算账本原样保留。"""
+    now = int(time.time())
     for off in day_offsets:
-        day_start8 = (int((time.time() + _TZ8) // 86400) - off) * 86400
-        t1, t2 = day_start8 - _TZ8, day_start8 - _TZ8 + 86400
+        day_start8 = (int((now + _TZ8) // 86400) - off) * 86400
+        begin = day_start8 - _TZ8
+        end = min(now, begin + 86400)
+        if end < begin:
+            continue
         day = datetime.datetime.utcfromtimestamp(day_start8).strftime("%Y-%m-%d")
-        with _lock:
-            conn.execute(
-                "REPLACE INTO daily(site_id, day, samples, avg_hashrate_ths, max_hashrate_ths,"
-                " avg_online, avg_total, avg_power_kw, power_kwh)"
-                " SELECT site_id, ?, COUNT(*), AVG(hashrate_ths), MAX(hashrate_ths),"
-                " AVG(online), AVG(total), AVG(power_kw), SUM(power_kw*dt)/3600.0"
-                " FROM (SELECT site_id, hashrate_ths, online, total, power_kw,"
-                "   MIN(COALESCE(LEAD(ts) OVER (PARTITION BY site_id ORDER BY ts), ts+60) - ts,"
-                "       300) AS dt"
-                "   FROM snapshots WHERE ok=1 AND ts>=? AND ts<?)"
-                " GROUP BY site_id",
-                (day, t1, t2))
-            conn.commit()
+        slots = {}
+        for row, left, right, quality in _observation_intervals(conn, begin, end, stalled_after=stalled_after):
+            dt = max(0, right - left)
+            in_day = begin <= row["ts"] < begin + 86400 and row["ts"] <= now
+            if not dt and not in_day:
+                continue
+            # 缺完整性证据的旧原始快照不能把旧日报自动升级为“可靠 v2”。
+            supported = row.get("measurement_time_supported") == 1 and any(
+                row.get(k) is not None for k in ("unknown", "hashrate_complete", "power_complete"))
+            if not supported:
+                continue
+            slot = slots.setdefault(row["site_id"], {"samples": 0, "common": 0.0, "peak": None,
+                **{key: [0.0, 0.0] for key in ("hashrate_ths", "online", "total", "power_kw")}})
+            if in_day:
+                slot["samples"] += 1
+            if quality["hashrate_ths"] and (dt or in_day):
+                value = validate.measurement(row.get("hashrate_ths"))
+                slot["peak"] = value if slot["peak"] is None else max(slot["peak"], value)
+            for key in ("hashrate_ths", "online", "total", "power_kw"):
+                if quality[key] and dt:
+                    slot[key][0] += validate.measurement(row[key]) * dt
+                    slot[key][1] += dt
+            if all(quality[k] for k in ("hashrate_ths", "online", "power_kw")):
+                slot["common"] += dt
+        elapsed = max(0, end - begin) / 3600.0
+        rows = []
+        for sid, slot in slots.items():
+            mean = lambda key: slot[key][0] / slot[key][1] if slot[key][1] else None
+            rows.append((sid, day, slot["samples"], mean("hashrate_ths"), slot["peak"],
+                         mean("online"), mean("total"), mean("power_kw"),
+                         slot["power_kw"][0] / 3600.0 if slot["power_kw"][1] else None,
+                         elapsed, slot["common"] / 3600.0,
+                         slot["common"] / (end - begin) * 100 if end > begin else 0.0,
+                         slot["hashrate_ths"][1] / 3600.0, slot["online"][1] / 3600.0,
+                         slot["power_kw"][1] / 3600.0, "time_weighted_v2"))
+        with _lock, conn:
+            conn.executemany("INSERT OR REPLACE INTO daily_observed_v2 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
 
 
 def daily_report(conn, site_id, days=14):
-    rows = conn.execute(
-        "SELECT * FROM daily WHERE site_id=? ORDER BY day DESC LIMIT ?",
-        (site_id, max(1, min(int(days), 3650)))).fetchall()
-    return [dict(r) for r in rows]
+    limit = max(1, min(int(days), 3650))
+    with _lock:
+        old = {r["day"]: dict(r) for r in conn.execute(
+            "SELECT * FROM daily WHERE site_id=? ORDER BY day DESC LIMIT ?", (site_id, limit))}
+        observed = {r["day"]: dict(r) for r in conn.execute(
+            "SELECT * FROM daily_observed_v2 WHERE site_id=? ORDER BY day DESC LIMIT ?", (site_id, limit))}
+    result = []
+    for day in sorted(set(old) | set(observed), reverse=True)[:limit]:
+        legacy = old.get(day)
+        r = observed.get(day)
+        if r is None:
+            r = dict(legacy, method="legacy_sample_mean", elapsed_hours=None,
+                     observed_hours=None, coverage_pct=None, hashrate_observed_hours=None,
+                     machines_observed_hours=None, power_observed_hours=None)
+        if legacy:
+            for key in ("avg_hashrate_ths", "max_hashrate_ths", "avg_online", "avg_total", "avg_power_kw", "power_kwh"):
+                r["legacy_" + key] = legacy[key]
+        if r["method"] == "time_weighted_v2":
+            # 中断数日后只重算今天/昨天，旧日的分母不能永远停在关机时刻而显示 100%。
+            day_begin = int(datetime.datetime.strptime(day, "%Y-%m-%d").replace(
+                tzinfo=datetime.timezone(datetime.timedelta(hours=8))).timestamp())
+            r["elapsed_hours"] = min(24.0, max(0.0, (time.time() - day_begin) / 3600.0))
+            r["coverage_pct"] = (min(100.0, r["observed_hours"] / r["elapsed_hours"] * 100)
+                                  if r["elapsed_hours"] else 0.0)
+        mapping = {"hashrate_ths": r["hashrate_observed_hours"], "online": r["machines_observed_hours"],
+                   "total": r["machines_observed_hours"], "power_kw": r["power_observed_hours"]}
+        r["metric_observed_hours"] = mapping
+        elapsed = r["elapsed_hours"]
+        r["metric_coverage_pct"] = {key: min(100, value / elapsed * 100) if value is not None and elapsed else
+                                   (0.0 if value == 0 and elapsed == 0 else None) for key, value in mapping.items()}
+        result.append(r)
+    return result
 
 
-# ---- 通知日志 ----
 def notify_log_add(conn, ts, site_id, ntype, msg, ok):
     with _lock:
         conn.execute("INSERT INTO notify_log(ts, site_id, type, msg, ok) VALUES(?,?,?,?,?)",

@@ -386,6 +386,305 @@ def test_revoked_site_cannot_fall_back_to_shared_token(cloud):
     assert write(client, "POST", "/api/connect/reveal", json={"target": sid, **PW}).status_code == 404
 
 
+@pytest.mark.parametrize("registered,revoked", [(False, False), (False, True), (True, False), (True, True)])
+def test_delete_provisioned_site_removes_it_until_explicit_rebind(cloud, registered, revoked):
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    other = write(client, "POST", "/api/connect/token", json={
+        **NEW_SITE, "site_name": "keep-me", **PW}).json()
+    sid, old_token = created["target"], created["token"]
+    expected_name = NEW_SITE["site_name"]
+    headers = {"Authorization": "Bearer " + old_token}
+    if registered:
+        assert client.post("/api/ingest/summary", headers=headers,
+                           json={"site_id": sid, "site": "现场名称", "type": "air"}).status_code == 200
+        assert write(client, "PATCH", "/api/site/" + sid, json={"name": "云端名称"}).status_code == 200
+        expected_name = "云端名称"
+    expected_type = "air" if registered else "hydro"
+    if revoked:
+        assert write(client, "POST", "/api/connect/token", json={
+            "target": sid, "action": "revoke", **PW}).status_code == 200
+    server.appconfig.update_settings({"alerts": {"preserved": True}})
+
+    assert write(client, "DELETE", "/api/site/" + sid).status_code == 200
+    assert write(client, "DELETE", "/api/site/" + sid).status_code == 404
+    assert all(x["id"] != sid for x in client.get("/api/connect").json()["sites"])
+    assert all(x["id"] != sid for x in client.get("/api/overview").json()["sites"])
+    deleted = client.get("/api/sites/deleted").json()["sites"]
+    assert next(x for x in deleted if x["id"] == sid)["name"] == expected_name
+    saved = server.appconfig.load_settings()
+    assert saved["alerts"] == {"preserved": True}
+    assert saved["ingest"]["tokens"][sid] == server.CFG["ingest"]["tokens"][sid] == ""
+    assert saved["ingest"]["tokens"][other["target"]] == other["token"]
+    assert server.CFG["ingest"]["token"] == "reporting-test-token"
+    assert saved["ingest"]["site_meta"][sid] == {"name": expected_name, "type": expected_type}
+    assert not server.db.site_exists(server.CONN, sid)
+    for kind in ("ping", "summary", "customers"):
+        body = {"site_id": sid, "site": "old reporter", "customers": []}
+        for token in (old_token, "reporting-test-token"):
+            assert client.post("/api/ingest/" + kind,
+                               headers={"Authorization": "Bearer " + token}, json=body).status_code == 401
+    for action in ("reveal", "rotate", "revoke"):
+        path = "/api/connect/reveal" if action == "reveal" else "/api/connect/token"
+        response = write(client, "POST", path, json={"target": sid, "action": action, **PW})
+        assert response.status_code == 410
+        assert server.appconfig.load_settings() == saved
+    with pytest.raises(server.db.SiteDeletedError):
+        server.db.upsert_site(server.CONN, sid, "inflight", "air", 1)
+
+    restored = write(client, "POST", "/api/site/" + sid + "/restore")
+    assert restored.status_code == 200 and restored.json()["requires_new_token"]
+    row = next(x for x in client.get("/api/connect").json()["sites"] if x["id"] == sid)
+    assert (row["name"], row["type"], row["registered"], row["revoked"], row["can_reveal"]) == (
+        expected_name, expected_type, False, True, False)
+    assert client.post("/api/ingest/ping", headers=headers, json={"site_id": sid}).status_code == 401
+    assert report(client, sid).status_code == 401
+    rebound = write(client, "POST", "/api/connect/token", json={"target": sid, "action": "rotate", **PW})
+    assert rebound.status_code == 200
+    data = rebound.json()
+    assert data["token"] != old_token
+    decoded = connect.parse_code(data["code"])
+    assert (decoded["s"], decoded["n"], decoded["y"]) == (sid, expected_name, expected_type)
+    assert client.post("/api/ingest/summary", headers={"Authorization": "Bearer " + data["token"]},
+                       json={"site_id": sid, "site": expected_name, "type": expected_type}).status_code == 200
+    assert client.post("/api/ingest/ping", headers=headers, json={"site_id": sid}).status_code == 401
+
+
+def test_deleted_yaml_token_stays_disabled_after_restart_and_restore(cloud):
+    import yaml
+    from fastapi.testclient import TestClient
+    server, client = cloud
+    sid, token = "st-yaml-pending", "synthetic-yaml-reporting-token"
+    config_path = Path(server.CFG_PATH)
+    config = yaml.safe_load(config_path.read_text())
+    config["ingest"]["tokens"] = {sid: token}
+    config["ingest"]["site_meta"] = {sid: {"name": "YAML 待接入", "type": "mixed"}}
+    config_path.write_text(yaml.safe_dump(config))
+    server.CONN.close()
+    server = importlib.reload(server)
+    client = TestClient(server.app, base_url="https://cloud.example.com")
+    login(client)
+    row = next(x for x in client.get("/api/connect").json()["sites"] if x["id"] == sid)
+    assert row["from_config"] and not row["registered"]
+    assert write(client, "DELETE", "/api/site/" + sid).status_code == 200
+    original_yaml = config_path.read_bytes()
+    server.CONN.close()
+    server = importlib.reload(server)
+    client = TestClient(server.app, base_url="https://cloud.example.com")
+    login(client)
+    assert config_path.read_bytes() == original_yaml
+    assert sid not in {x["id"] for x in client.get("/api/connect").json()["sites"]}
+    assert server.CFG["ingest"]["tokens"][sid] == ""
+    assert write(client, "POST", "/api/site/" + sid + "/restore").status_code == 200
+    server.CONN.close()
+    server = importlib.reload(server)
+    client = TestClient(server.app, base_url="https://cloud.example.com")
+    login(client)
+    row = next(x for x in client.get("/api/connect").json()["sites"] if x["id"] == sid)
+    assert (row["name"], row["type"], row["revoked"], row["from_config"]) == (
+        "YAML 待接入", "mixed", True, False)
+    for old_token in (token, "reporting-test-token"):
+        assert client.post("/api/ingest/ping", headers={"Authorization": "Bearer " + old_token},
+                           json={"site_id": sid}).status_code == 401
+
+
+def test_legacy_deleted_site_is_hidden_and_restore_revokes_old_credentials(cloud):
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    sid = created["target"]
+    # Old releases removed only database rows and left credentials valid in settings.
+    server.db.delete_site(server.CONN, sid, "旧版删除场地")
+    assert sid not in {x["id"] for x in client.get("/api/connect").json()["sites"]}
+    assert write(client, "POST", "/api/connect/reveal", json={"target": sid, **PW}).status_code == 410
+    assert write(client, "POST", "/api/site/" + sid + "/restore").status_code == 200
+    assert server.CFG["ingest"]["tokens"][sid] == ""
+    assert client.post("/api/ingest/ping", headers={"Authorization": "Bearer " + created["token"]},
+                       json={"site_id": sid}).status_code == 401
+    row = next(x for x in client.get("/api/connect").json()["sites"] if x["id"] == sid)
+    assert row["name"] == "旧版删除场地" and row["revoked"]
+
+
+def test_failed_binding_save_does_not_delete_site_or_change_credentials(cloud, monkeypatch):
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    sid = created["target"]
+    assert client.post("/api/ingest/summary", headers={"Authorization": "Bearer " + created["token"]},
+                       json={"site_id": sid, "site": "preserve"}).status_code == 200
+    before = copy.deepcopy(server.CFG["ingest"])
+    disk = Path(server.appconfig.SETTINGS_FILE).read_bytes()
+    def fail(_patch):
+        raise server.appconfig.SettingsError("simulated read-only settings")
+    monkeypatch.setattr(server.appconfig, "update_settings", fail)
+    response = write(client, "DELETE", "/api/site/" + sid)
+    assert response.status_code == 500
+    assert server.CFG["ingest"] == before
+    assert Path(server.appconfig.SETTINGS_FILE).read_bytes() == disk
+    assert server.db.site_exists(server.CONN, sid)
+    assert not server.db.site_management(server.CONN).get(sid, {}).get("deleted_ts")
+
+
+def test_database_delete_failure_restores_binding_without_losing_concurrent_settings(cloud, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    other = write(client, "POST", "/api/connect/token", json={**NEW_SITE, "site_name": "keep", **PW}).json()
+    sid, token = created["target"], created["token"]
+    assert client.post("/api/ingest/summary", headers={"Authorization": "Bearer " + token},
+                       json={"site_id": sid, "site": "现场名", "type": "air"}).status_code == 200
+    assert write(client, "PATCH", "/api/site/" + sid, json={"name": "云端改名"}).status_code == 200
+    before = copy.deepcopy(server.appconfig.load_settings()["ingest"])
+    server.CONN.execute("CREATE TRIGGER fail_site_delete BEFORE DELETE ON snapshots "
+                        "BEGIN SELECT RAISE(ABORT, 'simulated database failure'); END")
+    server.CONN.commit()
+    deleting, release, updating = threading.Event(), threading.Event(), threading.Event()
+    original = server.db.delete_site
+    def pause(*args, **kwargs):
+        deleting.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(server.db, "delete_site", pause)
+    def update_other_settings():
+        updating.set()
+        server.appconfig.update_settings({"alerts": {"concurrent_change": True}})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        removal = pool.submit(write, client, "DELETE", "/api/site/" + sid)
+        try:
+            assert deleting.wait(5)
+            change = pool.submit(update_other_settings)
+            assert updating.wait(5)
+        finally:
+            release.set()
+        response = removal.result(timeout=5)
+        change.result(timeout=5)
+    assert response.status_code == 500
+    assert "接入配置已保留" in response.json()["detail"]
+    saved = server.appconfig.load_settings()
+    assert saved["ingest"] == before
+    assert saved["alerts"] == {"concurrent_change": True}
+    assert server.CFG["ingest"]["tokens"][sid] == token
+    assert server.CFG["ingest"]["tokens"][other["target"]] == other["token"]
+    assert server.db.site_exists(server.CONN, sid)
+    assert not server.db.site_management(server.CONN).get(sid, {}).get("deleted_ts")
+    assert server.CONN.execute("SELECT COUNT(*) FROM snapshots WHERE site_id=?", (sid,)).fetchone()[0] == 1
+    assert client.post("/api/ingest/ping", headers={"Authorization": "Bearer " + token},
+                       json={"site_id": sid}).status_code == 200
+
+
+def test_database_restore_failure_preserves_deleted_state_and_prior_overrides(cloud):
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    sid, token = created["target"], created["token"]
+    server.db.delete_site(server.CONN, sid, "旧版删除")
+    before = copy.deepcopy(server.appconfig.load_settings()["ingest"])
+    server.CONN.execute("CREATE TRIGGER fail_site_restore BEFORE UPDATE ON site_management "
+                        "WHEN NEW.deleted_ts=0 BEGIN SELECT RAISE(ABORT, 'simulated restore failure'); END")
+    server.CONN.commit()
+    response = write(client, "POST", "/api/site/" + sid + "/restore")
+    assert response.status_code == 500
+    assert "接入配置已保留" in response.json()["detail"]
+    assert server.appconfig.load_settings()["ingest"] == before
+    assert server.CFG["ingest"]["tokens"][sid] == token
+    assert server.db.site_management(server.CONN)[sid]["deleted_ts"]
+    assert client.post("/api/ingest/ping", headers={"Authorization": "Bearer " + token},
+                       json={"site_id": sid}).status_code == 410
+    server.CONN.execute("DROP TRIGGER fail_site_restore")
+    server.CONN.commit()
+    assert write(client, "POST", "/api/site/" + sid + "/restore").status_code == 200
+    assert server.CFG["ingest"]["tokens"][sid] == ""
+
+
+def test_failed_delete_compensation_stays_disabled_and_can_be_retried(cloud, monkeypatch):
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    sid, token = created["target"], created["token"]
+    assert client.post("/api/ingest/summary", headers={"Authorization": "Bearer " + token},
+                       json={"site_id": sid}).status_code == 200
+    server.CONN.execute("CREATE TRIGGER fail_delete_again BEFORE DELETE ON snapshots "
+                        "BEGIN SELECT RAISE(ABORT, 'simulated database failure'); END")
+    server.CONN.commit()
+    calls, original = [], server.appconfig.update_settings
+    def fail_compensation(patch):
+        calls.append(patch)
+        if len(calls) == 2:
+            raise server.appconfig.SettingsError("simulated compensation write failure")
+        return original(patch)
+    monkeypatch.setattr(server.appconfig, "update_settings", fail_compensation)
+    response = write(client, "DELETE", "/api/site/" + sid)
+    assert response.status_code == 500 and "原凭据已停用" in response.json()["detail"]
+    assert server.CFG["ingest"]["tokens"][sid] == ""
+    assert server.appconfig.load_settings()["ingest"]["tokens"][sid] == ""
+    assert server.db.site_exists(server.CONN, sid)
+    assert not server.db.site_management(server.CONN).get(sid, {}).get("deleted_ts")
+    assert client.post("/api/ingest/ping", headers={"Authorization": "Bearer " + token},
+                       json={"site_id": sid}).status_code == 401
+    server.CONN.execute("DROP TRIGGER fail_delete_again")
+    server.CONN.commit()
+    assert write(client, "DELETE", "/api/site/" + sid).status_code == 200
+    assert not server.db.site_exists(server.CONN, sid)
+    assert server.db.site_management(server.CONN)[sid]["deleted_ts"]
+
+
+def test_restore_with_uncertain_committed_outcome_does_not_reenable_old_token(cloud, monkeypatch):
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    sid, token = created["target"], created["token"]
+    server.db.delete_site(server.CONN, sid, "旧版删除")
+    original = server.db.restore_site
+    def committed_then_failed(*args):
+        assert original(*args)
+        raise RuntimeError("simulated failure after commit")
+    monkeypatch.setattr(server.db, "restore_site", committed_then_failed)
+    response = write(client, "POST", "/api/site/" + sid + "/restore")
+    assert response.status_code == 500 and "未能完成确认" in response.json()["detail"]
+    assert not server.db.site_management(server.CONN)[sid]["deleted_ts"]
+    assert server.CFG["ingest"]["tokens"][sid] == ""
+    assert server.appconfig.load_settings()["ingest"]["tokens"][sid] == ""
+    assert client.post("/api/ingest/ping", headers={"Authorization": "Bearer " + token},
+                       json={"site_id": sid}).status_code == 401
+
+
+def test_inflight_token_rotation_cannot_leave_live_credentials_after_delete(cloud, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    server, client = cloud
+    login(client)
+    created = write(client, "POST", "/api/connect/token", json={**NEW_SITE, **PW}).json()
+    sid = created["target"]
+    rotating, release, deleting = threading.Event(), threading.Event(), threading.Event()
+    original = server._code_for
+    def pause(*args, **kwargs):
+        rotating.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(server, "_code_for", pause)
+    def delete():
+        deleting.set()
+        return write(client, "DELETE", "/api/site/" + sid)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rotate = pool.submit(write, client, "POST", "/api/connect/token",
+                             json={"target": sid, "action": "rotate", **PW})
+        try:
+            assert rotating.wait(5)
+            remove = pool.submit(delete)
+            assert deleting.wait(5)
+        finally:
+            release.set()
+        assert rotate.result(timeout=5).status_code == 200
+        assert remove.result(timeout=5).status_code == 200
+    assert server.CFG["ingest"]["tokens"][sid] == ""
+    assert server.appconfig.load_settings()["ingest"]["tokens"][sid] == ""
+    assert server.db.site_management(server.CONN)[sid]["deleted_ts"]
+    assert sid not in {x["id"] for x in client.get("/api/connect").json()["sites"]}
+
+
 def test_legacy_name_as_site_id_is_manageable(cloud):
     _server, client = cloud
     login(client)

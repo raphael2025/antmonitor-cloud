@@ -396,6 +396,7 @@ $("siteDelete").onclick = async () => {
   try {
     const r = await send("DELETE", `/api/site/${encodeURIComponent(s.id)}`);
     if (!r.ok) throw new Error(await errText(r));
+    removeConnSite(s.id);
     if (curSite === s.id) { $("siteModal").classList.add("hidden"); curSite = null; curSiteData = null; }
     await refresh();
   } catch (e) { $("siteManageMsg").textContent = e.message; }
@@ -421,14 +422,26 @@ $("deletedSitesModal").addEventListener("click", (e) => {
 $("deletedSitesList").addEventListener("click", async (e) => {
   const button = e.target.closest("[data-restore-site]");
   if (!button || curRole !== "admin") return;
+  const id = button.dataset.restoreSite;
+  let restored = false;
   button.disabled = true;
   $("deletedSitesMsg").textContent = "";
   try {
-    const r = await send("POST", `/api/site/${encodeURIComponent(button.dataset.restoreSite)}/restore`);
+    const r = await send("POST", `/api/site/${encodeURIComponent(id)}/restore`);
     if (!r.ok) throw new Error(await errText(r));
+    restored = true;
+    _connListVersion++;
+    _connDeletedSites.delete(id);
+    invalidateConnCredentials(id);
     await loadDeletedSites();
     await refresh();
-  } catch (err) { $("deletedSitesMsg").textContent = err.message; button.disabled = false; }
+    $("deletedSitesModal").classList.add("hidden");
+    const loaded = await openConnect();
+    connMsg(t(loaded ? "site.restored" : "site.restored_refresh_failed"), !loaded);
+  } catch (err) {
+    $("deletedSitesMsg").textContent = restored ? t("site.restored_refresh_failed") : err.message;
+    if (!restored) button.disabled = false;
+  }
 });
 // 事件委托：卡片每30s重建DOM，绑在document上点击永远有效
 document.addEventListener("click", (e) => {
@@ -717,14 +730,26 @@ $("secRevoke").onclick = async () => {
 let _connHideTimer = null;
 let _connSavedUrl = null;
 let _connAddressError = "";
+let _connSites = new Map();
+const _connDeletedSites = new Set();
+const _connDeleting = new Set();
+const _connCredentialVersions = new Map();
+const _connActionBusy = new Map();
+let _connListVersion = 0;
+let _connLoadSequence = 0;
 function connMsg(text, bad) {
   const el = $("connMsg");
   el.textContent = text || "";
   el.style.color = bad ? "var(--theme-danger, #ff9b9b)" : "";
 }
-async function copyText(text, manualField, successKey = "conn.copied") {
+async function copyText(text, manualField, successKey = "conn.copied", current = () => true) {
   if (!text) { connMsg(t("conn.copy_empty"), true); return false; }
-  try { await navigator.clipboard.writeText(text); connMsg(t(successKey)); return true; } catch (e) {}
+  try {
+    await navigator.clipboard.writeText(text);
+    if (!current()) return false;
+    connMsg(t(successKey)); return true;
+  } catch (e) {}
+  if (!current()) return false;
   const ta = document.createElement("textarea");   // 非安全上下文/老浏览器兜底
   ta.value = text; document.body.appendChild(ta); ta.select();
   let copied = false;
@@ -768,10 +793,12 @@ function readConnPacket(value) {
 async function copyConnInfo() {
   if (!connAddressReady()) return false;
   const code = $("connCode").value, packet = readConnPacket(code);
-  if (!packet || connUrlValue(packet.u) !== connUrlValue(_connSavedUrl)) {
+  if (!packet || _connDeletedSites.has(packet.s) || _connDeleting.has(packet.s)
+      || connUrlValue(packet.u) !== connUrlValue(_connSavedUrl)) {
     hideConnResult(); connMsg(t("conn.invalid_code"), true); return false;
   }
-  return copyText(code, $("connCode"), "conn.copied_info");
+  return copyText(code, $("connCode"), "conn.copied_info", () => $("connCode").value === code
+    && !_connDeletedSites.has(packet.s) && !_connDeleting.has(packet.s));
 }
 function hideConnResult() {
   $("connResult").classList.add("hidden");
@@ -823,6 +850,53 @@ function renderConnInstall() {
   $("connInstallHelp").textContent = t(windows ? "conn.install_windows" : "conn.install_linux");
 }
 function connUrlValue(value) { return String(value || "").trim().replace(/\/+$/, ""); }
+function invalidateConnCredentials(id) {
+  _connCredentialVersions.set(id, (_connCredentialVersions.get(id) || 0) + 1);
+  const packet = readConnPacket($("connCode").value);
+  if (id === "shared" || (packet && packet.s === id)) hideConnResult();
+}
+function connActionCurrent(id, version) {
+  return !_connDeleting.has(id) && !_connDeletedSites.has(id)
+    && (_connCredentialVersions.get(id) || 0) === version;
+}
+function removeConnSite(id) {
+  _connListVersion++;
+  _connDeletedSites.add(id);
+  invalidateConnCredentials(id);
+  _connActionBusy.delete(id);
+  _connSites.delete(id);
+  renderConnSites([..._connSites.values()]);
+}
+async function deleteConnSite(id) {
+  const site = _connSites.get(id);
+  if (curRole !== "admin" || !site || site.mode === "pull" || _connDeleting.has(id)) return;
+  if (!confirm(t("conn.delete_confirm", { name: site.name || id, id }))) return;
+  let deleted = false;
+  let responded = false;
+  _connDeleting.add(id);
+  renderConnSites([..._connSites.values()]);
+  connMsg("");
+  try {
+    const r = await send("DELETE", `/api/site/${encodeURIComponent(id)}`);
+    responded = true;
+    if (!r.ok) {
+      if (r.status >= 500) invalidateConnCredentials(id);
+      throw new Error(await errText(r));
+    }
+    deleted = true;
+    removeConnSite(id);
+    if (curSite === id) { $("siteModal").classList.add("hidden"); curSite = null; curSiteData = null; }
+    await loadConnect();
+    await refresh();
+    connMsg(t("conn.deleted"));
+  } catch (e) {
+    if (!responded) invalidateConnCredentials(id); // The server may have completed a request whose response was lost.
+    connMsg(deleted ? t("conn.deleted_refresh_failed") : e.message, true);
+  } finally {
+    _connDeleting.delete(id);
+    renderConnSites([..._connSites.values()]);
+  }
+}
 function connAddressReady() {
   const unchanged = connUrlValue($("connUrl").value) === connUrlValue(_connSavedUrl);
   if (_connSavedUrl !== null && _connSavedUrl && unchanged && !_connAddressError) return true;
@@ -833,7 +907,7 @@ function connAddressReady() {
   $("connUrl").focus();
   return false;
 }
-function renderConnect(d, savedAddress = false) {
+function renderConnect(d, savedAddress = false, listVersion = _connListVersion) {
   const dirty = _connSavedUrl !== null && connUrlValue($("connUrl").value) !== connUrlValue(_connSavedUrl);
   _connSavedUrl = d.public_url || "";
   _connAddressError = d.address_ready === false ? (d.address_error || t("conn.url_unsaved")) : "";
@@ -854,7 +928,12 @@ function renderConnect(d, savedAddress = false) {
   $("connSharedRevoke").disabled = !d.shared.set;
   $("connSharedRotate").textContent = d.shared.set ? t("conn.rotate") : t("conn.generate");
   $("connAutoReg").checked = !!d.auto_register;
-  $("tblConnSites").querySelector("tbody").innerHTML = (d.sites || []).map((x) => {
+  if (listVersion === _connListVersion) renderConnSites(d.sites || []);
+}
+function renderConnSites(sites) {
+  // A response started before deletion must not put its stale row back.
+  _connSites = new Map(sites.filter(x => !_connDeletedSites.has(x.id)).map(x => [x.id, x]));
+  $("tblConnSites").querySelector("tbody").innerHTML = [..._connSites.values()].map((x) => {
     const id = esc(x.id);
     const name = x.name ? esc(x.name) : `<span class="muted">${t("conn.no_name")}</span>`;
     const kind = ["air", "hydro", "mixed"].includes(x.type) ? t("type." + x.type) : "";
@@ -862,18 +941,24 @@ function renderConnect(d, savedAddress = false) {
     const tok = x.own_token ? `…${esc(x.hint || "****")}${x.from_config ? " · config.yaml" : ""}`
       : x.revoked ? `<span class="muted">${t("conn.revoked_label")}</span>`
       : `<span class="muted">${t("conn.use_shared")}</span>`;
-    const ops = x.own_token
-      ? `<button data-act="reveal" data-id="${id}">${t("conn.show")}</button>`
-        + `<button data-act="rotate" data-id="${id}">${t("conn.rotate")}</button>`
-        + (x.from_config ? "" : `<button class="danger" data-act="revoke" data-id="${id}">${t("conn.revoke")}</button>`)
-      : (x.mode === "pull" ? "" : (x.can_reveal
-          ? `<button data-act="reveal" data-id="${id}">${t("conn.show")}</button>` : "")
-        + `<button data-act="rotate" data-id="${id}">${t("conn.make_own")}</button>`);
+    const button = (act, label, danger = false) => `<button${danger ? ' class="danger"' : ""}`
+      + ((_connDeleting.has(x.id) || (act !== "delete" && _connActionBusy.has(x.id))) ? " disabled" : "")
+      + ` data-act="${act}" data-id="${id}">${t(label)}</button>`;
+    let ops = x.own_token
+      ? button("reveal", "conn.show") + button("rotate", "conn.rotate")
+        + (x.from_config ? "" : button("revoke", "conn.revoke", true))
+      : (x.mode === "pull" ? "" : (x.can_reveal ? button("reveal", "conn.show") : "")
+        + button("rotate", "conn.make_own"));
+    if (x.mode !== "pull") ops += button("delete", "site.delete", true);
     return `<tr><td>${name}<div class="muted">${esc(status)}</div></td><td class="conn-mono">${id}</td><td>${tok}</td><td>${ops}</td></tr>`;
   }).join("") || `<tr><td colspan="4" class="muted">${t("empty.none")}</td></tr>`;
 }
 async function loadConnect() {
+  const version = _connListVersion, sequence = ++_connLoadSequence;
   const d = await api("/api/connect");
+  if (version !== _connListVersion || sequence !== _connLoadSequence) return null;
+  // A fresh authoritative response may include a site restored in another tab.
+  for (const site of d.sites || []) _connDeletedSites.delete(site.id);
   renderConnect(d);
   return d;
 }
@@ -884,36 +969,61 @@ async function openConnect() {
   $("connAdvanced").open = false;
   $("connPw").value = "";
   $("connectModal").classList.remove("hidden");
-  try { await loadConnect(); } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); }
+  try { await loadConnect(); return true; }
+  catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); return false; }
 }
-async function connPost(path, body) {
+async function connPost(path, body, current = () => true) {
   const pw = $("connPw").value;
   if (!pw) { connMsg(t("conn.need_pw"), true); $("connPw").focus(); return null; }
   try {
     const r = await send("POST", path, Object.assign({ password: pw }, body));
-    if (!r.ok) { connMsg("✗ " + await errText(r), true); return null; }
+    if (!current()) return null;
+    if (!r.ok) {
+      const error = await errText(r);
+      if (current()) connMsg("✗ " + error, true);
+      return null;
+    }
+    const d = await r.json();
+    if (!current()) return null;
     connMsg("");
-    return await r.json();
-  } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); return null; }
+    return d;
+  } catch (e) {
+    if (current()) connMsg(t("notify.load_fail", { msg: e.message }), true);
+    return null;
+  }
 }
 async function connAction(act, target) {
+  const version = _connCredentialVersions.get(target) || 0;
+  const current = () => connActionCurrent(target, version);
+  if (!current() || _connActionBusy.has(target)) return;
   if ((act === "reveal" || act === "rotate") && !connAddressReady()) return;
-  if (act === "reveal") {
-    const d = await connPost("/api/connect/reveal", { target });
-    if (d) {
-      if (showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: target }), d))
-        await copyConnInfo();
-    }
-    return;
-  }
   if (act === "revoke" && !confirm(target === "shared" ? t("conn.confirm_disable") : t("conn.confirm_revoke", { id: target }))) return;
   if (act === "rotate" && target === "shared" && $("connShared").dataset.set === "1"
       && !confirm(t("conn.confirm_rotate"))) return;
-  const d = await connPost("/api/connect/token", { target, action: act });
-  if (!d) return;
-  if (d.token) showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: d.target }), d);
-  else connMsg(t("conn.revoked"));
-  loadConnect().catch(() => {});
+  const operation = {};
+  _connActionBusy.set(target, operation);
+  renderConnSites([..._connSites.values()]);
+  try {
+    if (act === "reveal") {
+      const d = await connPost("/api/connect/reveal", { target }, current);
+      if (d && current()) {
+        if (showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: target }), d))
+          await copyConnInfo();
+      }
+      return;
+    }
+    const d = await connPost("/api/connect/token", { target, action: act }, current);
+    if (!d || !current()) return;
+    invalidateConnCredentials(target);
+    if (d.token) showConnResult(target === "shared" ? t("conn.for_shared") : t("conn.for_site", { id: d.target }), d);
+    else connMsg(t("conn.revoked"));
+    await loadConnect();
+  } catch (e) {
+    if (current()) connMsg(t("notify.load_fail", { msg: e.message }), true);
+  } finally {
+    if (_connActionBusy.get(target) === operation) _connActionBusy.delete(target);
+    renderConnSites([..._connSites.values()]);
+  }
 }
 $("btnConnect").onclick = openConnect;
 $("connectClose").onclick = () => { hideConnResult(); $("connPw").value = ""; $("connectModal").classList.add("hidden"); };
@@ -935,21 +1045,28 @@ $("connNewSite").onclick = async () => {
   } catch (e) { connMsg(t("notify.load_fail", { msg: e.message }), true); }
   finally { $("connNewSite").disabled = false; }
 };
-$("tblConnSites").addEventListener("click", (e) => {
+$("tblConnSites").addEventListener("click", async (e) => {
   const b = e.target.closest("button[data-act]");
-  if (b) connAction(b.dataset.act, b.dataset.id);
+  if (!b || b.disabled) return;
+  if (b.dataset.act === "delete") await deleteConnSite(b.dataset.id);
+  else await connAction(b.dataset.act, b.dataset.id);
 });
 $("connUrlSave").onclick = async () => {
+  const version = _connListVersion;
   const d = await connPost("/api/connect/settings", { public_url: $("connUrl").value.trim() });
-  if (d) { hideConnResult(); renderConnect(d, true); connMsg(t("conn.saved")); }
+  if (d) { hideConnResult(); renderConnect(d, true, version); connMsg(t("conn.saved")); }
 };
 $("connAutoReg").onchange = async () => {
+  const version = _connListVersion;
   const want = $("connAutoReg").checked;
   const d = await connPost("/api/connect/settings", { auto_register: want });
-  if (d) { renderConnect(d); connMsg(t("conn.saved")); } else $("connAutoReg").checked = !want;
+  if (d) { renderConnect(d, false, version); connMsg(t("conn.saved")); } else $("connAutoReg").checked = !want;
 };
 $("connCodeCopy").onclick = copyConnInfo;
-$("connTokCopy").onclick = () => copyText($("connTok").value, $("connTok"), "conn.token_copied");
+$("connTokCopy").onclick = () => {
+  const token = $("connTok").value;
+  return copyText(token, $("connTok"), "conn.token_copied", () => $("connTok").value === token);
+};
 $("connFpCopy").onclick = () => copyText($("connFp").textContent);
 $("connUrl").oninput = hideConnResult;
 $("connSiteName").oninput = hideConnResult;

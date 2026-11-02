@@ -9,6 +9,7 @@ const html = fs.readFileSync(path.join(root, "web/index.html"), "utf8");
 const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
 const app = fs.readFileSync(path.join(root, "web/app.js"), "utf8");
 const source = app.slice(app.indexOf("// ---- 场地接入："), app.indexOf("// ---- 启动 ----"));
+const restoreSource = app.slice(app.indexOf("async function loadDeletedSites()"), app.indexOf("// 事件委托："));
 assert.ok(source.length > 1000, "load the real onboarding section");
 
 function setup(options = {}) {
@@ -19,35 +20,66 @@ function setup(options = {}) {
       const classes = new Set();
       const tbody = { innerHTML: "" };
       elements.set(id, { value: "", textContent: "", innerHTML: "", checked: false, disabled: false,
-        open: false, dataset: {}, style: {}, focused: false,
+        open: false, dataset: {}, style: {}, focused: false, listeners: {},
         classList: { add: (x) => classes.add(x), remove: (x) => classes.delete(x),
           contains: (x) => classes.has(x), toggle: (x, hide) => hide ? classes.add(x) : classes.delete(x) },
         focus() { this.focused = true; }, select() { this.selected = true; },
-        addEventListener() {}, querySelector: () => tbody,
+        addEventListener(type, callback) { this.listeners[type] = callback; }, querySelector: () => tbody,
       });
     }
     return elements.get(id);
   }
   let state = { public_url: "https://cloud.example.com", mode: "domain", fingerprint: "", warnings: [],
     address_ready: true, address_error: "",
-    shared: { set: true, hint: "tail" }, auto_register: false, sites: [] };
-  const calls = [], copies = [];
-  const context = vm.createContext({ $: element, t: (key) => key, atob, TextDecoder, URL,
+    shared: { set: true, hint: "tail" }, auto_register: false, sites: options.sites || [] };
+  let deletedSites = [], deletedCount = 0;
+  const catalogue = new Map(state.sites.map(x => [x.id, x]));
+  const calls = [], copies = [], translations = [];
+  const context = vm.createContext({ $: element, t: (key, values) => { translations.push({key, values}); return key; },
+    atob, TextDecoder, URL, curRole: options.role || "admin", curSite: null, curSiteData: null,
+    refresh: async () => {}, fmtFull: value => String(value),
     esc: (s) => String(s).replace(/[&<>"']/g, (x) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[x])),
-    api: async () => state,
+    api: async url => {
+      if (url === "/api/sites/deleted") return { sites: deletedSites };
+      if (options.connectResponse) return options.connectResponse(state);
+      if (options.failConnectReload && deletedCount) throw new Error("reload failed");
+      return state;
+    },
     send: async (method, url, body) => {
       calls.push({ method, url, body });
+      if (method === "DELETE") {
+        if (options.beforeDelete) await options.beforeDelete();
+        if (options.deleteError) return { ok: false, status: options.deleteStatus || 403 };
+        const id = decodeURIComponent(url.split("/").at(-1));
+        deletedSites.push({ ...catalogue.get(id), deleted_ts: 1800000000 });
+        state = { ...state, sites: state.sites.filter(x => x.id !== id) };
+        deletedCount++;
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
+      if (url.endsWith("/restore")) {
+        const id = decodeURIComponent(url.split("/").at(-2));
+        deletedSites = deletedSites.filter(x => x.id !== id);
+        state = { ...state, sites: [...state.sites, { ...catalogue.get(id), own_token: false, revoked: true, can_reveal: false }] };
+        return { ok: true, json: async () => ({ ok: true, requires_new_token: true }) };
+      }
+      if (url === "/api/connect/reveal" && options.beforeReveal) await options.beforeReveal();
+      if (url === "/api/connect/token" && body.action === "rotate" && options.beforeRotate) await options.beforeRotate();
+      if (url === "/api/connect/token" && body.action === "revoke") {
+        state = { ...state, sites: state.sites.map(x => x.id === body.target ? { ...x, own_token: false, revoked: true, can_reveal: false } : x) };
+        return { ok: true, json: async () => ({ ok: true, target: body.target }) };
+      }
       if (url === "/api/connect/settings") {
         state = { ...state, ...body, public_url: body.public_url.replace(/\/+$/, "") };
         return { ok: true, json: async () => state };
       }
+      const target = body.target || "st-test";
       const code = "AMC1-" + Buffer.from(JSON.stringify({ u: state.public_url, t: "secret-test-token",
-        s: "st-test", n: body.site_name || "北场 / 一期", y: body.site_type || "hydro" })).toString("base64url");
-      return { ok: true, json: async () => ({ target: "st-test", token: "secret-test-token", code,
+        s: target, n: body.site_name || "北场 / 一期", y: body.site_type || "hydro" })).toString("base64url");
+      return { ok: true, json: async () => ({ target, token: "secret-test-token", code,
         public_url: state.public_url, site_name: body.site_name || "北场 / 一期", site_type: body.site_type || "hydro",
         ...options.response }) };
     },
-    errText: async () => "request failed", confirm: () => true,
+    errText: async () => "request failed", confirm: () => options.confirm !== false,
     navigator: { clipboard: { writeText: async (value) => {
       if (options.clipboardBlocked) throw new Error("clipboard denied");
       copies.push(value);
@@ -57,12 +89,16 @@ function setup(options = {}) {
     setTimeout: () => 1, clearTimeout() {},
   });
   vm.runInContext(source, context, { filename: "web/app.js:onboarding" });
+  vm.runInContext(restoreSource, context, { filename: "web/app.js:restore" });
   element("connSiteName").value = "北场 / 一期";
   element("connSiteType").value = "hydro";
   element("connInstallOs").value = "linux";
   element("connPw").value = "password-for-test";
   context.renderConnect(state);
-  return { context, element, calls, copies, state: () => state };
+  return { context, element, calls, copies, translations, state: () => state,
+    clickRow: (act, id) => element("tblConnSites").listeners.click({ target: { closest: () => ({ disabled: false, dataset: { act, id } }) } }),
+    restore: id => element("deletedSitesList").listeners.click({ target: { closest: () => ({ disabled: false, dataset: { restoreSite: id } }) } }),
+  };
 }
 
 (async () => {
@@ -194,5 +230,115 @@ function setup(options = {}) {
   assert.equal(e.calls.length, 0, "unusable addresses never issue credentials");
   assert.equal(e.element("connMsg").textContent, "HTTPS is required");
   assert.equal(e.element("connAdvanced").open, true);
-  console.log("onboarding UI: one-copy packets, clipboard fallback, existing-site recopy, address validation and secret-free commands passed");
+
+  const oldSite = { id: "st-old", name: "test", type: "air", mode: "push", registered: false, own_token: true };
+  const newSite = { ...oldSite, id: "st-new" };
+  const revoked = { ...oldSite, own_token: false, revoked: true };
+  for (const entry of [oldSite, revoked, { ...oldSite, registered: true }, { ...oldSite, from_config: true }]) {
+    const h = setup({ sites: [entry, newSite, { ...oldSite, id: "st-pull", mode: "pull" }] });
+    const table = h.element("tblConnSites").querySelector("tbody").innerHTML;
+    assert.ok(table.includes('data-act="delete" data-id="st-old"'), "pending, revoked, registered and configured-token push sites can be deleted");
+    assert.ok(!table.includes('data-act="delete" data-id="st-pull"'), "pull sites keep config-file deletion semantics");
+    await h.context.connAction("reveal", "st-old");
+    h.element("connPw").value = "";
+    h.element("connUrl").value = "https://unsaved.example.com";
+    await h.clickRow("delete", "st-old");
+    assert.equal(h.calls.at(-1).method, "DELETE");
+    assert.equal(h.calls.at(-1).url, "/api/site/st-old");
+    assert.equal(h.calls.at(-1).body, undefined, "deletion uses the existing admin DELETE API, without copying credentials into its body");
+    const confirmation = h.translations.find(x => x.key === "conn.delete_confirm").values;
+    assert.equal(confirmation.name, "test"); assert.equal(confirmation.id, "st-old");
+    assert.equal(h.element("connCode").value, "");
+    assert.equal(h.element("connTok").value, "");
+    const after = h.element("tblConnSites").querySelector("tbody").innerHTML;
+    assert.ok(!after.includes('data-id="st-old"'));
+    assert.ok(after.includes('data-id="st-new"'), "same-name site with a different ID remains");
+    assert.equal(h.element("connMsg").textContent, "conn.deleted");
+    h.context.renderConnect({ ...h.state(), sites: [entry, newSite] });
+    assert.ok(!h.element("tblConnSites").querySelector("tbody").innerHTML.includes('data-id="st-old"'), "a stale response cannot reinsert the deleted row");
+    await h.restore("st-old");
+    const restored = h.element("tblConnSites").querySelector("tbody").innerHTML;
+    assert.ok(restored.includes('data-act="rotate" data-id="st-old"'));
+    assert.ok(!restored.includes('data-act="reveal" data-id="st-old"'));
+    assert.ok(restored.includes("conn.revoked_label"));
+    assert.equal(h.element("connMsg").textContent, "site.restored");
+    assert.equal(h.element("connCode").value, "", "restoration does not reveal or copy the old credential");
+  }
+  for (const options of [{ confirm: false }, { role: "viewer" }]) {
+    const h = setup({ ...options, sites: [oldSite] });
+    await h.clickRow("delete", "st-old");
+    assert.equal(h.calls.length, 0);
+    assert.ok(h.element("tblConnSites").querySelector("tbody").innerHTML.includes('data-id="st-old"'));
+  }
+  const denied = setup({ sites: [oldSite], deleteError: true });
+  await denied.context.connAction("reveal", "st-old");
+  const oldCode = denied.element("connCode").value;
+  await denied.clickRow("delete", "st-old");
+  assert.equal(denied.element("connCode").value, oldCode);
+  assert.ok(denied.element("tblConnSites").querySelector("tbody").innerHTML.includes('data-id="st-old"'));
+  assert.equal(denied.element("connMsg").textContent, "request failed");
+  const uncertain = setup({ sites: [oldSite], deleteError: true, deleteStatus: 503 });
+  await uncertain.context.connAction("reveal", "st-old");
+  await uncertain.clickRow("delete", "st-old");
+  assert.equal(uncertain.element("connCode").value, "", "server errors cannot leave a possibly revoked credential ready to copy");
+  assert.ok(uncertain.element("tblConnSites").querySelector("tbody").innerHTML.includes('data-id="st-old"'));
+  assert.equal(uncertain.element("connMsg").textContent, "request failed");
+
+  const unrelated = setup({ sites: [revoked, newSite] });
+  await unrelated.context.connAction("reveal", "st-new");
+  const newCode = unrelated.element("connCode").value;
+  await unrelated.clickRow("delete", "st-old");
+  assert.equal(unrelated.element("connCode").value, newCode, "deleting old test does not clear the different-ID new test's packet");
+  await unrelated.context.connAction("revoke", "st-new");
+  assert.equal(unrelated.element("connCode").value, "");
+  assert.ok(unrelated.element("tblConnSites").querySelector("tbody").innerHTML.includes('data-id="st-new"'), "revoking only the key retains the site row");
+  assert.equal(unrelated.element("connMsg").textContent, "conn.revoked");
+  const reload = setup({ sites: [oldSite], failConnectReload: true });
+  await reload.clickRow("delete", "st-old");
+  assert.equal(reload.element("connMsg").textContent, "conn.deleted_refresh_failed");
+  assert.ok(!reload.element("tblConnSites").querySelector("tbody").innerHTML.includes('data-id="st-old"'));
+
+  let releaseDelete;
+  const deleteGate = new Promise(resolve => { releaseDelete = resolve; });
+  const busy = setup({ sites: [oldSite], beforeDelete: () => deleteGate });
+  const deleting = busy.clickRow("delete", "st-old");
+  await busy.clickRow("delete", "st-old");
+  await busy.context.connAction("rotate", "st-old");
+  assert.equal(busy.calls.length, 1, "duplicate deletion and token rotation are blocked while deleting");
+  releaseDelete(); await deleting;
+
+  let releaseReveal;
+  const revealGate = new Promise(resolve => { releaseReveal = resolve; });
+  const late = setup({ sites: [oldSite], beforeReveal: () => revealGate });
+  const revealing = late.context.connAction("reveal", "st-old");
+  await late.clickRow("delete", "st-old");
+  releaseReveal(); await revealing;
+  assert.equal(late.copies.length, 0, "late credential responses cannot recopy a deleted site's code");
+  assert.equal(late.element("connCode").value, "");
+  assert.equal(late.element("connMsg").textContent, "conn.deleted");
+
+  let releaseRotate;
+  const rotateGate = new Promise(resolve => { releaseRotate = resolve; });
+  const rotate = setup({ sites: [oldSite], beforeRotate: () => rotateGate });
+  const rotating = rotate.context.connAction("rotate", "st-old");
+  await rotate.context.connAction("rotate", "st-old");
+  assert.equal(rotate.calls.length, 1, "double-clicking rotate cannot issue two different credentials");
+  releaseRotate(); await rotating;
+  assert.ok(rotate.element("connCode").value.startsWith("AMC1-"));
+
+  const external = setup({ sites: [oldSite] });
+  await external.clickRow("delete", "st-old");
+  external.state().sites.push({ ...revoked }); // another administrator explicitly restored this ID
+  await external.context.openConnect();
+  assert.ok(external.element("tblConnSites").querySelector("tbody").innerHTML.includes('data-act="rotate" data-id="st-old"'), "fresh authoritative reload shows an externally restored site");
+
+  let releaseOldList, listCount = 0;
+  const oldList = new Promise(resolve => { releaseOldList = resolve; });
+  const listing = setup({ sites: [oldSite], connectResponse: state => ++listCount === 1 ? oldList : state });
+  const loading = listing.context.loadConnect();
+  await listing.clickRow("delete", "st-old");
+  releaseOldList({ ...listing.state(), sites: [oldSite] }); await loading;
+  assert.ok(!listing.element("tblConnSites").querySelector("tbody").innerHTML.includes('data-id="st-old"'), "a list request started before deletion cannot reinsert the row");
+
+  console.log("onboarding UI: complete packets, pending/revoked deletion, restore/rebind, failures and concurrent requests passed");
 })().catch((e) => { console.error(e); process.exitCode = 1; });

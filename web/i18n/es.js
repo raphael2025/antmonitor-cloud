@@ -1,4 +1,10 @@
 I18N.register('es', {
+  "trend.partial": "Lecturas parciales",
+  "trend.partial_note": "Las lecturas parciales usan líneas discontinuas y puntos; no son totales completos.",
+  "trend.partial_tooltip": "Solo lecturas válidas, no el total completo del sitio.",
+  "trend.gap_note": "Los huecos indican falta de muestras válidas, no hashrate ni potencia cero.",
+  "trend.time_coverage": "Solo {seconds}/{total} segundos observados en este periodo; no se unen los intervalos sin datos.",
+  "trend.instant": "Solo lectura instantánea, aún sin duración observada. Se muestra como un punto.",
   "conn.delete_help": "Revocar el token detiene los informes, pero conserva el registro del sitio. Los sitios de prueba que ya no se usen se pueden eliminar. La eliminación invalida la información de conexión anterior y borra definitivamente el historial de este ID.",
   "conn.delete_confirm": "¿Eliminar el sitio «{name}»?\nID del sitio: {id}\n\nSe eliminará el registro de conexión, se desactivará la información de conexión anterior y se borrarán definitivamente el historial, los clientes y las alertas de este ID.\nNo afecta a otros ID con el mismo nombre. Puede restaurar el sitio en «Sitios eliminados» y generar nueva información de conexión. El historial eliminado no se puede recuperar.",
   "conn.deleted": "Sitio eliminado. La información de conexión anterior está desactivada.",

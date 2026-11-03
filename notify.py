@@ -27,6 +27,7 @@ import ipaddress
 import smtplib
 import socket
 import time
+from datetime import datetime, timezone
 from email.header import Header
 from email.mime.text import MIMEText
 from urllib.parse import urlsplit
@@ -36,6 +37,11 @@ import requests
 import db
 
 _TYPE_LABEL = {"air": "风冷", "hydro": "水冷", "mixed": "混合"}
+_NOTICE_GROUPS = (
+    frozenset(("unreachable", "stalled", "recovered")),
+    frozenset(("hashrate_drop", "hashrate_recovered")),
+    frozenset(("offline_count", "offline_recovered")),
+)
 
 
 class Notifier:
@@ -46,11 +52,16 @@ class Notifier:
         self.conn = conn
         self.enabled = bool(a.get("enabled", True))
         self.cooldown = int(a.get("cooldown", 1800))
+        # 规则关闭时暂停投递，但用最近启用的阈值确认旧事件是否结束，避免重开补发过期告警。
         self.drop_pct = float(a.get("hashrate_drop_pct", 30) or 0)
+        self.offline_threshold = int(a.get("offline_threshold", 0) or 0)
         self.prev = None          # site_id -> state(首轮只记不发，防重启风暴)
         self.active_drop = {}     # site_id -> 触发时基线(TH/s)
         self.active_offline = {}  # site_id -> True(掉线台数超阈值中，去抖动用)
         self.last_sent = {}       # (site_id, type) -> ts
+        # 仅当前事件的未送达通道。成功通道不重发；失败按 60s~15min 退避。
+        # 进程内队列，不把它当作重启后仍在的持久化消息服务。
+        self.pending = {}         # (site_id, type) -> {msg, remaining, attempts, due, created}
 
     def channels_on(self):
         return bool((self.cfg.get("telegram") or {}).get("enabled")
@@ -62,8 +73,10 @@ class Notifier:
         """sites: [{id,name,type,mode}]; site_state_fn(id, snap_ok, mode, now) -> state"""
         # enabled 现场读 self.cfg（不用 __init__ 时缓存的 self.enabled）：
         # 网页改配置是原地改同一个 dict，这样才能不重启立即生效。
-        if not (bool(self.cfg.get("enabled", True)) and self.channels_on()):
+        if self.prev is None and not (bool(self.cfg.get("enabled", True)) and self.channels_on()):
             return
+        # 开始值班后即使暂时关通知，也继续确认事件是否恢复/场地是否删除。
+        # 只暂停投递；未送达通道不能忘记，否则修好配置重开后原故障永远不会再通知。
         try:
             self._tick(sites, site_state_fn)
         except Exception as e:
@@ -75,9 +88,19 @@ class Notifier:
         cur = {}
         for s in sites:
             cur[s["id"]] = (site_state_fn(s["id"], last_ok.get(s["id"]), s["mode"], now), s)
+        # 删除场地后不能继续补发旧告警；也清理原事件与冷却，避免恢复同 ID 时串状态。
+        for table in (self.active_drop, self.active_offline):
+            for sid in list(table):
+                if sid not in cur:
+                    table.pop(sid, None)
+        for table in (self.pending, self.last_sent):
+            for key in list(table):
+                if key[0] not in cur:
+                    table.pop(key, None)
         if self.prev is None:                     # 进程刚启动：记状态不发通知
             self.prev = {k: v[0] for k, v in cur.items()}
             return
+        self.prev = {sid: state for sid, state in self.prev.items() if sid in cur}
         for sid, (state, s) in cur.items():
             old = self.prev.get(sid)
             if old is not None and state != old:
@@ -85,15 +108,20 @@ class Notifier:
             self.prev[sid] = state
         drop_pct = float(self.cfg.get("hashrate_drop_pct", 30) or 0)   # 现场读，见 tick() 注释
         if drop_pct > 0:
+            self.drop_pct = drop_pct
+        if self.drop_pct > 0:
             for sid, (state, s) in cur.items():
                 if state in ("ok", "alert") and db.snapshot_quality(last_ok.get(sid) or {}, now,
                         int(self.poll.get("stalled_after_s", 1200)))["hashrate_ths"]:
                     self._check_drop(sid, s, now)
         offline_threshold = int(self.cfg.get("offline_threshold", 0) or 0)   # 现场读
         if offline_threshold > 0:
+            self.offline_threshold = offline_threshold
+        if self.offline_threshold > 0:
             for sid, (state, s) in cur.items():
                 if state in ("ok", "alert"):
                     self._check_offline(sid, s, last_ok.get(sid), now)
+        self._retry_pending(cur, last_ok, now)
 
     # ---- 状态跳变 ----
     def _on_transition(self, sid, s, old, new, snap, now):
@@ -115,9 +143,12 @@ class Notifier:
 
     # ---- 算力骤降 ----
     def _check_drop(self, sid, s, now):
-        drop_pct = float(self.cfg.get("hashrate_drop_pct", 30) or 0)   # 现场读，见 tick() 注释
+        drop_pct = float(self.cfg.get("hashrate_drop_pct", 30) or 0) or self.drop_pct
         stalled_after = int(self.poll.get("stalled_after_s", 1200))
-        base = db.avg_hashrate(self.conn, sid, now - 5400, now - 2700, stalled_after)   # 45~90分钟前
+        # 已触发事件固定使用原基线。持续低算力会逐渐拉低滚动基线，不能据此报“恢复”。
+        base = self.active_drop.get(sid)
+        if base is None:
+            base = db.avg_hashrate(self.conn, sid, now - 5400, now - 2700, stalled_after)
         curr = db.avg_hashrate(self.conn, sid, now - 600, now, stalled_after)           # 最近10分钟
         if base is None or curr is None or base < 1:
             return
@@ -137,7 +168,7 @@ class Notifier:
     def _check_offline(self, sid, s, snap, now):
         if not snap:
             return
-        threshold = int(self.cfg.get("offline_threshold", 0) or 0)   # 现场读，见 tick() 注释
+        threshold = int(self.cfg.get("offline_threshold", 0) or 0) or self.offline_threshold
         if threshold <= 0:
             return
         quality = db.snapshot_quality(snap, now, int(self.poll.get("stalled_after_s", 1200)))
@@ -156,33 +187,114 @@ class Notifier:
             self._send(sid, "offline_recovered",
                        f"✅ 掉线恢复: {label} 掉线降至 {offline}/{total} 台", recovery=True)
 
-    # ---- 发送 ----
+    # ---- 发送与失败补发 ----
+    def _channels(self, include_paused=False):
+        """可用配置；暂停通道仅供记录投递意向，实际发送仍要求 enabled。"""
+        channels = {}
+        tg = self.cfg.get("telegram") or {}
+        if (include_paused or tg.get("enabled")) and tg.get("bot_token") and tg.get("chat_id"):
+            channels["telegram"] = (tg, _send_telegram)
+        wh = self.cfg.get("webhook") or {}
+        if (include_paused or wh.get("enabled")) and wh.get("url"):
+            channels["webhook"] = (wh, _send_webhook)
+        em = self.cfg.get("email") or {}
+        if (include_paused or em.get("enabled")) and em.get("smtp_host"):
+            channels["email"] = (em, _send_email)
+        return channels
+
     def _send(self, sid, ntype, msg, recovery=False):
         now = int(time.time())
-        cooldown = int(self.cfg.get("cooldown", 1800) or 0)   # 现场读，见 tick() 注释
-        if not recovery:
-            last = self.last_sent.get((sid, ntype), 0)
-            if now - last < cooldown:
-                return
-            self.last_sent[(sid, ntype)] = now
-        ok = False
-        tg = self.cfg.get("telegram") or {}
-        if tg.get("enabled") and tg.get("bot_token") and tg.get("chat_id"):
-            ok = _send_telegram(tg, msg) or ok
-        wh = self.cfg.get("webhook") or {}
-        if wh.get("enabled") and wh.get("url"):
-            ok = _send_webhook(wh, msg) or ok
-        em = self.cfg.get("email") or {}
-        if em.get("enabled") and em.get("smtp_host"):
-            ok = _send_email(em, msg) or ok
-        try:
-            db.notify_log_add(self.conn, now, sid, ntype, msg, ok)
-        except Exception:
-            pass
-        try:   # GBK 控制台打不出 emoji 也不能影响告警流程(日志已入库)
-            print(f"[notify] {'OK' if ok else 'FAIL'} {msg}")
-        except Exception:
-            pass
+        key = (sid, ntype)
+        group = next((g for g in _NOTICE_GROUPS if ntype in g), (ntype,))
+        for old in list(self.pending):
+            if old[0] == sid and old[1] in group and old != key:
+                self.pending.pop(old, None)  # 状态已反转，不补发相反的旧消息。
+        if key in self.pending:
+            return
+        # 全部通道暂停期间也可能“恢复后又故障”；保存最新事件，否则 prev 已前移，
+        # 重开通道后仍没有新的跳变可触发。没有配置过任何接收端时才无需排队。
+        channels = self._channels() or self._channels(include_paused=True)
+        if not channels:
+            return
+        cooldown = int(self.cfg.get("cooldown", 1800) or 0)
+        due = now
+        if not recovery and key in self.last_sent:
+            due = max(due, self.last_sent[key] + cooldown)
+        self.pending[key] = {"msg": msg, "remaining": set(channels), "attempts": 0,
+                             "due": due, "created": now}
+        self._attempt_pending(key, now)
+
+    def _attempt_pending(self, key, now):
+        notice = self.pending.get(key)
+        if notice is None or now < notice["due"]:
+            return
+        if not self.cfg.get("enabled", True):
+            return
+        if key[1] in _NOTICE_GROUPS[1] and not float(self.cfg.get("hashrate_drop_pct", 30) or 0):
+            return
+        if key[1] in _NOTICE_GROUPS[2] and not int(self.cfg.get("offline_threshold", 0) or 0):
+            return
+        channels = self._channels()
+        ready = notice["remaining"].intersection(channels)
+        if not ready:
+            return  # 通道关闭只暂停，不丢失失败状态，也不占用成功冷却。
+        msg = notice["msg"]
+        if now > notice["created"]:
+            created = datetime.fromtimestamp(notice["created"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            msg = f"⏳ 补发通知（事件时间 {created}）\n{msg}"
+        for channel in sorted(ready):
+            cfg, sender = channels[channel]
+            try:
+                ok = bool(sender(cfg, msg))
+            except Exception:
+                ok = False  # 不打印可能带 URL/token 的异常；其它通道继续尝试。
+            if ok:
+                notice["remaining"].remove(channel)
+            logged = f"[{channel}] {msg}"
+            try:
+                db.notify_log_add(self.conn, now, key[0], key[1], logged, ok)
+            except Exception:
+                pass
+            try:   # GBK 控制台打不出 emoji 也不能影响补发状态。
+                print(f"[notify] {'OK' if ok else 'FAIL'} {logged}")
+            except Exception:
+                pass
+        if not notice["remaining"]:
+            self.last_sent[key] = now
+            self.pending.pop(key, None)
+        else:
+            notice["attempts"] = min(notice["attempts"] + 1, 5)
+            notice["due"] = now + min(900, 60 * 2 ** (notice["attempts"] - 1))
+
+    def _retry_pending(self, cur, last_ok, now):
+        for key in list(self.pending):
+            sid, ntype = key
+            if sid not in cur:
+                self.pending.pop(key, None)
+                continue
+            state = cur[sid][0]
+            if ntype in _NOTICE_GROUPS[0]:
+                current = state if state in ("unreachable", "stalled") else "recovered"
+                if state == "pending" or ntype != current:
+                    self.pending.pop(key, None)
+                    continue
+            else:
+                is_drop = ntype in _NOTICE_GROUPS[1]
+                setting = "hashrate_drop_pct" if is_drop else "offline_threshold"
+                if float(self.cfg.get(setting, 30 if is_drop else 0) or 0) <= 0:
+                    continue
+                # 缺测/失联不是恢复：保留当前故障，但没有新证据时暂停补发测量类消息。
+                if state not in ("ok", "alert"):
+                    continue
+                quality = db.snapshot_quality(last_ok.get(sid) or {}, now,
+                                              int(self.poll.get("stalled_after_s", 1200)))
+                if not (quality["hashrate_ths"] if is_drop else quality["online"] and quality["total"]):
+                    continue
+                active = sid in (self.active_drop if is_drop else self.active_offline)
+                if active != (ntype in ("hashrate_drop", "offline_count")):
+                    self.pending.pop(key, None)
+                    continue
+            self._attempt_pending(key, now)
 
     # ---- 测试通知(管理面板"发送测试通知"按钮) ----
     def send_test(self, msg):
@@ -288,7 +400,10 @@ def _send_telegram(tg, msg):
     try:
         r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                           json={"chat_id": tg["chat_id"], "text": msg}, timeout=10)
-        return r.ok
+        if not 200 <= r.status_code < 300:
+            return False
+        result = r.json()
+        return isinstance(result, dict) and result.get("ok") is True
     except Exception as e:
         print(f"[notify] telegram 发送失败: {_redact(e, token)}")
         return False
@@ -314,7 +429,14 @@ def _send_webhook(wh, msg):
                 return False
         # 不跟随重定向：防止公网地址 302 到内网绕过上面的检查
         r = requests.post(url, json=payload, timeout=10, allow_redirects=False)
-        return r.ok
+        if not 200 <= r.status_code < 300:
+            return False
+        if kind not in ("wecom", "dingtalk"):
+            return True   # 自定义接收端只约定 HTTP 2xx，不强加厂商 JSON 协议。
+        result = r.json()
+        # 企业微信/钉钉会用 HTTP 200 返回业务失败，HTTP 可达不能冒充消息已接收。
+        code = result.get("errcode") if isinstance(result, dict) else None
+        return isinstance(code, int) and not isinstance(code, bool) and code == 0
     except Exception as e:
         print(f"[notify] webhook 发送失败: {_redact(e, url, _url_tail(url))}")
         return False

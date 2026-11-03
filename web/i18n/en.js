@@ -1,4 +1,10 @@
 I18N.register('en', {
+  "trend.partial": "Partial readings",
+  "trend.partial_note": "Partial readings use dashed lines and dots; they are not complete totals.",
+  "trend.partial_tooltip": "Valid readings only, not the complete site total.",
+  "trend.gap_note": "Gaps mean missing valid samples, not zero hashrate or power.",
+  "trend.time_coverage": "Only {seconds}/{total} seconds observed in this period; missing time is not connected.",
+  "trend.instant": "Instantaneous reading only; no observed duration yet. Shown as a dot.",
   "conn.delete_help": "Revoking a token stops reports but keeps the site record. Unused test sites can be deleted. Deleting invalidates the old connection information and permanently removes this ID’s history.",
   "conn.delete_confirm": "Delete site “{name}”?\nSite ID: {id}\n\nThis removes the connection record, disables old connection information and permanently deletes this ID’s history, customers and alerts.\nOther IDs with the same name are unaffected. You can restore the site under Deleted sites, then generate new connection information. Deleted history cannot be recovered.",
   "conn.deleted": "Site deleted. Old connection information is disabled.",

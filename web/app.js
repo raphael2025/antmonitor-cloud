@@ -150,6 +150,72 @@ function withGaps(pts) {
   }
   return out;
 }
+
+function trendSeries(label, color, full, partial = [], legacy = [], div = 1) {
+  const data = withGaps(AntDataQuality.points(full, 0, 1, div));
+  const datasets = [{ label, borderColor: color, backgroundColor: color, data,
+    pointRadius: c => c.raw?.y != null && data[c.dataIndex - 1]?.y == null &&
+      data[c.dataIndex + 1]?.y == null ? 2 : 0 }];
+  const byTime = new Map(partial.map(p => [num(p.ts), p]));
+  const observed = data.map(p => {
+    const part = byTime.get(p.x), value = num(part?.value);
+    return p.y == null && value != null
+      ? { x: p.x, y: value / div, partial: true, coverage: part.coverage }
+      : { ...p, partial: false };
+  });
+  datasets[0].trendHasGap = observed.some(p => p.y == null || p.partial && p.coverage?.continuous !== true);
+  if (observed.some(p => p.partial)) datasets.push({
+    label: label + " · " + t("trend.partial"), trendPartial: true,
+    borderColor: color, backgroundColor: color, borderDash: [5, 4],
+    fill: false, tension: 0, data: observed,
+    pointRadius: c => c.raw?.partial ? 2 : 0,
+    pointHoverRadius: c => c.raw?.partial ? 4 : 0,
+    segment: { borderColor: c => {
+      const a = observed[c.p0DataIndex], b = observed[c.p1DataIndex];
+      if (!a?.partial && !b?.partial) return "transparent";
+      // A bucket with missing time is a visible isolated reading, never a
+      // line through its unknown periods. Complete neighbors only anchor
+      // continuously observed, machine-partial readings.
+      if ((a?.partial && a.coverage?.continuous !== true) ||
+          (b?.partial && b.coverage?.continuous !== true)) return "transparent";
+      return color;
+    } },
+  });
+  if (legacy.some(p => num(p[1]) != null)) datasets.push({
+    label: label + " · " + t("quality.legacy"), borderColor: "#8b949e",
+    backgroundColor: "#8b949e", borderDash: [5, 4],
+    data: withGaps(AntDataQuality.points(legacy, 0, 1, div)),
+  });
+  return datasets;
+}
+
+function trendCoverage(point) {
+  const c = point.coverage || {}, notes = [];
+  const counts = [c.known_min, c.known_max, c.total_min, c.total_max].map(num);
+  if (counts.every(n => n != null && Number.isInteger(n)) &&
+      counts[0] <= counts[1] && counts[2] <= counts[3]) {
+    const range = (a, b) => a === b ? a : a + "–" + b;
+    notes.push(t("quality.counted_machines", {
+      known: range(counts[0], counts[1]), total: range(counts[2], counts[3]),
+    }));
+  }
+  notes.push(t("trend.partial_tooltip"));
+  if (c.continuous !== true) {
+    notes.push(num(c.seconds) > 0 && num(c.window_seconds) > 0
+      ? t("trend.time_coverage", { seconds: c.seconds, total: c.window_seconds })
+      : t("trend.instant"));
+  }
+  return notes;
+}
+
+function trendNotice(id, datasets) {
+  const partial = datasets.filter(d => d.trendPartial);
+  const hasPartial = partial.some(d => d.data.some(p => p.partial));
+  const hasGap = datasets.some(d => d.trendHasGap);
+  const note = $(id);
+  note.textContent = [hasPartial ? t("trend.partial_note") : "", hasGap ? t("trend.gap_note") : ""].filter(Boolean).join(" ");
+  note.classList.toggle("hidden", !note.textContent);
+}
 const endLabels = {  // 多序列时在线尾直接标注场地名(文字用墨色，线端色块即身份)
   id: "endLabels",
   afterDatasetsDraw(chart) {
@@ -157,6 +223,7 @@ const endLabels = {  // 多序列时在线尾直接标注场地名(文字用墨�
     const ctx = chart.ctx;
     ctx.save(); ctx.font = "11px sans-serif"; ctx.textBaseline = "middle"; ctx.fillStyle = INK.label;
     chart.data.datasets.forEach((ds, i) => {
+      if (ds.trendPartial) return;
       const meta = chart.getDatasetMeta(i);
       if (meta.hidden || !meta.data.length) return;
       let index = ds.data.length - 1;
@@ -185,9 +252,11 @@ function mkLine(canvasId, datasets, { hours, yUnit, padRight }) {
       plugins: {
         legend: { display: datasets.length > 1, labels: { color: INK.label, boxWidth: 12, boxHeight: 12 } },
         tooltip: {
+          filter: item => !item.dataset.trendPartial || item.raw?.partial === true,
           callbacks: {
             title: (items) => items.length ? fmtFull(items[0].parsed.x) : "",
             label: (item) => ` ${item.dataset.label}: ${item.parsed.y == null ? "—" : Number(item.parsed.y).toLocaleString(undefined, { maximumFractionDigits: 1 })} ${yUnit || ""}`,
+            afterLabel: item => item.dataset.trendPartial ? trendCoverage(item.raw) : [],
           },
         },
       },
@@ -205,16 +274,14 @@ function mkLine(canvasId, datasets, { hours, yUnit, padRight }) {
 async function loadTrend() {
   const hours = Number($("trendRange").value);
   const d = await api(`/api/trend?hours=${hours}`);
-  const maxTh = Math.max(1, ...d.sites.flatMap((s) => [...s.points, ...(s.legacy_points || [])].map(p => num(p[1]) || 0)));
+  const maxTh = Math.max(1, ...d.sites.flatMap(s => [
+    ...[...s.points, ...(s.legacy_points || [])].map(p => num(p[1]) || 0),
+    ...(s.partial_points || []).map(p => num(p.value) || 0),
+  ]));
   const u = hashUnit(maxTh);
-  const datasets = d.sites.flatMap((s, i) => {
-    const base = { label: s.name, borderColor: SERIES[i % SERIES.length], backgroundColor: SERIES[i % SERIES.length],
-      data: withGaps(AntDataQuality.points(s.points, 0, 1, u.div)) };
-    const old = s.legacy_points || [];
-    return old.some(p => num(p[1]) != null) ? [base, { ...base,
-      label: s.name + " · " + t("quality.legacy"), borderDash: [5, 4],
-      data: withGaps(AntDataQuality.points(old, 0, 1, u.div)) }] : [base];
-  });
+  const datasets = d.sites.flatMap((s, i) => trendSeries(s.name, SERIES[i % SERIES.length],
+    s.points, s.partial_points || [], s.legacy_points || [], u.div));
+  trendNotice("trendQuality", datasets);
   mkLine("trendChart", datasets, { hours, yUnit: u.unit + "/s", padRight: 70 });
 }
 $("trendRange").onchange = () => {
@@ -518,18 +585,20 @@ async function loadSite() {
   renderSiteAlerts(d.alert_summary);
 
   const tr = d.trend;
-  const maxTh = Math.max(1, ...tr.flatMap(p => [num(p.hashrate_ths) || 0, num(p.legacy_hashrate_ths) || 0]));
+  const maxTh = Math.max(1, ...tr.flatMap(p => [num(p.hashrate_ths) || 0,
+    num(p.partial_hashrate_ths) || 0, num(p.legacy_hashrate_ths) || 0]));
   const u = hashUnit(maxTh);
-  const series = (key, label, color, div = 1) => {
-    const base = { label: t(label), borderColor: color, backgroundColor: color,
-      data: withGaps(AntDataQuality.points(tr, "ts", key, div)) };
-    return tr.some(p => num(p["legacy_" + key]) != null) ? [base, { ...base,
-      label: t("quality.legacy"), borderDash: [5, 4],
-      data: withGaps(AntDataQuality.points(tr, "ts", "legacy_" + key, div)) }] : [base];
-  };
-  mkLine("chHr", series("hashrate_ths", "chart.hashrate", METRIC.hashrate, u.div), { hours, yUnit: u.unit + "/s" });
+  const series = (key, label, color, div = 1) => trendSeries(t(label), color,
+    tr.map(p => [p.ts, p[key]]),
+    tr.filter(p => num(p["partial_" + key]) != null).map(p => ({ ts: p.ts,
+      value: p["partial_" + key], coverage: p[(key === "hashrate_ths" ? "hashrate" : "power") + "_coverage"] })),
+    tr.map(p => [p.ts, p["legacy_" + key]]), div);
+  const hashrateSeries = series("hashrate_ths", "chart.hashrate", METRIC.hashrate, u.div);
+  const powerSeries = series("power_kw", "chart.power", METRIC.power);
+  trendNotice("siteTrendQuality", [...hashrateSeries, ...powerSeries]);
+  mkLine("chHr", hashrateSeries, { hours, yUnit: u.unit + "/s" });
   mkLine("chOnline", series("online", "chart.online", METRIC.online), { hours, yUnit: t("chart.unit_machines") });
-  mkLine("chPower", series("power_kw", "chart.power", METRIC.power), { hours, yUnit: "kW" });
+  mkLine("chPower", powerSeries, { hours, yUnit: "kW" });
 
   renderSiteCustomers(d.customers);
 

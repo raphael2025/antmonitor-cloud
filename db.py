@@ -379,7 +379,7 @@ def _observation_intervals(conn, begin, end, site_id=None, stalled_after=1200):
 
 
 def trend(conn, site_id, hours=24, points=288, stalled_after=1200):
-    """按真实观测秒数降采样，未知/失败区间为 null，不能画成零算力。"""
+    """按真实观测秒数降采样；部分实测与完整总量分开，缺口不补成连续观测。"""
     hours = max(1, min(int(hours), 24 * 90))
     points = max(24, min(int(points), 2000))
     bucket = max(60, int(hours * 3600 / points))
@@ -387,7 +387,10 @@ def trend(conn, site_id, hours=24, points=288, stalled_after=1200):
     begin = now - hours * 3600
     keys = ("online", "total", "hashrate_ths", "power_kw", "active_alerts")
     bins = {}
+    measured_keys = {"hashrate_ths": "hashrate", "power_kw": "power"}
+    observed_bins = {}
     for row, left, right, quality in _observation_intervals(conn, begin, now, site_id, stalled_after):
+        observed = snapshot_observed(row, row["ts"], stalled_after)
         while left <= right:
             stamp = left // bucket * bucket
             stop = min(right, stamp + bucket)
@@ -409,6 +412,31 @@ def trend(conn, site_id, hours=24, points=288, stalled_after=1200):
                     legacy[1] += stop - left
                     if stop > left or row["ts"] == left:
                         legacy[2] = value
+            if stop > left or row["ts"] == left:
+                for key, prefix in measured_keys.items():
+                    stat = observed_bins.setdefault(stamp, {}).setdefault(key, {
+                        "integral": 0.0, "seconds": 0, "instant": None,
+                        "all_complete": True, "missing": False, "counts_known": True,
+                        "known_min": None, "known_max": None,
+                        "total_min": None, "total_max": None})
+                    value = validate.measurement(observed.get(key))
+                    stat["all_complete"] = stat["all_complete"] and quality[key]
+                    if value is None:
+                        stat["missing"] = True
+                        continue
+                    stat["integral"] += value * (stop - left)
+                    stat["seconds"] += stop - left
+                    stat["instant"] = value
+                    total = validate.measurement(row.get("total"), int)
+                    known = validate.measurement(row.get(prefix + "_known_machines"), int)
+                    if known is None and quality[key]:
+                        known = total  # A verified complete total covers the entire inventory.
+                    valid_counts = known is not None and total is not None and known <= total
+                    stat["counts_known"] = stat["counts_known"] and valid_counts
+                    if valid_counts:
+                        for name, count in (("known", known), ("total", total)):
+                            stat[name + "_min"] = min(stat[name + "_min"], count) if stat[name + "_min"] is not None else count
+                            stat[name + "_max"] = max(stat[name + "_max"], count) if stat[name + "_max"] is not None else count
             if stop >= right:
                 break
             left = stop
@@ -420,6 +448,28 @@ def trend(conn, site_id, hours=24, points=288, stalled_after=1200):
         point = {"ts": stamp}
         for key, (integral, duration, instant) in slot.items():
             point[key] = round(integral / duration, 1) if duration else instant
+        # Clip edge buckets to the requested interval. A point sampled exactly
+        # at `now` is still useful, but proves no continuous duration yet.
+        window_seconds = max(0, min(now, stamp + bucket) - max(begin, stamp))
+        for key, prefix in measured_keys.items():
+            stat = observed_bins.get(stamp, {}).get(key)
+            seconds = stat["seconds"] if stat else 0
+            continuous = bool(stat and window_seconds > 0 and not stat["missing"]
+                              and seconds >= window_seconds)
+            complete = bool(continuous and stat["all_complete"])
+            point["partial_" + key] = None
+            point[prefix + "_coverage"] = {
+                **{name: stat[name] if stat and stat["counts_known"] else None
+                   for name in ("known_min", "known_max", "total_min", "total_max")},
+                "seconds": seconds, "window_seconds": window_seconds, "continuous": continuous}
+            if not complete:
+                # Averaging just the complete fragments of a mixed bucket must
+                # not conceal missing miners or periods. Daily billing still
+                # uses the unchanged raw observation intervals independently.
+                point[key] = None
+                if stat:
+                    point["partial_" + key] = (round(stat["integral"] / seconds, 1)
+                                               if seconds else stat["instant"])
         result.append(point)
     return result
 

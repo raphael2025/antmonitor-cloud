@@ -1,4 +1,10 @@
 I18N.register('zh', {
+  "trend.partial": "部分实测",
+  "trend.partial_note": "部分实测以虚线和圆点标示，不是完整总量。",
+  "trend.partial_tooltip": "仅展示有效读数，不是完整场地总量。",
+  "trend.gap_note": "空档表示缺少有效采样，不代表算力或功率为零。",
+  "trend.time_coverage": "本时段仅有 {seconds}/{total} 秒有效数据；缺测时段不连线。",
+  "trend.instant": "仅有瞬时读数，尚无持续时段；仅显示点。",
   "conn.delete_help": "撤销密钥会停止上报并保留场地记录；不用的测试场地可以直接删除。删除会使旧接入信息失效，并永久删除该 ID 的历史数据。",
   "conn.delete_confirm": "删除场地「{name}」？\n场地 ID：{id}\n\n将移除此接入记录、停用旧接入信息，并永久删除该 ID 的历史、客户及告警数据。\n同名但不同 ID 的场地不受影响。误删后可在「已删除场地」恢复，再生成新的接入信息；已删除的历史无法恢复。",
   "conn.deleted": "场地已删除，旧接入信息已停用。",

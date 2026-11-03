@@ -319,6 +319,9 @@ def _trend_payload(hours, points):
                        stalled_after=int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
         out.append({"id": s["id"], "name": s["name"], "type": s.get("type", "air"),
                     "points": [[p["ts"], p["hashrate_ths"]] for p in pts],
+                    "partial_points": [{"ts": p["ts"], "value": p["partial_hashrate_ths"],
+                                        "coverage": p["hashrate_coverage"]} for p in pts
+                                       if p["partial_hashrate_ths"] is not None],
                     "legacy_points": [[p["ts"], p.get("legacy_hashrate_ths")] for p in pts]})
     return {"ok": True, "ts": int(time.time()), "hours": hours, "sites": out}
 

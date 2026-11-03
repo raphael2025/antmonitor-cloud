@@ -1,4 +1,10 @@
 I18N.register('de', {
+  "trend.partial": "Teilweise Messwerte",
+  "trend.partial_note": "Teilweise Messwerte erscheinen als gestrichelte Linien und Punkte, nicht als vollständige Summen.",
+  "trend.partial_tooltip": "Nur gültige Messwerte, nicht die vollständige Standortsumme.",
+  "trend.gap_note": "Lücken bedeuten fehlende gültige Messwerte, nicht null Hashrate oder Leistung.",
+  "trend.time_coverage": "Nur {seconds}/{total} Sekunden in diesem Zeitraum beobachtet; Lücken werden nicht verbunden.",
+  "trend.instant": "Nur ein Momentanwert, noch keine beobachtete Dauer. Darstellung als Punkt.",
   "conn.delete_help": "Das Widerrufen eines Tokens stoppt Meldungen, behält aber den Standorteintrag. Nicht mehr benötigte Teststandorte können gelöscht werden. Beim Löschen werden alte Verbindungsdaten ungültig und die Historie dieser ID dauerhaft entfernt.",
   "conn.delete_confirm": "Standort „{name}“ löschen?\nStandort-ID: {id}\n\nDer Verbindungseintrag wird entfernt, alte Verbindungsdaten werden deaktiviert und Historie, Kunden sowie Alarme dieser ID dauerhaft gelöscht.\nAndere IDs mit gleichem Namen bleiben unberührt. Unter „Gelöschte Standorte“ können Sie den Standort wiederherstellen und danach neue Verbindungsdaten erstellen. Gelöschte Historie lässt sich nicht wiederherstellen.",
   "conn.deleted": "Standort gelöscht. Alte Verbindungsdaten sind deaktiviert.",

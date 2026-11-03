@@ -17,6 +17,29 @@ for (const lang of ["zh", "en", "ru", "es", "de", "ar"])
     {I18N:{register:(name,values)=>{dicts[name]=values;}}});
 const t = (key,args={}) => (dicts.zh[key] || key).replace(/\{(\w+)\}/g,(_,k)=>args[k] ?? "");
 const format = n => n + " kWh";
+
+// Exercise the shipped Chart.js parser and segment resolver. Only canvas
+// drawing is inert; line gaps, skip flags and scriptable styles are real.
+function realTrendChart(config) {
+  const ActualChart = require("../web/vendor/chart.umd.min.js");
+  const plain = value => Array.isArray(value) ? Array.from(value, plain) :
+    value && typeof value === "object" ? Object.fromEntries(
+      Object.entries(value).map(([key,item])=>[key,plain(item)])) : value;
+  config = plain(config);  // Normalize VM option objects while keeping callbacks.
+  const canvas = {width:800, height:300};
+  const context = new Proxy({canvas, measureText:s=>({width:String(s).length*7}), getLineDash:()=>[]}, {
+    get:(target,key)=>key in target ? target[key] : ()=>{},
+    set:(target,key,value)=>(target[key]=value,true)
+  });
+  canvas.getContext=()=>context;
+  return new ActualChart(canvas, {...config, options:{...config.options, responsive:false,
+    plugins:{...config.options.plugins, legend:{display:false}, tooltip:{enabled:false}}}});
+}
+
+const coverage = (known=538, total=539, seconds=300, window=300) => ({
+  known_min:known, known_max:known, total_min:total, total_max:total,
+  seconds, window_seconds:window, continuous:window>0 && seconds===window,
+});
 const observed = {billing_method:"time_weighted_v2",billing_source:"observed",billing_hours:24,
   power_kwh:3, power_observed_hours:1,power_coverage_pct:100/24,
   delivered_th_h:293,delivery_observed_hours:1,delivery_coverage_pct:100/24,
@@ -90,7 +113,7 @@ test("partial totals and plotting never manufacture measured zero",()=>{
 test("all six locales cover quality and unit statements and preserve placeholders",()=>{
   const powerKeys = ["card.power", "th.power", "worker.kwh", "worker.hint", "miner.detail_hr",
     "seg.stat", "cbox.power_detail", "cbox.detail_power", "kpi.power", "chart.power", "th.kwh", "th.kwh24"];
-  const keys=Object.keys(dicts.zh).filter(k=>k.startsWith("quality.") || k.startsWith("power.") ||
+  const keys=Object.keys(dicts.zh).filter(k=>k.startsWith("quality.") || k.startsWith("power.") || k.startsWith("trend.") ||
     powerKeys.includes(k) || k==="kind.inventory");
   for (const [lang,values] of Object.entries(dicts)) for (const key of keys){
     assert.ok(values[key],lang+": "+key);
@@ -299,4 +322,139 @@ test("available zero power is a number and absent power stays unknown",()=>{
   const cell=q.total(packet,"power_kw",t,n=>n+" kW");
   assert.match(cell,/rate-value">—/);
   assert.doesNotMatch(cell,/0 kW|部分读数/);
+});
+
+test("partial trend segments retain site colors and show actual machine coverage",async()=>{
+  const h=setup();
+  h.respond({sites:[{name:"A",points:[[1000,161700],[1300,null],[1600,161600],[1900,161700]],
+    partial_points:[{ts:1300,value:161400,coverage:coverage()}]},
+    {name:"B",points:[[1000,401000],[1300,402000],[1600,401500],[1900,402000]]}]});
+  await h.ctx.loadTrend();
+  const c=h.configs.trendChart, [full,part,other]=c.data.datasets;
+  assert.equal(part.trendPartial,true);
+  assert.equal(part.borderColor,full.borderColor);
+  assert.notEqual(other.borderColor,full.borderColor);
+  assert.equal(part.data[1].y,161.4);
+  assert.equal(full.data[1].y,null);
+  assert.equal(part.fill,false);
+  assert.equal(c.options.spanGaps,false);
+  const tooltip=c.options.plugins.tooltip;
+  const item={dataset:part,raw:part.data[1],parsed:{y:161.4}};
+  assert.match(tooltip.callbacks.label(item),/部分实测: 161.4 PH\/s/);
+  assert.match(tooltip.callbacks.afterLabel(item).join("\n"),/已统计 538\/539 台/);
+  assert.match(tooltip.callbacks.afterLabel(item).join("\n"),/不是完整场地总量/);
+  assert.equal(tooltip.filter(item),true);
+  assert.equal(tooltip.filter({dataset:part,raw:part.data[0]}),false);
+  assert.match(h.el("trendQuality").textContent,/虚线和圆点/);
+  assert.doesNotMatch(h.el("trendQuality").textContent,/空档/);
+  const chart=realTrendChart(c);
+  try {
+    const base=chart.getDatasetMeta(0), partial=chart.getDatasetMeta(1);
+    assert.equal(base.data[1].skip,true);
+    assert.equal(partial.data[1].skip,false);
+    assert.equal(partial.data[1].options.radius,2);
+    assert.equal(partial.data[0].options.radius,0);
+    assert.deepEqual(partial.dataset.segments.filter(s=>s.style.borderColor!=="transparent")
+      .map(s=>[s.start,s.end]),[[0,2]]);
+    assert.deepEqual([...partial.dataset.options.borderDash],[5,4]);
+    assert.equal(partial.dataset.segments[0].style.borderColor,full.borderColor);
+    assert.ok(partial.dataset.segments.some(s=>s.start===2&&s.end===3&&s.style.borderColor==="transparent"));
+  } finally {chart.destroy();}
+  h.respond({sites:[{name:"A",points:[[2000,161700],[2300,161600]]}]});
+  await h.ctx.loadTrend();
+  assert.equal(h.configs.trendChart.data.datasets.length,1);
+  assert.equal(h.el("trendQuality").textContent,"");
+  assert.equal(h.el("trendQuality").classList.contains("hidden"),true);
+});
+
+test("a time-partial bucket is an isolated point and true nulls break both lines",async()=>{
+  const h=setup();
+  h.respond({sites:[{name:"A",points:[[1000,161700],[1300,null],[1600,161600],
+    [1900,null],[2200,161700],[2500,null],[2800,null]],partial_points:[
+      {ts:1300,value:161400,coverage:coverage(539,539,180,300)},
+      {ts:1900,value:161300,coverage:coverage()},
+      {ts:2800,value:161500,coverage:coverage()},
+    ]}]});
+  await h.ctx.loadTrend();
+  const c=h.configs.trendChart, part=c.data.datasets[1];
+  const note=c.options.plugins.tooltip.callbacks.afterLabel({dataset:part,raw:part.data[1]}).join("\n");
+  assert.match(note,/180\/300 秒有效数据/);
+  assert.match(note,/缺测时段不连线/);
+  assert.match(h.el("trendQuality").textContent,/不代表算力或功率为零/);
+  const chart=realTrendChart(c);
+  try {
+    const full=chart.getDatasetMeta(0), partial=chart.getDatasetMeta(1);
+    assert.equal(partial.data[1].skip,false);
+    assert.equal(partial.data[1].options.radius,2);
+    const painted=partial.dataset.segments.filter(s=>s.style.borderColor!=="transparent");
+    assert.deepEqual(painted.map(s=>[s.start,s.end]),[[2,4]]);
+    for(const meta of [full,partial]){
+      assert.equal(meta.data[5].skip,true);
+      assert.ok(meta.dataset.segments.every(s=>s.end<5||s.start>5));
+    }
+  } finally {chart.destroy();}
+});
+
+test("instantaneous partial zero and isolated full points are visible without invented counts",async()=>{
+  const h=setup();
+  h.respond({sites:[{name:"A",points:[[1000,null]],partial_points:[{
+    ts:1000,value:0,coverage:coverage(null,null,0,0)}]}]});
+  await h.ctx.loadTrend();
+  const c=h.configs.trendChart, part=c.data.datasets[1];
+  const notes=c.options.plugins.tooltip.callbacks.afterLabel({dataset:part,raw:part.data[0]}).join("\n");
+  assert.match(notes,/瞬时读数/);
+  assert.doesNotMatch(notes,/已统计/);
+  const chart=realTrendChart(c);
+  try {
+    const point=chart.getDatasetMeta(1).data[0];
+    assert.equal(point.skip,false);
+    assert.equal(point.options.radius,2);
+    assert.ok(point.y<=chart.chartArea.bottom);
+  } finally {chart.destroy();}
+  h.respond({sites:[{name:"A",points:[[2000,0]]}]});
+  await h.ctx.loadTrend();
+  const single=realTrendChart(h.configs.trendChart);
+  try {
+    assert.equal(single.getDatasetMeta(0).data[0].skip,false);
+    assert.equal(single.getDatasetMeta(0).data[0].options.radius,2);
+  } finally {single.destroy();}
+});
+
+test("site detail plots hashrate and power partials independently and retains legacy",async()=>{
+  const h=setup();
+  vm.runInContext("curSite='a';",h.ctx);
+  h.respond({site:{id:"a",name:"A",reported_name:"A",mode:"push",type:"hydro",state:"ok"},
+    trend:[{ts:1000,hashrate_ths:161700,online:539,power_kw:null,partial_power_kw:2800,
+      power_coverage:coverage(525),legacy_power_kw:2900},
+      {ts:1300,hashrate_ths:null,partial_hashrate_ths:161400,hashrate_coverage:coverage(),
+        online:538,power_kw:null,partial_power_kw:2790,power_coverage:coverage(524)}],customers:[],days:[]});
+  await h.ctx.loadSite();
+  const hr=h.configs.chHr, power=h.configs.chPower, online=h.configs.chOnline;
+  assert.equal(hr.data.datasets[1].data[1].y,161.4);
+  assert.equal(power.data.datasets[1].data[0].y,2800);
+  assert.equal(power.data.datasets[0].data[0].y,null);
+  assert.equal(power.data.datasets[2].data[0].y,2900);
+  assert.equal(power.data.datasets[2].borderColor,"#8b949e");
+  assert.equal(online.data.datasets.length,1);
+  assert.equal(online.data.datasets[0].data[0].y,539);
+  const tooltip=power.options.plugins.tooltip;
+  assert.match(tooltip.callbacks.label({dataset:power.data.datasets[1],parsed:{y:2800}}),/kW/);
+  assert.match(tooltip.callbacks.afterLabel({dataset:power.data.datasets[1],raw:power.data.datasets[1].data[0]}).join("\n"),/525\/539/);
+  assert.match(h.el("siteTrendQuality").textContent,/部分实测/);
+  const chart=realTrendChart(power);
+  try {
+    assert.equal(chart.getDatasetMeta(0).data[0].skip,true);
+    assert.equal(chart.getDatasetMeta(1).data[0].skip,false);
+    assert.equal(chart.getDatasetMeta(1).data[0].options.radius,2);
+  } finally {chart.destroy();}
+});
+
+test("same-name sites do not hide one another's real missing samples",async()=>{
+  const h=setup();
+  h.respond({sites:[{id:"a",name:"Same",points:[[1000,null],[1300,null]],partial_points:[
+    {ts:1000,value:161400,coverage:coverage()}, {ts:1300,value:161500,coverage:coverage()}]},
+    {id:"b",name:"Same",points:[[1000,null],[1300,null]]}]});
+  await h.ctx.loadTrend();
+  assert.match(h.el("trendQuality").textContent,/部分实测/);
+  assert.match(h.el("trendQuality").textContent,/空档/);
 });

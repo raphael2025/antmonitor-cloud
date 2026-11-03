@@ -356,22 +356,146 @@ def test_realtime_summary_visible_before_history_and_slow_report_cannot_rollback
     assert payload(client)["rows"][0]["hashrate_ths"] == 600
 
 
-def test_missing_current_worker_is_zero_but_missing_field_preserves_live_snapshot(cloud):
+def test_period_only_backup_account_does_not_increase_current_customers(cloud, monkeypatch):
+    server, client = cloud
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    # Two 300 TH/s, 3 kW miners for an hour. An old site version attributed
+    # customer A's middle ten minutes to its backup pool account.
+    a = {**customer("A", rate=300, mean=250, hours=1),
+         "delivered_th_h": 250, "power_kwh": 2.5}
+    b = {**customer("B", rate=300, mean=300, hours=1),
+         "delivered_th_h": 300, "power_kwh": 3}
+    backup = {**customer("backup", rate=0, mean=50, hours=1),
+              "current_machines": 0, "delivered_th_h": 50, "power_kwh": .5}
+    assert post_customers(client, [a, b, backup], hours=1).status_code == 200
+    assert post_summary(client, [{"worker": name, "machines": 1, "hashrate_ths": 300}
+                                 for name in ("A", "B")]).status_code == 200
+
+    result = payload(client)
+    overview = client.get("/api/overview").json()
+    assert overview["totals"]["customers"] == 2
+    assert overview["totals"]["customer_site_pairs"] == 2
+    assert overview["sites"][0]["customers"] == 2
+    assert db.customer_count_by_site(server.CONN) == {"st-a": 2}
+    detail = client.get("/api/site/st-a").json()
+    assert detail["site"]["customers"] == 2
+    rows = {r["worker"]: r for r in result["rows"]}
+    assert set(rows) == {"A", "B", "backup"}
+    assert rows["backup"]["current_machines"] == rows["backup"]["hashrate_ths"] == 0
+    assert rows["backup"]["avg_hashrate_ths"] == 50
+    assert rows["backup"]["power_kwh"] == .5
+    for scope in (detail["customers"], result["rows"], result["by_worker"]):
+        assert sum(r["avg_hashrate_ths"] for r in scope) == 600
+        assert sum(r["delivered_th_h"] for r in scope) == 600
+        assert sum(r["power_kwh"] for r in scope) == 6
+        assert all(r["period_start_ts"] == a["period_start_ts"] and
+                   r["period_end_ts"] == a["period_end_ts"] and
+                   r["avg_complete"] for r in scope)
+
+
+def test_customer_count_falls_back_only_without_current_roster(cloud):
+    server, client = cloud
+    legacy = [{"worker": "legacy-owner", "machines": 2, "power_kwh": 10},
+              {"worker": "retired", "machines": 1, "current_machines": 0},
+              {"worker": "empty-history", "machines": 0},
+              {"worker": "reported-owner", "machines": 1, "current_machines": 1}]
+    assert post_customers(client, legacy).status_code == 200
+    payload(client)
+    overview = client.get("/api/overview").json()
+    assert overview["totals"]["customers"] == overview["sites"][0]["customers"] == 2
+    assert db.customer_count_by_site(server.CONN) == {"st-a": 2}
+    # Once the full current channel exists, old period machine counts cannot
+    # revive removed accounts, even when a slow legacy report arrives later.
+    assert post_summary(client, [{"worker": "new-owner", "machines": 2,
+                                  "hashrate_ths": 0}]).status_code == 200
+    assert post_customers(client, legacy).status_code == 200
+    overview = client.get("/api/overview").json()
+    assert overview["totals"]["customers"] == overview["sites"][0]["customers"] == 1
+    rows = {r["worker"]: r for r in client.get("/api/customers").json()["rows"]}
+    assert rows["legacy-owner"]["current_machines"] == 0
+    assert rows["legacy-owner"]["legacy_power_kwh"] == 10
+
+
+def test_stale_or_unknown_readings_do_not_remove_current_customer_ownership(cloud, monkeypatch):
+    server, client = cloud
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    current = [{"worker": "offline-owner", "machines": 2, "hashrate_ths": 0},
+               {"worker": "unknown-count", "machines": None, "hashrate_ths": None},
+               {"worker": "partial-readings", "machines": 3, "hashrate_ths": None}]
+    assert post_summary(client, current).status_code == 200
+    payload(client)
+    assert db.customer_count_by_site(server.CONN) == {"st-a": 3}
+    monkeypatch.setattr(time, "time", lambda: now + 3600)
+    assert post_summary(client, None).status_code == 400
+    overview = client.get("/api/overview").json()
+    assert overview["totals"]["customers"] == overview["sites"][0]["customers"] == 3
+    rows = {r["worker"]: r for r in client.get("/api/customers").json()["rows"]}
+    assert rows["offline-owner"]["hashrate_stale"] is True
+    assert rows["offline-owner"]["current_machines"] == 2
+    assert rows["unknown-count"]["current_machines"] is None
+    assert rows["partial-readings"]["hashrate_ths"] is None
+
+
+def test_current_customer_counts_follow_transfer_and_cross_site_deduplication(cloud, monkeypatch):
     _, client = cloud
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    for sid in ("st-a", "st-b"):
+        assert post_customers(client, [customer("shared"), customer("former-owner")], sid).status_code == 200
+    assert post_summary(client, [{"worker": "shared", "machines": 1, "hashrate_ths": 293},
+                                 {"worker": "new-owner", "machines": 1, "hashrate_ths": 293}], "st-a").status_code == 200
+    assert post_summary(client, [{"worker": "shared", "machines": 1, "hashrate_ths": 293}], "st-b").status_code == 200
+    result = payload(client)
+    overview = client.get("/api/overview").json()
+    assert overview["totals"]["customers"] == 2
+    assert overview["totals"]["customer_site_pairs"] == 3
+    assert {s["id"]: s["customers"] for s in overview["sites"]} == {"st-a": 2, "st-b": 1}
+    rows = {r["worker"]: r for r in result["by_worker"]}
+    assert set(rows) == {"shared", "former-owner", "new-owner"}
+    assert rows["former-owner"]["current_machines"] == 0
+    assert rows["former-owner"]["avg_hashrate_ths"] == 586
+    assert rows["new-owner"]["current_machines"] == 1
+    assert rows["new-owner"]["avg_hashrate_ths"] is None
+    assert rows["shared"]["current_machines"] == 2
+    assert rows["shared"]["hashrate_ths"] == rows["shared"]["avg_hashrate_ths"] == 586
+    # Removing the last current machine at one site changes the site/customer
+    # pair count but leaves its measured history and the remaining owner intact.
+    assert post_summary(client, [], "st-b").status_code == 200
+    overview = client.get("/api/overview").json()
+    assert overview["totals"]["customers"] == 2
+    assert overview["totals"]["customer_site_pairs"] == 2
+    assert {s["id"]: s["customers"] for s in overview["sites"]} == {"st-a": 2, "st-b": 0}
+    shared = next(r for r in client.get("/api/customers").json()["by_worker"] if r["worker"] == "shared")
+    assert shared["hashrate_ths"] == 293
+    assert shared["avg_hashrate_ths"] == 586
+    assert shared["window_alignment"] == "aligned"
+
+
+def test_missing_current_worker_is_zero_but_missing_field_preserves_live_snapshot(cloud):
+    server, client = cloud
     post_customers(client, [customer(worker="old")])
     post_summary(client, [{"worker": "new", "machines": 1, "hashrate_ths": 300}])
     rows = {r["worker"]: r for r in payload(client)["rows"]}
     assert rows["old"]["current_machines"] == 0
     assert rows["old"]["hashrate_ths"] == 0
     assert rows["new"]["hashrate_ths"] == 300
+    assert client.get("/api/overview").json()["totals"]["customers"] == 1
     client.post("/api/ingest/summary", headers={"Authorization": "Bearer reporting-test-token"},
                 json={"site_id": "st-a", "site": "st-a"})
     assert {r["worker"]: r for r in payload(client)["rows"]}["new"]["hashrate_ths"] == 300
+    assert db.customer_count_by_site(server.CONN) == {"st-a": 1}
     assert post_summary(client, []).status_code == 200
     rows = payload(client)["rows"]
     assert [r["worker"] for r in rows] == ["old"]
     assert rows[0]["hashrate_ths"] == 0
     assert rows[0]["current_machines"] == 0
+    assert client.get("/api/overview").json()["totals"]["customers"] == 0
+    assert client.get("/api/site/st-a").json()["site"]["customers"] == 0
+    delayed = post_summary(client, [{"worker": "new", "machines": 1, "hashrate_ths": 300}], age=600)
+    assert delayed.status_code == 200 and delayed.json()["stored"] is False
+    assert db.customer_count_by_site(server.CONN) == {}
 
 
 def test_site_clock_skew_cannot_make_slow_report_override_live_roster(cloud, monkeypatch):

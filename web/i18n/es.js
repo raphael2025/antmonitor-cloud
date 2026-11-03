@@ -43,7 +43,8 @@ I18N.register('es', {
   "quality.eff_help": "Potencia total medida dividida por hashrate total, en J/TH.",
   "quality.daily_title": "Informes diarios de los últimos 14 días (UTC+8)",
   "quality.daily_help": "Ponderado por tiempo observado; hoy solo incluye el tiempo transcurrido. La energía es una estimación; use contadores para facturar. Las líneas discontinuas son registros anteriores no verificados; el gráfico usa la zona horaria del navegador.",
-  "quality.customer_identity": "Sin duplicados por cuenta del pool/nombre de worker; los nombres idénticos en distintos sitios son una cuenta.",
+  "quality.customer_identity": "Clientes según la cuenta del primer pool configurado de los mineros actuales. Cambiar al pool de respaldo no añade clientes. Se excluyen las cuentas históricas sin mineros actuales; los nombres iguales entre sitios cuentan una vez.",
+  "rate.history_only": "Registro histórico; excluido del número actual de clientes",
   "quality.period_end": "Fin del período: {time}",
   "kind.inventory": "Cambio de inventario",
 

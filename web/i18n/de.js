@@ -43,7 +43,8 @@ I18N.register('de', {
   "quality.eff_help": "Gemessene Gesamtleistung geteilt durch Gesamt-Hashrate, in J/TH.",
   "quality.daily_title": "Tagesberichte der letzten 14 Tage (UTC+8)",
   "quality.daily_help": "Nach beobachteter Zeit gewichtet; heute nur die verstrichene Zeit. Energie ist eine Schätzung; zur Abrechnung Zähler verwenden. Gestrichelte Linien zeigen ungeprüfte frühere Daten; Diagrammzeiten nutzen die Browser-Zeitzone.",
-  "quality.customer_identity": "Nach Pool-Konto/Worker-Name dedupliziert; gleiche Namen an mehreren Standorten gelten als ein Konto.",
+  "quality.customer_identity": "Kunden werden nach dem ersten konfigurierten Pool-Konto ihrer aktuellen Miner gezählt. Ein Wechsel zum Ersatzpool fügt keine Kunden hinzu. Historische Konten ohne aktuelle Miner zählen nicht; gleiche Namen an mehreren Standorten zählen einmal.",
+  "rate.history_only": "Historischer Eintrag; zählt nicht als aktueller Kunde",
   "quality.period_end": "Zeitraum endet: {time}",
   "kind.inventory": "Bestandsänderung",
 

@@ -283,15 +283,16 @@ def _overview_payload():
     now = int(time.time())
     latest = db.latest_snapshots(CONN)
     last_ok = db.latest_ok_snapshots(CONN)
-    cust_counts = db.customer_count_by_site(CONN)
+    customer_rows = db.customers(CONN)
+    customer_keys = db.current_customer_keys(customer_rows)
+    cust_counts = db.customer_count_by_site(CONN, rows=customer_rows)
     sites = [_site_entry(s, latest, last_ok, cust_counts, now)
              for s in all_sites()]
-    customer_rows = db.customers(CONN)
     tot = {"sites": len(sites),
            "sites_ok": sum(1 for s in sites if s["state"] in ("ok", "alert")),
            "sites_unreachable": sum(1 for s in sites if s["state"] == "unreachable"),
-           "customers": len({r["worker"] for r in customer_rows}),
-           "customer_site_pairs": len({(r["site_id"], r["worker"]) for r in customer_rows})}
+           "customers": len({worker for _site_id, worker in customer_keys}),
+           "customer_site_pairs": len(customer_keys)}
     fields = {"machines_total": "total", "machines_online": "online", "hashrate_ths": "hashrate_ths",
               "power_kw": "power_kw", "active_alerts": "active_alerts", "containers": "containers",
               "containers_faulty": "containers_faulty", "containers_offline": "containers_offline",
@@ -329,12 +330,13 @@ def _site_payload(key, hours):
     now = int(time.time())
     latest = db.latest_snapshots(CONN)
     last_ok = db.latest_ok_snapshots(CONN)
-    cust_counts = db.customer_count_by_site(CONN)
+    customer_rows = db.customers(CONN, site_id=scfg["id"])
+    cust_counts = db.customer_count_by_site(CONN, rows=customer_rows)
     entry = _site_entry(scfg, latest, last_ok, cust_counts, now)
     pts = db.trend(CONN, scfg["id"], hours=hours,
                    stalled_after=int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
     return {"ok": True, "ts": now, "site": entry, "hours": hours,
-            "trend": pts, "customers": _customer_rows(db.customers(CONN, site_id=scfg["id"])),
+            "trend": pts, "customers": _customer_rows(customer_rows),
             "alert_summary": db.get_alert_summary(CONN, scfg["id"])}
 
 

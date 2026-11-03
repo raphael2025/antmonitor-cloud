@@ -88,6 +88,12 @@ assert.equal(rates.header([steady], t), "24h 平均算力");
 assert.equal(rates.header([{hashrate_hours: 72}], t), "72h 平均算力");
 assert.equal(rates.header([steady, {hashrate_hours: 72}], t), "平均算力");
 assert.equal(rates.machines(steady, t), "1");
+// A historical backup name remains in the report without appearing to be a current customer.
+assert.match(rates.machines({...steady, current_machines: 0}, t), /^0<span/);
+assert.match(rates.machines({...steady, current_machines: 0}, t), /历史记录，不计入当前客户数/);
+assert.doesNotMatch(rates.machines({...steady, current_machines: 1, hashrate_ths: 0}, t), /历史记录/);
+assert.doesNotMatch(rates.machines({machines: 1, current_machines: null}, t), /历史记录/);
+assert.match(cell({...steady, current_machines: 0}), /293 TH\/s/);
 assert.match(rates.machines({machines: 465}, t), /已观测峰值台数/);
 for (const bad of ["<img src=x onerror=alert(1)>", Infinity, NaN, true, -1]) {
   assert.equal(rates.number(bad), null);

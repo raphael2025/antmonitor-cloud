@@ -38,7 +38,8 @@ I18N.register('en', {
   "quality.eff_help": "Measured total power divided by total hashrate, in J/TH.",
   "quality.daily_title": "Last 14 daily reports (UTC+8)",
   "quality.daily_help": "Weighted by observed time; today includes elapsed time only. Energy is a monitoring estimate; use meters for billing. Dashed lines are unverified legacy records; trend times use the browser time zone.",
-  "quality.customer_identity": "Deduplicated by pool account/worker name; identical names across sites are one account.",
+  "quality.customer_identity": "Count current miners by their primary configured pool account. Pool failover does not add customers. Historical accounts with no current miners are excluded; matching names across sites count once.",
+  "rate.history_only": "Historical record; excluded from current customer count",
   "quality.period_end": "Window ends: {time}",
   "kind.inventory": "Inventory change",
 

@@ -81,7 +81,7 @@
   }
   function machines(r, t) {
     const current = number(r.current_machines);
-    if (current != null) return short(current);
+    if (current != null) return short(current) + (current === 0 ? note(t("rate.history_only")) : "");
     const historical = number(r.machines);
     return historical == null ? "—" : short(historical) + note(t((r.machines_source === "legacy" || (r.machines_source == null && r.billing_source === "legacy_only")) ? "rate.legacy_machines" : number(r.sites) > 1 ? "rate.site_peak_sum" : "rate.period_machines"));
   }

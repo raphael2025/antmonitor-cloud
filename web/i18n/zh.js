@@ -38,7 +38,8 @@ I18N.register('zh', {
   "quality.eff_help": "全场实测总功率 ÷ 总算力；单位 J/TH。",
   "quality.daily_title": "近 14 天日报（UTC+8）",
   "quality.daily_help": "按有效时间加权；今天只统计已经经过的时间。耗电为监控估算，对账需电表。虚线为旧版未验证记录，趋势时间按浏览器时区显示。",
-  "quality.customer_identity": "按矿池账户/矿工名去重；同名在多个场地视为同一账户。",
+  "quality.customer_identity": "按当前机器所属的主矿池账户去重；主备切换不新增客户。当前无机器的历史账户不计数；同名跨场地视为同一账户。",
+  "rate.history_only": "历史记录，不计入当前客户数",
   "quality.period_end": "统计截止：{time}",
   "kind.inventory": "名册变更",
 

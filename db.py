@@ -567,12 +567,33 @@ def customers(conn, site_id=None):
     return sorted(out.values(), key=lambda r: (r["site_name"], -machine_count(r.get("machines"))))
 
 
-def customer_count_by_site(conn):
-    with _lock:
-        rows = conn.execute(
-            "SELECT site_id, COUNT(*) AS n FROM (SELECT site_id,worker FROM site_customers "
-            "UNION SELECT site_id,worker FROM site_customer_current) GROUP BY site_id").fetchall()
-    return {r["site_id"]: r["n"] for r in rows}
+def current_customer_keys(rows):
+    """当前机器归属的客户键；周期账目中的离场/旧矿池账号不增加当前客户数。
+
+    customers() 已用完整实时名单覆盖慢报表，并将名单外的历史客户置为零台。
+    名单中的离线客户仍有机器；算力为零、缺测或扫描过期均不能删除其归属。
+    实时名单里机器数未知时保留已明确上报的客户身份；只有没有实时名单且
+    报表也未提供当前台数的旧协议，才回退到报表台数。
+    """
+    keys = set()
+    for r in rows:
+        machines = validate.measurement(r.get("current_machines"), int, hi=10**6)
+        if machines is not None:
+            present = machines > 0
+        elif r.get("hashrate_source") == "summary":
+            present = True
+        else:
+            present = validate.num(r.get("machines"), int, hi=10**6) > 0
+        if present:
+            keys.add((r["site_id"], r["worker"]))
+    return keys
+
+
+def customer_count_by_site(conn, rows=None):
+    counts = {}
+    for site_id, _worker in current_customer_keys(customers(conn) if rows is None else rows):
+        counts[site_id] = counts.get(site_id, 0) + 1
+    return counts
 
 
 # ---- 场地注册 ----

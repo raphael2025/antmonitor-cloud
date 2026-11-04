@@ -10,12 +10,19 @@ permissions:
 
 jobs:
   regression:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.8', '3.12', '3.14']
+        include:
+          # Python 3.8 has no hosted build on the current ubuntu-latest image.
+          - python: '3.8'
+            os: ubuntu-22.04
+          - python: '3.12'
+            os: ubuntu-latest
+          - python: '3.14'
+            os: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

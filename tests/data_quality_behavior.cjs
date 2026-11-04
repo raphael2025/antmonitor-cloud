@@ -146,7 +146,9 @@ function setup(){
     ctx.api=async()=>response;
     vm.runInContext("let curSite=null,curSiteData=null,curRole='admin';",ctx);
     vm.runInContext(app.slice(app.indexOf("// ---- 图表 ----"),app.indexOf("async function refresh()")),ctx);
-    vm.runInContext(app.slice(app.indexOf("async function loadSite()"),app.indexOf("// ---- 版本更新")),ctx);
+    vm.runInContext(app.slice(app.indexOf("let _siteSeq = 0"),app.indexOf("// ---- 版本更新")),ctx);
+    vm.runInContext(app.slice(app.indexOf("function openSite(id)"),app.indexOf("function setSiteBusy(busy)")),ctx);
+    vm.runInContext(app.slice(app.indexOf("function closeSite()"),app.indexOf("function fmtDuration(s)")),ctx);
   }else{
     vm.runInContext(app.slice(0,app.indexOf("async function ackAlert")),ctx);
     ctx.jget=async()=>response;
@@ -159,6 +161,161 @@ function setup(){
   }
   return {ctx,el,configs,respond:r=>{response=r;}};
 }
+
+function deferredRequests(h) {
+  const pending = [];
+  h.ctx.api = url => new Promise((resolve, reject) => pending.push({url, resolve, reject}));
+  return pending;
+}
+
+test("overview trend keeps the latest range even after an older response arrives", async()=>{
+  const h=setup(), pending=deferredRequests(h);
+  const old=h.ctx.loadTrend();
+  h.el("trendRange").value="168";
+  const current=h.ctx.loadTrend();
+  pending[1].resolve({sites:[{name:"NEW_168_HOURS",points:[[1,100]]}]});
+  await current;
+  pending[0].resolve({sites:[{name:"OLD_24_HOURS",points:[[1,200]]}]});
+  await old;
+  assert.equal(h.configs.trendChart.data.datasets[0].label,"NEW_168_HOURS");
+});
+
+test("trend selection returning to the same period still discards the oldest request", async()=>{
+  const h=setup(), pending=deferredRequests(h);
+  const oldest=h.ctx.loadTrend();
+  h.el("trendRange").value="168";
+  const middle=h.ctx.loadTrend();
+  h.el("trendRange").value="24";
+  const current=h.ctx.loadTrend();
+  pending[2].resolve({sites:[{name:"CURRENT_24_HOURS",points:[[1,100]]}]});
+  await current;
+  pending[1].resolve({sites:[{name:"STALE_168",points:[[1,200]]}]});
+  pending[0].resolve({sites:[{name:"STALE_24",points:[[1,300]]}]});
+  await Promise.all([oldest,middle]);
+  assert.equal(h.configs.trendChart.data.datasets[0].label,"CURRENT_24_HOURS");
+});
+
+test("site detail and daily data cannot overwrite a newer request for the same site", async()=>{
+  const h=setup(), pending=deferredRequests(h);
+  vm.runInContext("curSite='a'",h.ctx);
+  const detail=name=>({site:{id:"a",name,type:"air",state:"ok",mode:"push"},trend:[],customers:[],alert_summary:[]});
+  const old=h.ctx.loadSite();
+  pending[0].resolve(detail("OLD_SITE_RESPONSE"));
+  await old; // Its daily request remains in flight.
+  h.el("siteRange").value="168";
+  const current=h.ctx.loadSite();
+  pending[2].resolve(detail("NEW_SITE_RESPONSE"));
+  await current;
+  pending[3].resolve({days:[{day:"NEW_DAY"}]});
+  await Promise.resolve();
+  pending[1].resolve({days:[{day:"OLD_DAY"}]});
+  await Promise.resolve();
+  assert.match(h.el("siteTitle").innerHTML,/NEW_SITE_RESPONSE/);
+  assert.match(h.el("tblDaily").querySelector().innerHTML,/NEW_DAY/);
+  assert.doesNotMatch(h.el("tblDaily").querySelector().innerHTML,/OLD_DAY/);
+});
+
+test("out-of-order site range responses and a closed detail view are ignored", async()=>{
+  const h=setup(), pending=deferredRequests(h);
+  vm.runInContext("curSite='a'",h.ctx);
+  const detail=name=>({site:{id:"a",name,type:"air",state:"ok",mode:"push"},trend:[],customers:[],alert_summary:[]});
+  const old=h.ctx.loadSite();
+  h.el("siteRange").value="168";
+  const current=h.ctx.loadSite();
+  pending[1].resolve(detail("CURRENT_SITE"));
+  await current;
+  pending[0].resolve(detail("STALE_SITE"));
+  await old;
+  assert.match(h.el("siteTitle").innerHTML,/CURRENT_SITE/);
+  const afterClose=h.ctx.loadSite();
+  vm.runInContext("curSite=null",h.ctx);
+  pending[pending.length-1].resolve(detail("CLOSED_SITE"));
+  await afterClose;
+  assert.doesNotMatch(h.el("siteTitle").innerHTML,/CLOSED_SITE/);
+});
+
+function trackSiteLoads(h) {
+  const load=h.ctx.loadSite, requests=[];
+  h.ctx.loadSite=(...args)=>{
+    const request=load(...args);
+    requests.push(request);
+    return request;
+  };
+  return requests;
+}
+const siteDetail=(name,id="a")=>({site:{id,name,type:"air",state:"ok",mode:"push"},trend:[],customers:[],alert_summary:[]});
+
+test("the real close button and same-site reopen discard the former detail request", async()=>{
+  const h=setup(), pending=deferredRequests(h), loads=trackSiteLoads(h);
+  h.ctx.openSite("a");
+  h.el("siteClose").onclick();
+  assert.equal(vm.runInContext("curSite",h.ctx),null);
+  assert.equal(vm.runInContext("curSiteData",h.ctx),null);
+  assert.equal(h.el("siteModal").classList.contains("hidden"),true);
+  h.ctx.openSite("a");
+  assert.equal(h.el("siteModal").classList.contains("hidden"),false);
+  assert.equal(pending[0].url,pending[1].url);
+  pending[1].resolve(siteDetail("REOPENED_SITE"));
+  await loads[1];
+  pending[0].resolve(siteDetail("CLOSED_SITE"));
+  await loads[0];
+  assert.equal(h.el("siteName").value,"REOPENED_SITE");
+  assert.equal(vm.runInContext("curSiteData.name",h.ctx),"REOPENED_SITE");
+  assert.equal(pending.length,3); // Only the accepted response starts a daily request.
+  pending[2].resolve({days:[]});
+  await Promise.resolve();
+});
+
+test("site A to B to A at one period keeps the last A response", async()=>{
+  const h=setup(), pending=deferredRequests(h), loads=trackSiteLoads(h);
+  h.ctx.openSite("a");
+  h.ctx.openSite("b");
+  h.ctx.openSite("a");
+  pending[2].resolve(siteDetail("CURRENT_A"));
+  await loads[2];
+  pending[0].resolve(siteDetail("STALE_A"));
+  pending[1].resolve(siteDetail("STALE_B","b"));
+  await Promise.all(loads);
+  assert.equal(h.el("siteName").value,"CURRENT_A");
+  assert.match(h.el("siteTitle").innerHTML,/CURRENT_A/);
+  assert.equal(pending.length,4);
+  pending[3].resolve({days:[]});
+  await Promise.resolve();
+});
+
+test("closing and reopening a site invalidates its in-flight daily response", async()=>{
+  const h=setup(), pending=deferredRequests(h), loads=trackSiteLoads(h);
+  h.ctx.openSite("a");
+  pending[0].resolve(siteDetail("FIRST_OPEN"));
+  await loads[0];
+  h.el("siteClose").onclick();
+  h.ctx.openSite("a");
+  pending[2].resolve(siteDetail("SECOND_OPEN"));
+  await loads[1];
+  pending[3].resolve({days:[{day:"REOPENED_DAY"}]});
+  await Promise.resolve();
+  pending[1].resolve({days:[{day:"CLOSED_DAY"}]});
+  await Promise.resolve();
+  const html=h.el("tblDaily").querySelector().innerHTML;
+  assert.match(html,/REOPENED_DAY/);
+  assert.doesNotMatch(html,/CLOSED_DAY/);
+});
+
+test("a rejected request from a closed site cannot show an error on its reopened view", async()=>{
+  const h=setup(), pending=deferredRequests(h), loads=trackSiteLoads(h);
+  h.ctx.openSite("a");
+  h.el("siteClose").onclick();
+  h.ctx.openSite("a");
+  pending[1].resolve(siteDetail("CURRENT_SITE"));
+  await loads[1];
+  pending[0].reject(new Error("obsolete request failed"));
+  await loads[0];
+  await Promise.resolve();
+  assert.equal(h.el("siteManageMsg").textContent,"");
+  assert.equal(h.el("siteName").value,"CURRENT_SITE");
+  pending[2].resolve({days:[]});
+  await Promise.resolve();
+});
 
 test("real power and energy renderers keep kW distinct from period kWh at site scale",async()=>{
   const h=setup();

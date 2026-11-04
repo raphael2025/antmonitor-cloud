@@ -113,7 +113,8 @@ CREATE TABLE IF NOT EXISTS site_management(
   site_id TEXT PRIMARY KEY,
   name_override TEXT,
   deleted_name TEXT,
-  deleted_ts INTEGER NOT NULL DEFAULT 0
+  deleted_ts INTEGER NOT NULL DEFAULT 0,
+  notification_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 -- 日级汇总(UTC+8 切日, 永久保留)。power_kwh 为 Σ(功率×名义间隔) 估算，精确对账在场地本地。
@@ -145,6 +146,34 @@ CREATE TABLE IF NOT EXISTS notify_log(
   type TEXT,                           -- unreachable|stalled|recovered|hashrate_drop|hashrate_recovered
   msg TEXT,
   ok INTEGER                           -- 是否至少一个通道发送成功
+);
+
+-- 活动事件、待发消息与每通道回执同库提交；重启只继续未送达通道。
+CREATE TABLE IF NOT EXISTS notification_state(
+  site_id TEXT PRIMARY KEY,
+  epoch INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  drop_baseline REAL,
+  offline_active INTEGER NOT NULL,
+  drop_pct REAL NOT NULL,
+  offline_threshold INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notification_outbox(
+  site_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  msg TEXT NOT NULL,
+  created_ts INTEGER NOT NULL,
+  due_ts INTEGER NOT NULL,
+  attempts INTEGER NOT NULL,
+  remaining_json TEXT NOT NULL,
+  delivered_json TEXT NOT NULL,
+  PRIMARY KEY(site_id, type)
+);
+CREATE TABLE IF NOT EXISTS notification_cooldown(
+  site_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  sent_ts INTEGER NOT NULL,
+  PRIMARY KEY(site_id, type)
 );
 
 -- 安全审计：谁、从哪个IP、做了什么(登录失败/改设置/改密码/更新/删场地)。
@@ -197,6 +226,9 @@ def connect(path):
     conn.execute("PRAGMA synchronous=NORMAL")
     _migrate_v1(conn)
     conn.executescript(SCHEMA)
+    management_cols = {r[1] for r in conn.execute("PRAGMA table_info(site_management)")}
+    if "notification_epoch" not in management_cols:
+        conn.execute("ALTER TABLE site_management ADD COLUMN notification_epoch INTEGER NOT NULL DEFAULT 0")
     # 旧报表只包含累计算力，不能用累计值伪造实时/平均算力；新增列保持 NULL。
     customer_cols = {r[1] for r in conn.execute("PRAGMA table_info(site_customers)")}
     for column, kind in (("hashrate_ths", "REAL"), ("avg_hashrate_ths", "REAL"),
@@ -707,13 +739,15 @@ def push_sites(conn):
 def delete_site(conn, site_id, name=None):
     """删除场地及其全部数据(场地下线后清理)。"""
     with _lock, conn:
-        conn.execute("INSERT INTO site_management(site_id, deleted_name, deleted_ts) "
-                     "VALUES(?,?,?) ON CONFLICT(site_id) DO UPDATE SET "
-                     "deleted_name=excluded.deleted_name, deleted_ts=excluded.deleted_ts",
+        conn.execute("INSERT INTO site_management(site_id, deleted_name, deleted_ts, notification_epoch) "
+                     "VALUES(?,?,?,1) ON CONFLICT(site_id) DO UPDATE SET "
+                     "deleted_name=excluded.deleted_name, deleted_ts=excluded.deleted_ts, "
+                     "notification_epoch=site_management.notification_epoch+1",
                      (site_id, name or site_id, int(time.time())))
         for t in ("sites", "snapshots", "site_customers", "site_customer_current",
                   "site_customer_current_state", "site_customer_report_state", "site_alert_summary",
-                  "daily", "daily_observed_v2", "notify_log"):
+                  "daily", "daily_observed_v2", "notify_log", "notification_state",
+                  "notification_outbox", "notification_cooldown"):
             conn.execute(f"DELETE FROM {t} WHERE {'id' if t == 'sites' else 'site_id'}=?",
                          (site_id,))
 
@@ -821,6 +855,49 @@ def daily_report(conn, site_id, days=14):
                                    (0.0 if value == 0 and elapsed == 0 else None) for key, value in mapping.items()}
         result.append(r)
     return result
+
+
+def notification_load(conn):
+    """读取一致的通知检查点；返回的行已完整取出，不泄漏共享连接游标。"""
+    with _lock:
+        states = [dict(r) for r in conn.execute("SELECT n.* FROM notification_state n "
+                  "LEFT JOIN site_management m ON n.site_id=m.site_id "
+                  "WHERE COALESCE(m.deleted_ts,0)=0 AND n.epoch=COALESCE(m.notification_epoch,0)").fetchall()]
+        valid = {r["site_id"] for r in states}
+        pending = [dict(r) for r in conn.execute("SELECT * FROM notification_outbox").fetchall()
+                   if r["site_id"] in valid]
+        sent = [dict(r) for r in conn.execute("SELECT * FROM notification_cooldown").fetchall()
+                if r["site_id"] in valid]
+        return states, pending, sent
+
+
+def notification_generation(conn, site_id):
+    with _lock:
+        row = conn.execute("SELECT deleted_ts,notification_epoch FROM site_management WHERE site_id=?",
+                           (site_id,)).fetchone()
+        return (int(row["notification_epoch"]), bool(row["deleted_ts"])) if row else (0, False)
+
+
+def notification_save(conn, site_id, epoch, state, pending, sent):
+    """单场地原子检查点；删除/恢复后旧实例不能把已删除的队列写回来。"""
+    with _lock, conn:
+        current, deleted = notification_generation(conn, site_id)
+        if deleted or current != epoch:
+            return False
+        for table in ("notification_state", "notification_outbox", "notification_cooldown"):
+            conn.execute("DELETE FROM %s WHERE site_id=?" % table, (site_id,))
+        if state is not None:
+            conn.execute("INSERT INTO notification_state VALUES(?,?,?,?,?,?,?)",
+                         (site_id, epoch, state["state"], state["drop_baseline"],
+                          int(state["offline_active"]), state["drop_pct"], state["offline_threshold"]))
+            for kind, notice in pending.items():
+                conn.execute("INSERT INTO notification_outbox VALUES(?,?,?,?,?,?,?,?)",
+                             (site_id, kind, notice["msg"], notice["created"], notice["due"],
+                              notice["attempts"], json.dumps(sorted(notice["remaining"])),
+                              json.dumps(sorted(notice.get("delivered", ())))))
+            for kind, stamp in sent.items():
+                conn.execute("INSERT INTO notification_cooldown VALUES(?,?,?)", (site_id, kind, stamp))
+        return True
 
 
 def notify_log_add(conn, ts, site_id, ntype, msg, ok):

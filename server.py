@@ -18,6 +18,11 @@ import threading
 import time
 from contextlib import contextmanager
 
+# 兼容旧 ExecStart=python server.py：先由稳定启动器保护依赖/import/启动失败恢复。
+import updater
+if __name__ == "__main__":
+    updater.guard_server_entry()
+
 import yaml
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -30,7 +35,6 @@ import auth
 import connect
 import db
 import seccheck
-import updater
 import validate
 from collector import Collector
 
@@ -63,6 +67,13 @@ COLLECTOR = Collector(CFG, CONN)
 app = FastAPI(title="矿场云端总览", docs_url=None, redoc_url=None)
 
 
+@app.exception_handler(appconfig.SettingsError)
+async def _settings_unavailable(_request: Request, _error: appconfig.SettingsError):
+    # 运行中没有可信覆盖层时拒绝认证/配置操作，且不向浏览器泄漏服务端路径。
+    return JSONResponse(status_code=500, content={
+        "detail": "安全配置不可用，请检查配置文件或权限后重试"})
+
+
 def _update_event(msg):
     """自动更新的通知：打日志 + 借用告警通道推一条(不占告警冷却)。"""
     print(f"[update] {msg}")
@@ -87,6 +98,12 @@ def _startup():
         print(f"[seccheck] 自检异常: {e}")
     COLLECTOR.start()   # 幂等；uvicorn server:app 方式启动时也能拉起采集线程
     updater.start_auto(CFG.get("update") or {}, on_event=_update_event)
+    updater.start_health_timer()
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    updater.cancel_health_timer()
 
 
 # ---------- 鉴权 ----------
@@ -1237,7 +1254,7 @@ def api_update_check(request: Request):
 def api_update_apply(request: Request):
     """拉取新代码(ff-only+编译自检+失败回滚)并重启服务(需 systemd/NSSM 守护)。"""
     sess = _require_admin(request)
-    r = updater.apply((CFG.get("update") or {}).get("branch") or None)
+    r = updater.apply((CFG.get("update") or {}).get("branch") or None, force=True)
     _audit(request, sess["user"], "update_apply",
            f"{r.get('from')} → {r.get('to')}" if r.get("ok") else f"失败: {r.get('msg')}")
     if r.get("ok"):
@@ -1313,8 +1330,8 @@ def api_settings_post(request: Request, body: dict = Body(...)):
     """保存通知设置：{"alerts": {...部分字段...}}。
 
     原地改 CFG["alerts"] 的嵌套字典(不能整体替换——collector.py 里 Notifier 持有的是
-    同一个 dict 引用，替换成新对象它会读不到)，改完立即生效，无需重启；再持久化到
-    cloud_settings.json，进程重启后 apply_settings() 会重新叠加回来。
+    同一个 dict 引用，替换成新对象它会读不到)。先在副本上合并并持久化，成功后再
+    原地生效；整个过程共用配置锁，失败时运行中的通知设置保持原值。
     掩码字段(bot_token/webhook.url/email.password)留空/缺省=保留原值，不清空
     (标准"留空不改"表单语义)。所有数值/字符串字段按本文件既有的 _num 风格钳制，
     非法输入只回退默认值，绝不 500。
@@ -1327,72 +1344,77 @@ def api_settings_post(request: Request, body: dict = Body(...)):
                              else None, 1024)
     if _new_url and not _new_url.lower().startswith(("https://", "http://")):   # 先校验，再动 CFG
         raise HTTPException(400, "Webhook URL 必须以 https:// 或 http:// 开头")
-    a = CFG.setdefault("alerts", {})
-    tg = a.setdefault("telegram", {})
-    wh = a.setdefault("webhook", {})
-    em = a.setdefault("email", {})
+    with appconfig._LOCK:
+        a = copy.deepcopy(CFG.get("alerts") or {})
+        tg = a.setdefault("telegram", {})
+        wh = a.setdefault("webhook", {})
+        em = a.setdefault("email", {})
 
-    if "enabled" in inb:
-        a["enabled"] = bool(inb["enabled"])
-    if "cooldown" in inb:
-        a["cooldown"] = int(_num(inb.get("cooldown"), int, a.get("cooldown", 1800), hi=86400))
-    if "hashrate_drop_pct" in inb:
-        a["hashrate_drop_pct"] = _num(inb.get("hashrate_drop_pct"), float,
-                                      a.get("hashrate_drop_pct", 30), hi=100)
-    if "offline_threshold" in inb:
-        a["offline_threshold"] = int(_num(inb.get("offline_threshold"), int,
-                                          a.get("offline_threshold", 0), hi=10**6))
+        if "enabled" in inb:
+            a["enabled"] = bool(inb["enabled"])
+        if "cooldown" in inb:
+            a["cooldown"] = int(_num(inb.get("cooldown"), int, a.get("cooldown", 1800), hi=86400))
+        if "hashrate_drop_pct" in inb:
+            a["hashrate_drop_pct"] = _num(inb.get("hashrate_drop_pct"), float,
+                                          a.get("hashrate_drop_pct", 30), hi=100)
+        if "offline_threshold" in inb:
+            a["offline_threshold"] = int(_num(inb.get("offline_threshold"), int,
+                                              a.get("offline_threshold", 0), hi=10**6))
 
-    itg = inb.get("telegram")
-    if isinstance(itg, dict):
-        if "enabled" in itg:
-            tg["enabled"] = bool(itg["enabled"])
-        v = _settings_str(itg.get("bot_token"), 256)
-        if v:
-            tg["bot_token"] = v
-        if "chat_id" in itg:
-            tg["chat_id"] = _settings_str(itg.get("chat_id"), 128)
+        itg = inb.get("telegram")
+        if isinstance(itg, dict):
+            if "enabled" in itg:
+                tg["enabled"] = bool(itg["enabled"])
+            v = _settings_str(itg.get("bot_token"), 256)
+            if v:
+                tg["bot_token"] = v
+            if "chat_id" in itg:
+                tg["chat_id"] = _settings_str(itg.get("chat_id"), 128)
 
-    iwh = inb.get("webhook")
-    if isinstance(iwh, dict):
-        if "enabled" in iwh:
-            wh["enabled"] = bool(iwh["enabled"])
-        v = _settings_str(iwh.get("url"), 1024)
-        if v:
-            wh["url"] = v
-        if "kind" in iwh:
-            k = str(iwh.get("kind") or "wecom").strip().lower()
-            wh["kind"] = k if k in _WEBHOOK_KINDS else "wecom"
+        iwh = inb.get("webhook")
+        if isinstance(iwh, dict):
+            if "enabled" in iwh:
+                wh["enabled"] = bool(iwh["enabled"])
+            v = _settings_str(iwh.get("url"), 1024)
+            if v:
+                wh["url"] = v
+            if "kind" in iwh:
+                k = str(iwh.get("kind") or "wecom").strip().lower()
+                wh["kind"] = k if k in _WEBHOOK_KINDS else "wecom"
 
-    iem = inb.get("email")
-    if isinstance(iem, dict):
-        if "enabled" in iem:
-            em["enabled"] = bool(iem["enabled"])
-        if "smtp_host" in iem:
-            em["smtp_host"] = _settings_str(iem.get("smtp_host"), 256)
-        if "smtp_port" in iem:
-            em["smtp_port"] = _settings_port(iem.get("smtp_port"), em.get("smtp_port", 465))
-        if "use_ssl" in iem:
-            em["use_ssl"] = bool(iem["use_ssl"])
-        if "use_starttls" in iem:
-            em["use_starttls"] = bool(iem["use_starttls"])
-        if "username" in iem:
-            em["username"] = _settings_str(iem.get("username"), 256)
-        v = _settings_str(iem.get("password"), 256)
-        if v:
-            em["password"] = v
-        if "from_addr" in iem:
-            em["from_addr"] = _settings_str(iem.get("from_addr"), 256)
-        if "to" in iem:
-            raw_to = iem.get("to")
-            if isinstance(raw_to, str):
-                raw_to = raw_to.split(",")
-            if isinstance(raw_to, list):
-                em["to"] = [validate.text(t, 256) for t in raw_to[:50] if validate.text(t, 256)]
-        if "subject_prefix" in iem:
-            em["subject_prefix"] = _settings_str(iem.get("subject_prefix"), 64)
+        iem = inb.get("email")
+        if isinstance(iem, dict):
+            if "enabled" in iem:
+                em["enabled"] = bool(iem["enabled"])
+            if "smtp_host" in iem:
+                em["smtp_host"] = _settings_str(iem.get("smtp_host"), 256)
+            if "smtp_port" in iem:
+                em["smtp_port"] = _settings_port(iem.get("smtp_port"), em.get("smtp_port", 465))
+            if "use_ssl" in iem:
+                em["use_ssl"] = bool(iem["use_ssl"])
+            if "use_starttls" in iem:
+                em["use_starttls"] = bool(iem["use_starttls"])
+            if "username" in iem:
+                em["username"] = _settings_str(iem.get("username"), 256)
+            v = _settings_str(iem.get("password"), 256)
+            if v:
+                em["password"] = v
+            if "from_addr" in iem:
+                em["from_addr"] = _settings_str(iem.get("from_addr"), 256)
+            if "to" in iem:
+                raw_to = iem.get("to")
+                if isinstance(raw_to, str):
+                    raw_to = raw_to.split(",")
+                if isinstance(raw_to, list):
+                    em["to"] = [validate.text(t, 256) for t in raw_to[:50] if validate.text(t, 256)]
+            if "subject_prefix" in iem:
+                em["subject_prefix"] = _settings_str(iem.get("subject_prefix"), 64)
 
-    appconfig.update_settings({"alerts": copy.deepcopy(a)})
+        try:
+            appconfig.update_settings({"alerts": a})
+        except (appconfig.SettingsError, OSError) as e:
+            raise HTTPException(500, "通知设置保存失败，请检查配置文件和磁盘权限") from e
+        appconfig._merge_inplace(CFG.setdefault("alerts", {}), a)
     # 只记改了哪些块，不记值(值里有 bot_token/密码)
     _audit(request, sess["user"], "settings_save", ",".join(sorted(inb.keys()))[:200])
     return {"ok": True, "alerts": _mask_alerts(a)}
@@ -1459,7 +1481,7 @@ def api_sessions_revoke(request: Request):
 def api_health():
     """云端服务自身心跳(免登录、不含业务数据)：外部看门狗探活用。"""
     now = int(time.time())
-    return {"ok": True, "ts": now,
+    return {"ok": True, "ts": now, "instance": updater.health_identity(),
             "last_poll_age_s": (now - COLLECTOR.last_poll_ts) if COLLECTOR.last_poll_ts else None}
 
 

@@ -271,9 +271,12 @@ function mkLine(canvasId, datasets, { hours, yUnit, padRight }) {
   });
 }
 
+let _trendSeq = 0;
 async function loadTrend() {
+  const seq = ++_trendSeq;
   const hours = Number($("trendRange").value);
   const d = await api(`/api/trend?hours=${hours}`);
+  if (seq !== _trendSeq || hours !== Number($("trendRange").value)) return;
   const maxTh = Math.max(1, ...d.sites.flatMap(s => [
     ...[...s.points, ...(s.legacy_points || [])].map(p => num(p[1]) || 0),
     ...(s.partial_points || []).map(p => num(p.value) || 0),
@@ -481,7 +484,7 @@ $("siteDelete").onclick = async () => {
     const r = await send("DELETE", `/api/site/${encodeURIComponent(s.id)}`);
     if (!r.ok) throw new Error(await errText(r));
     removeConnSite(s.id);
-    if (curSite === s.id) { $("siteModal").classList.add("hidden"); curSite = null; curSiteData = null; }
+    if (curSite === s.id) closeSite();
     await refresh();
   } catch (e) { $("siteManageMsg").textContent = e.message; }
   finally { setSiteBusy(false); }
@@ -532,8 +535,13 @@ document.addEventListener("click", (e) => {
   const card = e.target.closest(".site[data-site-id]");
   if (card) openSite(card.dataset.siteId);
 });
-$("siteClose").onclick = () => $("siteModal").classList.add("hidden");
-$("siteModal").addEventListener("click", (e) => { if (e.target === $("siteModal")) $("siteModal").classList.add("hidden"); });
+function closeSite() {
+  _siteSeq++;
+  curSite = null; curSiteData = null;
+  $("siteModal").classList.add("hidden");
+}
+$("siteClose").onclick = closeSite;
+$("siteModal").addEventListener("click", (e) => { if (e.target === $("siteModal")) closeSite(); });
 $("siteRange").onchange = () => loadSite().catch(() => {});
 
 function fmtDuration(s) {
@@ -562,12 +570,20 @@ function renderSiteAlerts(groups) {
   }).join("");
 }
 
+let _siteSeq = 0;
 async function loadSite() {
   const id = curSite;
   if (!id) return;
+  const seq = ++_siteSeq;
   const hours = Number($("siteRange").value);
-  const d = await api(`/api/site/${encodeURIComponent(id)}?hours=${hours}`);
-  if (curSite !== id) return;
+  let d;
+  try {
+    d = await api(`/api/site/${encodeURIComponent(id)}?hours=${hours}`);
+  } catch (e) {
+    if (seq !== _siteSeq || curSite !== id) return;
+    throw e;
+  }
+  if (seq !== _siteSeq || curSite !== id || hours !== Number($("siteRange").value)) return;
   const s = d.site, st = STATE[s.state] || STATE.pending, tp = TYPE[s.type] || TYPE.air;
   curSiteData = s;
   $("siteName").value = s.name;
@@ -602,12 +618,12 @@ async function loadSite() {
 
   renderSiteCustomers(d.customers);
 
-  loadDaily(d.site.id).catch(() => {});
+  loadDaily(d.site.id, seq).catch(() => {});
 }
 
-async function loadDaily(id) {
+async function loadDaily(id, seq = _siteSeq) {
   const d = await api(`/api/daily?site=${encodeURIComponent(id)}&days=14`);
-  if (curSite !== id) return;
+  if (seq !== _siteSeq || curSite !== id) return;
   $("tblDaily").querySelector("tbody").innerHTML = d.days.map((r) => `<tr>
     <td>${esc(r.day)}</td><td>${AntDataQuality.daily(r, "avg_hashrate_ths", "hashrate_ths", t, n => fmtHash(n, "/s"))}</td>
     <td>${AntDataQuality.daily(r, "max_hashrate_ths", "hashrate_ths", t, n => fmtHash(n, "/s"))}</td>

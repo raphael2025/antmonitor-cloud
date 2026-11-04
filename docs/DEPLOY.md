@@ -151,11 +151,12 @@ cp config.example.yaml config.yaml && chmod 600 config.yaml
 #  自检: venv/bin/python seccheck.py   (没有"✖ 高危"才算过)
 #  HTTPS：前置 nginx(§3)；或填 server.tls_cert/tls_key 让服务自己跑 HTTPS
 #  (自签证书再加 server.tls_self_signed: true，场地接入页才会显示指纹)
-venv/bin/python server.py
+venv/bin/python cloud_launcher.py
 ```
 
 systemd 单元可参考一键脚本生成的 `/etc/systemd/system/antmonitor-cloud.service`。
-Windows 服务器用 NSSM：`nssm install CloudOverview "C:\...\python.exe" "D:\antmonitor-cloud\server.py"`。
+Windows 服务器用 NSSM：`nssm install CloudOverview "C:\...\python.exe" "D:\antmonitor-cloud\cloud_launcher.py"`。
+已有 `python server.py` 服务入口会自动转入启动器；非 Git 源码包仍可直接运行，Docker 继续通过重建镜像更新。
 
 ## 3. 自己配 nginx 反代（不用一键脚本的 Caddy 时）
 
@@ -366,8 +367,10 @@ git revert -m 1 HEAD && git push origin master   # 反向提交往前推，部�
 ```
 
 - **云端**：面板右上角自动出现「🔄 更新 (N)」按钮（admin 可见，悬停看更新内容）→
-  点击 → 自动拉取+编译自检+重启（约10秒），失败自动回滚。
-  或命令行：`python updater.py check / apply`（apply 后需重启服务）。
+  点击后先在独立候选目录编译、导入并执行隔离启动检查。依赖变化时创建单独环境，检查通过后才快进切换代码。
+  新进程运行至少 60 秒且本次实例的 HTTP 健康接口确认成功后，更新才完成；依赖下载会增加等待时间。
+  命令行分别执行 `python updater.py check`、`python updater.py apply`，后者准备完成后仍需重启服务。
+  已有受保护 Git 安装重跑安装脚本或执行 `update` 时，也使用这一流程，并保持 GitHub/Gitee 及离线 wheels 选项。
 - **场地端**：`config.yaml > update.auto: true` 则每小时自查自动更新重启（NAT 后无人值守的推荐方式）；
   或运维远程桌面到场地机器跑 `python updater.py apply` 再重启服务。
   也有 API：`GET /api/update/check`、`POST /api/update/apply`（admin）。
@@ -377,9 +380,16 @@ git revert -m 1 HEAD && git push origin master   # 反向提交往前推，部�
 - **⚠ 红线：master 永远禁止 `git push --force` / `reset --hard` 后强推**——部署机只做
   快进合并，主支历史被改写后所有部署机快进失败、集体卡住不更新。回退一律用
   `git revert`（见上），它是"往前滚"的回退，与自动更新完美兼容。
-- 只做**快进合并**，分叉历史会被拒绝；这不能代替保存本地代码改动，更新前先检查 `git status`
-- 更新后全量 `py_compile` 自检，**语法错误自动回滚**到原版本，绝不带病重启
-- 重启交给守护进程（云端 systemd；场地端 NSSM 或 `run.bat` 循环）
+- 只做**快进合并**，分叉历史会被拒绝。云端在候选检查前、真正切换前都要求干净工作区，
+  暂存、未暂存和未忽略的新文件都会阻止更新；不会用强制重置覆盖现场代码改动。
+- 云端候选代码或依赖检查失败时保留运行版本与原解释器。新版本启动崩溃、未确认健康便退出，
+  或 180 秒内不能通过健康确认时，启动器有限重试；连续 3 次失败后恢复上一提交及依赖环境。
+  回退前若发现现场改动，停止自动回退并报告人工检查，保留改动。
+- 已失败的提交会被自动更新跳过；修复环境后可用网页手动更新或 CLI apply 重试。
+  恢复状态与分版本依赖环境存于 Git 私有目录 `antcloud-update`（普通克隆为 `.git/antcloud-update`），
+  运行中的解释器可能位于其中。保留该目录，配置和数据库继续按各自备份方案保存。
+- 首次从没有启动器的旧版本升级时，该次更新仍由旧更新代码执行；本版成功启动后，后续 Git 更新才具有上述完整保护。
+- 云端由 `cloud_launcher.py` 监督应用子进程，systemd 管理启动器；场地端继续使用 NSSM 或 `run.bat` 循环。
 - **灰度习惯**：先只给一个试点场地开 `update.auto`（或手动先更它），推完看云端面板
   正常，其它场地再更；重要版本发布前打标签 `git tag v20260709` 方便对照
 - 自动更新的场地如果更坏了（运行期错误编译自检拦不住）：守护进程重启循环 →

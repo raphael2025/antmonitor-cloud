@@ -291,6 +291,50 @@ setup_venv() {
   as_svc "$DIR/venv/bin/pip" install -q "${opts[@]}" -r "$DIR/requirements.txt"
 }
 
+protected_git_update() {
+  command -v git >/dev/null || die "Git is required for this deployment"
+  [[ -x "$DIR/venv/bin/python" ]] || die "Missing installation Python: $DIR/venv/bin/python"
+  [[ "$SOURCE_EXPLICIT" -ne 0 || -z "$SRC" ]] \
+    || die "Destination is a Git checkout; use a fast-forward Git update or a separate directory"
+  select_origin
+  local origin alternate="" current wheels="${ANTCLOUD_WHEELHOUSE:-}"
+  origin="$(git_dir remote get-url origin)"
+  current="$(git_dir rev-parse --abbrev-ref HEAD)"
+  if [[ "$AUTO_SOURCE" == 1 && "$current" == "$BRANCH" ]] && official_origin "$origin"; then
+    if [[ "$origin" == *gitee.com* ]]; then alternate="${GH_PROXY}https://github.com/raphael2025/antmonitor-cloud.git"
+    else alternate="https://gitee.com/raphael01/antmonitor-cloud.git"; fi
+  fi
+  info "$(L '检查候选代码、依赖与启动，保留失败回退点' 'Validating candidate code, dependencies and startup with rollback protection')"
+  # The guardian/updater needs only stdlib. The selected application interpreter
+  # may live in .git/antcloud-update/envs; never pip-install into the live venv.
+  PY="$(as_svc env ANTCLOUD_WHEELHOUSE="$wheels" "$DIR/venv/bin/python" - "$DIR" "$BRANCH" "$alternate" <<'PY'
+import os, sys
+os.chdir(sys.argv[1])
+sys.path.insert(0, sys.argv[1])
+import updater
+result = updater.apply(branch=sys.argv[2], restart=False, force=True,
+                       fallback_url=sys.argv[3] or None)
+print(result.get("msg") or "Update prepared; restarting for HTTP health confirmation", file=sys.stderr)
+if not (result.get("ok") or result.get("unchanged")):
+    sys.exit(1)
+print(updater.runtime_python())
+PY
+)" || die "$(L '更新检查失败，已保留运行版本/恢复状态；请查看上方原因' 'Update validation failed; running version/recovery state preserved; see the error above')"
+}
+
+update_code_and_dependencies() {
+  if [[ -e "$DIR/.git" && -f "$DIR/cloud_launcher.py" ]]; then
+    protected_git_update
+  else
+    # New installations and archive deployments keep their existing source flow.
+    # Legacy Git installations acquire the guardian on this first upgrade; old
+    # server.py service units are redirected by the new stdlib entry bootstrap.
+    fetch_code
+    [[ -f "$DIR/server.py" ]] || die "$(L '代码下载不完整' 'Incomplete download')"
+    setup_venv
+  fi
+}
+
 cfg_set() { as_svc "$PY" "$DIR/tools/configure.py" "$CONF" "$@"; }
 cfg_get() {  # cfg_get section key
   as_svc "$PY" - "$CONF" "$1" "$2" <<'PY'
@@ -544,9 +588,10 @@ Wants=network-online.target
 [Service]
 User=${SVC_USER}
 WorkingDirectory=${DIR}
-ExecStart=${DIR}/venv/bin/python server.py
+ExecStart=${DIR}/venv/bin/python cloud_launcher.py
 Restart=always
 RestartSec=5
+RestartPreventExitStatus=78
 Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -601,9 +646,7 @@ do_install() {
   local fresh=0
   [[ -f "$CONF" ]] || fresh=1
   [[ -d "$DIR" ]] && fix_owner
-  fetch_code
-  [[ -f "$DIR/server.py" ]] || die "$(L '代码下载不完整' 'Incomplete download')"
-  setup_venv
+  update_code_and_dependencies
   ensure_config
   # 首次安装没给 --domain：默认 IP 模式。已有配置且没给模式参数：不动现有网络配置
   # (比如原来自己配的 nginx 反代，重跑本脚本只更新代码)
@@ -636,8 +679,7 @@ do_update() {
   fi
   create_user
   fix_owner
-  fetch_code
-  setup_venv
+  update_code_and_dependencies
   PORT="$(port_of)"
   ensure_perms
   write_service

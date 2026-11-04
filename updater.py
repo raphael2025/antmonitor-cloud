@@ -164,6 +164,47 @@ def runtime_python():
     return interpreter
 
 
+def _normalize_public_remote(url):
+    """Use anonymous HTTPS for this public project instead of requiring SSH keys."""
+    raw = str(url or "").strip()
+    comparable = raw.rstrip("/")
+    if comparable.endswith(".git"):
+        comparable = comparable[:-4]
+    official = {
+        "git@github.com:raphael2025/antmonitor-cloud":
+            "https://github.com/raphael2025/antmonitor-cloud.git",
+        "ssh://git@github.com/raphael2025/antmonitor-cloud":
+            "https://github.com/raphael2025/antmonitor-cloud.git",
+        "https://github.com/raphael2025/antmonitor-cloud":
+            "https://github.com/raphael2025/antmonitor-cloud.git",
+        "git@gitee.com:raphael01/antmonitor-cloud":
+            "https://gitee.com/raphael01/antmonitor-cloud.git",
+        "ssh://git@gitee.com/raphael01/antmonitor-cloud":
+            "https://gitee.com/raphael01/antmonitor-cloud.git",
+        "https://gitee.com/raphael01/antmonitor-cloud":
+            "https://gitee.com/raphael01/antmonitor-cloud.git",
+    }
+    return official.get(comparable, raw)
+
+
+def _fetch_sources(fallback_url=None):
+    """Return read-only fetch sources without rewriting the configured origin."""
+    origin = _git("remote", "get-url", "origin", timeout=15)
+    primary = _normalize_public_remote(origin)
+    sources = [primary]
+    if fallback_url:
+        sources.append(_normalize_public_remote(fallback_url))
+    elif primary == "https://github.com/raphael2025/antmonitor-cloud.git":
+        sources.append("https://gitee.com/raphael01/antmonitor-cloud.git")
+    elif primary == "https://gitee.com/raphael01/antmonitor-cloud.git":
+        sources.append("https://github.com/raphael2025/antmonitor-cloud.git")
+    result = []
+    for source in sources:
+        if source and source not in result:
+            result.append(source)
+    return result
+
+
 def check(branch=None, fallback_url=None):
     """Read update availability. A rejected version is visible but not auto-applied."""
     if not is_git_deployment():
@@ -181,12 +222,17 @@ def check(branch=None, fallback_url=None):
         # shared by all fetches, so each check owns an independent temporary ref.
         fetched_ref = "refs/antcloud/check/" + uuid.uuid4().hex
         try:
-            try:
-                _git("fetch", "--quiet", "origin", branch + ":" + fetched_ref, timeout=120)
-            except Exception:
-                if not fallback_url:
-                    raise
-                _git("fetch", "--quiet", fallback_url, branch + ":" + fetched_ref, timeout=120)
+            errors = []
+            fetched = False
+            for source in _fetch_sources(fallback_url):
+                try:
+                    _git("fetch", "--quiet", source, branch + ":" + fetched_ref, timeout=120)
+                    fetched = True
+                    break
+                except Exception as exc:
+                    errors.append("%s: %s" % (source, str(exc)[-500:]))
+            if not fetched:
+                raise RuntimeError("公开更新源均不可达: " + " | ".join(errors)[-1400:])
             remote = _git("rev-parse", fetched_ref)
         finally:
             _git("update-ref", "-d", fetched_ref)

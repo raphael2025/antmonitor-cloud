@@ -4,6 +4,7 @@ cloud_settings.json
 *.db
 *.db-wal
 *.db-shm
+*.before-statistics-cleanup-*.sqlite3
 data/
 
 # Python

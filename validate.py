@@ -100,7 +100,7 @@ REPORT_FIELDS = BILLING_FIELDS + PERIOD_FIELDS + ("machines_source",)
 
 
 def customers(rows, limit=5000, strict=False):
-    """客户报表保留未知、真实零和独立覆盖；旧估算只进入 legacy 字段。"""
+    """保留实测报表和真实零；无观测依据的旧累计值不再进入统计。"""
     out = []
     if not isinstance(rows, list):
         if strict:
@@ -119,9 +119,8 @@ def customers(rows, limit=5000, strict=False):
             raise ValueError("customers 客户重复")
         seen.add(worker)
         source = c.get("billing_source")
-        if source not in ("observed", "legacy_only", "missing"):
-            source = "legacy_only" if any(c.get(k) is not None for k in
-                                         ("delivered_th_h", "power_kwh", "uptime_pct")) else "missing"
+        if source != "observed":
+            source = "missing"
         row = {
             "worker": worker,
             "machines": num(c.get("machines"), int, hi=10**6),
@@ -138,10 +137,7 @@ def customers(rows, limit=5000, strict=False):
         }
         for key, maximum in (("uptime_pct", 100), ("delivered_th_h", 10**13), ("power_kwh", 10**10)):
             row[key] = measurement(c.get(key), hi=maximum) if source == "observed" else None
-            legacy = c.get("legacy_" + key)
-            if legacy is None and source == "legacy_only":
-                legacy = c.get(key)
-            row["legacy_" + key] = measurement(legacy, hi=maximum)
+            row["legacy_" + key] = None  # Compatibility keys only; old ledgers are not revived.
         for prefix in ("delivery", "power", "uptime"):
             observed = measurement(c.get(prefix + "_observed_hours"), hi=24 * 90)
             hours = row["billing_hours"]
@@ -296,6 +292,27 @@ def measurement_timestamp(src, scan_ts):
     # only make a measurement slightly older, never refresh an old reading.
     corrected = math.floor(scan_ts - max(0, raw_scan - measured))
     return corrected if corrected > 0 else None
+
+
+def scan_progress_fields(src, now, scan_ts):
+    """Normalize scan metadata without refreshing a delayed heartbeat on receipt."""
+    sent = measurement(src.get("ts"), int, hi=253402300799)
+    raw_scan = measurement(src.get("scan_ts"), int, hi=253402300799)
+    started = measurement(src.get("scan_started_ts"), int, hi=253402300799)
+    if not scan_ts or not raw_scan or not started or started > raw_scan:
+        started = None
+    else:
+        started = scan_ts - (raw_scan - started)
+        if started <= 0:
+            started = None
+    scanning = src.get("scanning") is True
+    progress = measurement(src.get("scan_progress_ts"), int, hi=253402300799)
+    if (not scanning or not sent or sent > now + 60 or not progress or
+            progress > sent or progress > now + 60):
+        progress = None
+    else:
+        progress = min(progress, now - (sent - progress))
+    return {"scan_started_ts": started, "scanning": scanning, "scan_progress_ts": progress}
 
 
 def site_key(v, maxlen=64):

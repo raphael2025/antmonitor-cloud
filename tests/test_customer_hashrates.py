@@ -54,11 +54,12 @@ def test_old_database_migrates_without_inventing_rates(tmp_path):
     old.execute("INSERT INTO site_customers VALUES('a','customer',1,100,7032,120,24,100)")
     old.commit()
     old.close()
-    for _ in range(2):  # migration is idempotent, old bills survive every startup
+    for _ in range(2):  # migration clears only incompatible metrics, once
         conn = db.connect(path)
         row = db.customers(conn)[0]
-        assert row["delivered_th_h"] == 7032
-        assert row["power_kwh"] == 120
+        assert row["worker"] == "customer" and row["machines"] == 1
+        assert row["delivered_th_h"] is None
+        assert row["power_kwh"] is None
         for field in ("hashrate_ths", "avg_hashrate_ths", "hashrate_hours", "observed_hours",
                       "coverage_pct", "hashrate_ts", "current_machines"):
             assert row[field] is None
@@ -176,7 +177,7 @@ def test_legacy_report_never_converts_integral_into_unknown_average(cloud):
     post_customers(client, [{"worker": "c", "machines": 1, "delivered_th_h": 7032}])
     row = payload(client)["rows"][0]
     assert row["delivered_th_h"] is None
-    assert row["legacy_delivered_th_h"] == 7032
+    assert row["legacy_delivered_th_h"] is None
     assert row["hashrate_ths"] is None
     assert row["avg_hashrate_ths"] is None
     assert row["current_machines"] is None
@@ -223,8 +224,8 @@ def test_fresh_site_summary_with_legacy_customer_report_is_not_expired(cloud, mo
         assert row["report_stale"] is False
         assert row["delivered_th_h"] is None
         assert row["power_kwh"] is None
-        assert row["legacy_delivered_th_h"] == 3360000
-        assert row["legacy_power_kwh"] == 59940
+        assert row["legacy_delivered_th_h"] is None
+        assert row["legacy_power_kwh"] is None
 
 
 def test_new_report_waiting_for_first_scan_is_missing_not_unreported(cloud):
@@ -414,7 +415,7 @@ def test_customer_count_falls_back_only_without_current_roster(cloud):
     assert overview["totals"]["customers"] == overview["sites"][0]["customers"] == 1
     rows = {r["worker"]: r for r in client.get("/api/customers").json()["rows"]}
     assert rows["legacy-owner"]["current_machines"] == 0
-    assert rows["legacy-owner"]["legacy_power_kwh"] == 10
+    assert rows["legacy-owner"]["legacy_power_kwh"] is None
 
 
 def test_stale_or_unknown_readings_do_not_remove_current_customer_ownership(cloud, monkeypatch):

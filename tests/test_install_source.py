@@ -120,6 +120,71 @@ command() {
     def existing_checkout(self):
         (self.install_dir / ".git").mkdir(parents=True)
 
+    def protected_checkout(self):
+        import sys
+        self.existing_checkout()
+        (self.install_dir / "server.py").write_text("# server\n")
+        (self.install_dir / "cloud_launcher.py").write_text("# guardian\n")
+        binary = self.install_dir / "venv" / "bin" / "python"
+        binary.parent.mkdir(parents=True)
+        binary.symlink_to(sys.executable)
+        (self.install_dir / "updater.py").write_text(
+            "import json, os, sys\n"
+            "def apply(**kwargs):\n"
+            "    kwargs['wheels'] = os.environ.get('ANTCLOUD_WHEELHOUSE')\n"
+            "    with open(os.environ['TEST_LOG'], 'a') as f: f.write(json.dumps(kwargs) + '\\n')\n"
+            "    return {'ok': os.environ.get('TEST_UPDATE_FAIL') != '1', 'msg': 'checked'}\n"
+            "def runtime_python(): return sys.executable\n")
+
+    def test_protected_update_preserves_active_environment_and_wheelhouse(self):
+        import json
+        self.protected_checkout()
+        wheels = str(self.root / "offline wheels")
+        result = self.run_script('update_code_and_dependencies',
+                                 extra_env={"ANTCLOUD_WHEELHOUSE": wheels})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = next(json.loads(line) for line in self.requests().splitlines() if line.startswith('{'))
+        self.assertFalse(record["restart"])
+        self.assertTrue(record["force"])
+        self.assertEqual(record["fallback_url"], GITEE)
+        self.assertEqual(record["wheels"], wheels)
+        self.assertNotIn("merge ", self.requests())
+
+    def test_protected_explicit_source_does_not_supply_automatic_fallback(self):
+        import json
+        self.protected_checkout()
+        result = self.run_script('update_code_and_dependencies', '--source', 'gitee')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = next(json.loads(line) for line in self.requests().splitlines() if line.startswith('{'))
+        self.assertFalse(record["fallback_url"])
+        self.assertIn("remote set-url origin " + GITEE, self.requests())
+
+    def test_protected_update_failure_cannot_fall_back_to_raw_merge(self):
+        self.protected_checkout()
+        result = self.run_script('update_code_and_dependencies', extra_env={"TEST_UPDATE_FAIL": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("\"restart\": false", self.requests())
+        self.assertNotIn("fetch ", self.requests())
+        self.assertNotIn("merge ", self.requests())
+
+    def test_both_existing_install_actions_use_guarded_update_entry(self):
+        for action in ("do_update", "do_install"):
+            self.install_dir.mkdir(exist_ok=True)
+            (self.install_dir / "server.py").write_text("# existing\n")
+            (self.install_dir / "config.yaml").write_text("# existing\n")
+            result = self.run_script(r'''
+install_packages() { :; }
+create_user() { :; }
+fix_owner() { :; }
+fetch_code() { echo RAW_FETCH; return 88; }
+setup_venv() { echo LIVE_PIP; return 89; }
+update_code_and_dependencies() { echo GUARDED; exit 0; }
+''' + action)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("GUARDED", result.stdout)
+            self.assertNotIn("RAW_FETCH", result.stdout)
+            self.assertNotIn("LIVE_PIP", result.stdout)
+
     def test_gitee_install_clones_selected_branch(self):
         result = self.run_script("fetch_code", "--source", "gitee", "--branch", "release")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)

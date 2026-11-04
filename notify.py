@@ -27,6 +27,7 @@ import ipaddress
 import smtplib
 import socket
 import time
+import json
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.text import MIMEText
@@ -46,7 +47,9 @@ _NOTICE_GROUPS = (
 
 class Notifier:
     def __init__(self, cfg, conn):
-        a = cfg.get("alerts") or {}
+        a = cfg.get("alerts")
+        if not isinstance(a, dict):
+            a = cfg["alerts"] = {}
         self.cfg = a
         self.poll = cfg.get("poll") or {}
         self.conn = conn
@@ -55,13 +58,68 @@ class Notifier:
         # 规则关闭时暂停投递，但用最近启用的阈值确认旧事件是否结束，避免重开补发过期告警。
         self.drop_pct = float(a.get("hashrate_drop_pct", 30) or 0)
         self.offline_threshold = int(a.get("offline_threshold", 0) or 0)
-        self.prev = None          # site_id -> state(首轮只记不发，防重启风暴)
+        self.prev = None          # site_id -> state(无检查点时首轮只记不发)
         self.active_drop = {}     # site_id -> 触发时基线(TH/s)
         self.active_offline = {}  # site_id -> True(掉线台数超阈值中，去抖动用)
         self.last_sent = {}       # (site_id, type) -> ts
         # 仅当前事件的未送达通道。成功通道不重发；失败按 60s~15min 退避。
-        # 进程内队列，不把它当作重启后仍在的持久化消息服务。
-        self.pending = {}         # (site_id, type) -> {msg, remaining, attempts, due, created}
+        # SQLite 检查点保存活动事件、原始基线、重试计划和已送达通道。
+        self.pending = {}         # (site_id, type) -> {msg, remaining, delivered, attempts, due, created}
+        self._epochs = {}         # 删除代次：防在途任务复活已删/已恢复场地的旧事件。
+        self._saved = {}          # 单场地变更检测，空转轮次不写 SQLite。
+        self._delivery_budget = None
+        states, pending, sent = db.notification_load(conn)
+        if states:
+            self.prev = {r["site_id"]: r["state"] for r in states}
+        for row in states:
+            sid = row["site_id"]
+            self._epochs[sid] = row["epoch"]
+            if row["drop_baseline"] is not None:
+                self.active_drop[sid] = row["drop_baseline"]
+            if row["offline_active"]:
+                self.active_offline[sid] = True
+            if self.drop_pct <= 0:
+                self.drop_pct = row["drop_pct"]
+            if self.offline_threshold <= 0:
+                self.offline_threshold = row["offline_threshold"]
+        for row in pending:
+            self.pending[(row["site_id"], row["type"])] = {
+                "msg": row["msg"], "remaining": set(json.loads(row["remaining_json"])),
+                "delivered": set(json.loads(row["delivered_json"])), "created": row["created_ts"],
+                "due": row["due_ts"], "attempts": row["attempts"]}
+        self.last_sent = {(r["site_id"], r["type"]): r["sent_ts"] for r in sent}
+
+    def _forget_site(self, sid):
+        if self.prev is not None:
+            self.prev.pop(sid, None)
+        self.active_drop.pop(sid, None)
+        self.active_offline.pop(sid, None)
+        for table in (self.pending, self.last_sent):
+            for key in list(table):
+                if key[0] == sid:
+                    table.pop(key, None)
+
+    def _persist(self, site_id=None):
+        """先保存再发请求；每个成功通道都马上提交回执，不等其它通道。"""
+        targets = list(self._epochs.items()) if site_id is None else [(site_id, self._epochs.get(site_id))]
+        for sid, epoch in targets:
+            if epoch is None:
+                continue
+            state = None
+            if self.prev is not None and sid in self.prev:
+                state = {"state": self.prev[sid], "drop_baseline": self.active_drop.get(sid),
+                         "offline_active": sid in self.active_offline, "drop_pct": self.drop_pct,
+                         "offline_threshold": self.offline_threshold}
+            pending = {kind: notice for (site, kind), notice in self.pending.items() if site == sid}
+            sent = {kind: ts for (site, kind), ts in self.last_sent.items() if site == sid}
+            signature = json.dumps([state, pending, sent], sort_keys=True, default=sorted)
+            if signature == self._saved.get(sid):
+                continue
+            if not db.notification_save(self.conn, sid, epoch, state, pending, sent):
+                self._forget_site(sid)
+                self._saved.pop(sid, None)
+                continue
+            self._saved[sid] = signature
 
     def channels_on(self):
         return bool((self.cfg.get("telegram") or {}).get("enabled")
@@ -77,17 +135,29 @@ class Notifier:
             return
         # 开始值班后即使暂时关通知，也继续确认事件是否恢复/场地是否删除。
         # 只暂停投递；未送达通道不能忘记，否则修好配置重开后原故障永远不会再通知。
+        self._delivery_budget = 20  # 每轮最多 20 个通道请求，避免停机期间积压在重启时集中轰炸。
         try:
             self._tick(sites, site_state_fn)
         except Exception as e:
             print(f"[notify] 评估异常: {e}")
+        finally:
+            self._delivery_budget = None
 
     def _tick(self, sites, site_state_fn):
         now = int(time.time())
         last_ok = db.latest_ok_snapshots(self.conn)
         cur = {}
         for s in sites:
-            cur[s["id"]] = (site_state_fn(s["id"], last_ok.get(s["id"]), s["mode"], now), s)
+            sid = s["id"]
+            epoch, deleted = db.notification_generation(self.conn, sid)
+            if deleted:
+                self._forget_site(sid)
+                continue
+            if sid in self._epochs and self._epochs[sid] != epoch:
+                self._forget_site(sid)
+                self._saved.pop(sid, None)
+            self._epochs[sid] = epoch
+            cur[sid] = (site_state_fn(sid, last_ok.get(sid), s["mode"], now), s)
         # 删除场地后不能继续补发旧告警；也清理原事件与冷却，避免恢复同 ID 时串状态。
         for table in (self.active_drop, self.active_offline):
             for sid in list(table):
@@ -97,15 +167,16 @@ class Notifier:
             for key in list(table):
                 if key[0] not in cur:
                     table.pop(key, None)
-        if self.prev is None:                     # 进程刚启动：记状态不发通知
+        if self.prev is None:                     # 首次安装/无检查点：记状态不发通知。
             self.prev = {k: v[0] for k, v in cur.items()}
+            self._persist()
             return
         self.prev = {sid: state for sid, state in self.prev.items() if sid in cur}
         for sid, (state, s) in cur.items():
             old = self.prev.get(sid)
+            self.prev[sid] = state  # 与新事件一起持久化；中途崩溃不能重复识别同一次跳变。
             if old is not None and state != old:
                 self._on_transition(sid, s, old, state, last_ok.get(sid), now)
-            self.prev[sid] = state
         drop_pct = float(self.cfg.get("hashrate_drop_pct", 30) or 0)   # 现场读，见 tick() 注释
         if drop_pct > 0:
             self.drop_pct = drop_pct
@@ -122,6 +193,7 @@ class Notifier:
                 if state in ("ok", "alert"):
                     self._check_offline(sid, s, last_ok.get(sid), now)
         self._retry_pending(cur, last_ok, now)
+        self._persist()
 
     # ---- 状态跳变 ----
     def _on_transition(self, sid, s, old, new, snap, now):
@@ -220,8 +292,9 @@ class Notifier:
         due = now
         if not recovery and key in self.last_sent:
             due = max(due, self.last_sent[key] + cooldown)
-        self.pending[key] = {"msg": msg, "remaining": set(channels), "attempts": 0,
-                             "due": due, "created": now}
+        self.pending[key] = {"msg": msg, "remaining": set(channels), "delivered": set(),
+                             "attempts": 0, "due": due, "created": now}
+        self._persist(sid)   # 事件/活动状态必须在任何外部请求之前落地，包括暂停和冷却中的事件。
         self._attempt_pending(key, now)
 
     def _attempt_pending(self, key, now):
@@ -238,11 +311,25 @@ class Notifier:
         ready = notice["remaining"].intersection(channels)
         if not ready:
             return  # 通道关闭只暂停，不丢失失败状态，也不占用成功冷却。
+        if self._delivery_budget is not None and self._delivery_budget <= 0:
+            return
         msg = notice["msg"]
         if now > notice["created"]:
             created = datetime.fromtimestamp(notice["created"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             msg = f"⏳ 补发通知（事件时间 {created}）\n{msg}"
+        self._persist(key[0])
+        failed = False
         for channel in sorted(ready):
+            if key not in self.pending:
+                return
+            epoch, deleted = db.notification_generation(self.conn, key[0])
+            if deleted or epoch != self._epochs.get(key[0]):
+                self._forget_site(key[0])
+                return
+            if self._delivery_budget is not None:
+                if self._delivery_budget <= 0:
+                    break
+                self._delivery_budget -= 1
             cfg, sender = channels[channel]
             try:
                 ok = bool(sender(cfg, msg))
@@ -250,6 +337,13 @@ class Notifier:
                 ok = False  # 不打印可能带 URL/token 的异常；其它通道继续尝试。
             if ok:
                 notice["remaining"].remove(channel)
+                notice["delivered"].add(channel)
+                if not notice["remaining"]:
+                    self.last_sent[key] = now
+                    self.pending.pop(key, None)
+                self._persist(key[0])  # webhook/email 失败或进程随后退出，也不能重发已送达 Telegram。
+            else:
+                failed = True
             logged = f"[{channel}] {msg}"
             try:
                 db.notify_log_add(self.conn, now, key[0], key[1], logged, ok)
@@ -259,15 +353,13 @@ class Notifier:
                 print(f"[notify] {'OK' if ok else 'FAIL'} {logged}")
             except Exception:
                 pass
-        if not notice["remaining"]:
-            self.last_sent[key] = now
-            self.pending.pop(key, None)
-        else:
+        if key in self.pending and failed:
             notice["attempts"] = min(notice["attempts"] + 1, 5)
             notice["due"] = now + min(900, 60 * 2 ** (notice["attempts"] - 1))
+            self._persist(key[0])
 
     def _retry_pending(self, cur, last_ok, now):
-        for key in list(self.pending):
+        for key in sorted(self.pending, key=lambda k: (self.pending[k]["due"], self.pending[k]["created"], k)):
             sid, ntype = key
             if sid not in cur:
                 self.pending.pop(key, None)

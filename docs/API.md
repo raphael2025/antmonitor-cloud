@@ -426,7 +426,7 @@ curl -s -H "Authorization: Bearer $TOKEN" https://overview.example.com/api/publi
 ### `GET /api/health`（免登录，无业务数据）
 
 ```json
-{"ok": true, "ts": 1783574000, "last_poll_age_s": 12}
+{"ok": true, "ts": 1783574000, "instance": "本次启动的随机标识", "last_poll_age_s": 12}
 ```
 `last_poll_age_s` = 采集循环上次跑完距现在秒数（远超 `poll.interval` 说明云端服务自身卡死，
 外部看门狗应报警）。纯推送部署下该循环也在跑（做数据清理），此值同样有效。

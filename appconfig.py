@@ -40,37 +40,77 @@ class SettingsError(RuntimeError):
     """cloud_settings.json 存在但读不了/解析不了：绝不能当成空文件再整份覆盖写回去。"""
 
 
+# 每个配置路径分别保存最后一次完整、可信的覆盖层。读错误绝不能把密码/撤销项变回 YAML。
+# 仅进程内保留：新进程读到坏文件直接停止启动，让管理员修复原文件。
+_trusted = {}
+# 见过坏文件/断链/读取权限错误后，删除它也不能重新当作首次安装。
+# 与可信快照分开：观察到文件存在不等于其内容可以作为凭据覆盖层。
+_observed_existing = set()
+
+
+def _validate_settings(data):
+    if not isinstance(data, dict):
+        raise SettingsError("配置根节点必须是对象")
+    for section in ("passwords", "ingest", "alerts", "connect"):
+        if section in data and not isinstance(data[section], dict):
+            raise SettingsError("配置 %s 必须是对象" % section)
+    passwords = data.get("passwords", {})
+    if any(not isinstance(v, str) or not v for v in passwords.values()):
+        raise SettingsError("passwords 中的口令覆盖必须是非空字符串")
+    ingest = data.get("ingest", {})
+    if "token" in ingest and not isinstance(ingest["token"], str):
+        raise SettingsError("ingest.token 必须是字符串（空串表示停用）")
+    for key in ("tokens", "site_meta"):
+        if key in ingest and not isinstance(ingest[key], dict):
+            raise SettingsError("ingest.%s 必须是对象" % key)
+    if any(not isinstance(v, str) for v in ingest.get("tokens", {}).values()):
+        raise SettingsError("场地 token 必须是字符串（空串表示撤销）")
+    for key in ("telegram", "webhook", "email"):
+        alerts = data.get("alerts", {})
+        if key in alerts and not isinstance(alerts[key], dict):
+            raise SettingsError("alerts.%s 必须是对象" % key)
+    return data
+
+
 def _read_settings():
-    if not os.path.exists(SETTINGS_FILE):
-        return {}
+    """严格读取；仅首次安装且文件从未出现时允许空覆盖。写路径也使用它。"""
+    path = os.path.abspath(SETTINGS_FILE)
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-    except (OSError, ValueError) as e:
-        raise SettingsError(f"{SETTINGS_FILE} 读取失败({e})。常见原因：用 sudo 跑过 auth.py，"
-                            f"文件变成 root 所有——chown 回服务账号后重试") from e
-    return d if isinstance(d, dict) else {}
+            _observed_existing.add(path)
+            data = _validate_settings(json.load(f))
+    except FileNotFoundError as e:
+        if os.path.lexists(SETTINGS_FILE):  # 断链符号链接仍是已有的配置，不能回落到 YAML。
+            _observed_existing.add(path)
+        if path not in _observed_existing and not _trusted.get(path, {}).get("existed"):
+            _trusted[path] = {"data": {}, "existed": False}
+            return {}
+        raise SettingsError("%s 已有配置丢失；请恢复后重试" % SETTINGS_FILE) from e
+    except (OSError, ValueError, SettingsError) as e:
+        _observed_existing.add(path)
+        raise SettingsError("%s 读取失败(%s)；请修复文件或权限后重试" % (SETTINGS_FILE, e)) from e
+    _trusted[path] = {"data": copy.deepcopy(data), "existed": True}
+    return data
 
 
 def load_settings():
     with _LOCK:
         try:
             return _read_settings()
-        except SettingsError as e:
-            print(f"[appconfig] ⚠ {e}")   # 读路径降级为空(服务照常起)；写路径见 update_settings
-            return {}
+        except SettingsError:
+            trusted = _trusted.get(os.path.abspath(SETTINGS_FILE))
+            if not trusted or not trusted["existed"]:
+                raise  # 缺失文件的空值不是可信覆盖层；首次读取坏文件仍须失败关闭。
+            return copy.deepcopy(trusted["data"])
 
 
 def update_settings(patch):
-    """原子地把 patch 合并进 cloud_settings.json(加锁→读→浅合并→写)，返回合并后的完整 dict。
-
-    与 save 相比的关键差异：整个读-改-写在同一把锁内完成，多个管理员并发保存
-    (先 load 再改再 save)不会互相覆盖。patch 的每个顶层 key(如 "alerts")整体替换，
-    调用方需自己把完整的合并结果传进来(参见 server.py 的 POST /api/settings)。
-    """
+    """在同一锁中严格读取、合并并原子保存；失败不会污染最后可信覆盖层。"""
     with _LOCK:
-        merged = {**_read_settings(), **(patch or {})}   # 读失败直接抛错，不覆盖原文件
+        merged = _validate_settings({**_read_settings(), **(patch or {})})
         _atomic_json(SETTINGS_FILE, merged)
+        _observed_existing.add(os.path.abspath(SETTINGS_FILE))
+        _trusted[os.path.abspath(SETTINGS_FILE)] = {"data": copy.deepcopy(merged), "existed": True}
         return merged
 
 
@@ -85,6 +125,8 @@ def _atomic_json(path, data):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -95,32 +137,17 @@ def _atomic_json(path, data):
 
 
 # ---- 口令覆盖层(网页/命令行改密码) ----
-_pw_cache = {"mtime": None, "data": {}}
-
-
 def password_overrides():
-    """{用户名: 哈希}。按文件 mtime 缓存：命令行 `python auth.py passwd` 改完，
-    运行中的服务下一次登录/鉴权就读到新值，无需重启。"""
+    """使用与启动/保存相同的可信读路径；命令行改密码下一次鉴权即生效。"""
     with _LOCK:
-        try:
-            mt = os.path.getmtime(SETTINGS_FILE)
-        except OSError:
-            mt = None
-        if mt != _pw_cache["mtime"]:
-            p = load_settings().get("passwords") if mt is not None else None
-            _pw_cache["data"] = ({str(k): str(v) for k, v in p.items()}
-                                 if isinstance(p, dict) else {})
-            _pw_cache["mtime"] = mt
-        return dict(_pw_cache["data"])
+        return dict(load_settings().get("passwords", {}))
 
 
 def set_password_override(username, pw_hash):
     with _LOCK:
-        cur = _read_settings().get("passwords")
-        cur = dict(cur) if isinstance(cur, dict) else {}
+        cur = dict(_read_settings().get("passwords", {}))
         cur[str(username)] = str(pw_hash)
         update_settings({"passwords": cur})
-        _pw_cache["mtime"] = None   # 同一秒内连改两次 mtime 可能不变，强制下次重读
 
 
 def apply_settings(cfg, s):

@@ -123,26 +123,23 @@ def test_duplicate_receipt_timestamp_does_not_double_weight(conn):
     assert day["power_kwh"] == 5
 
 
-def test_legacy_daily_ledger_is_preserved_and_never_claims_coverage(conn):
+def test_legacy_daily_ledger_is_excluded_and_never_claims_coverage(conn):
     day = time.strftime("%Y-%m-%d", time.gmtime(START + 8 * 3600))
     old = ("a", day, 10, 222, 333, 1, 2, 20, 999)
     conn.execute("INSERT INTO daily VALUES(?,?,?,?,?,?,?,?,?)", old)
     conn.commit()
     snapshot(conn, START, unknown=None, hashrate_complete=None, power_complete=None)
-    report = rollup(conn, START + 60)[0]
-    assert report["method"] == "legacy_sample_mean"
-    assert report["coverage_pct"] is None
-    assert report["legacy_power_kwh"] == 999
+    assert rollup(conn, START + 60) == []
     assert tuple(conn.execute("SELECT * FROM daily").fetchone()) == old
     snapshot(conn, START + 60)
     report = rollup(conn, START + 120)[0]
     assert report["method"] == "time_weighted_v2"
     assert report["power_kwh"] == 6
-    assert report["legacy_power_kwh"] == 999
+    assert "legacy_power_kwh" not in report
     assert tuple(conn.execute("SELECT * FROM daily").fetchone()) == old
 
 
-def test_trend_keeps_legacy_values_separate_and_unknown_is_not_zero(conn):
+def test_trend_excludes_legacy_values_and_unknown_is_not_zero(conn):
     snapshot(conn, START, unknown=None, hashrate_complete=None, power_complete=None)
     snapshot(conn, START + 60, rate=None, power=None, hashrate_complete=False, power_complete=False)
     with patch.object(db.time, "time", return_value=START + 120):
@@ -150,7 +147,7 @@ def test_trend_keeps_legacy_values_separate_and_unknown_is_not_zero(conn):
     old = next(p for p in points if p["ts"] == START)
     unknown = next(p for p in points if p["ts"] == START + 60)
     assert old["hashrate_ths"] is None
-    assert old["legacy_hashrate_ths"] == 100
+    assert old["legacy_hashrate_ths"] is None
     assert unknown["hashrate_ths"] is None
     assert unknown["legacy_hashrate_ths"] is None
 
@@ -267,17 +264,17 @@ def test_billing_period_coverage_and_zero_survive_protocol(cloud):
     assert total["power_unavailable_reason"] == "partial_coverage"
 
 
-def test_legacy_energy_stays_legacy_and_missing_never_turns_into_zero(cloud):
+def test_legacy_energy_is_discarded_and_missing_never_turns_into_zero(cloud):
     server, client = cloud
     send_customers(client, "a", [{"worker": "same-worker", "power_kwh": 12, "delivered_th_h": 7032}])
     row = server._customers_payload()["rows"][0]
     assert row["power_kwh"] is None
-    assert row["legacy_power_kwh"] == 12
-    assert row["legacy_delivered_th_h"] == 7032
-    assert row["billing_source"] == "legacy_only"
+    assert row["legacy_power_kwh"] is None
+    assert row["legacy_delivered_th_h"] is None
+    assert row["billing_source"] == "missing"
     total = server._customers_payload()["by_worker"][0]
     assert total["power_kwh"] is None
-    assert total["legacy_power_kwh"] == 12
+    assert total["legacy_power_kwh"] is None
 
 
 @pytest.mark.parametrize("invalid", [None, False, [None], [{"worker": "same"}, {"worker": "same"}]])
@@ -560,13 +557,13 @@ def test_fractional_old_or_future_measurement_never_refreshes_known_power(cloud,
     assert overview["observed_totals"]["machines_online"] is None
 
 
-def test_old_time_protocol_stays_legacy_but_explicit_unknown_is_not_legacy(conn):
+def test_old_time_protocol_and_explicit_unknown_both_leave_trend_empty(conn):
     snapshot(conn, START, measurement_ts=None, measurement_time_supported=False)
     snapshot(conn, START + 60, measurement_ts=None, measurement_time_supported=True)
     with patch.object(db.time, "time", return_value=START + 120):
         points = {p["ts"]: p for p in db.trend(conn, "a", hours=1, points=60)}
     assert points[START]["hashrate_ths"] is None
-    assert points[START]["legacy_hashrate_ths"] == 100
+    assert points[START]["legacy_hashrate_ths"] is None
     assert points[START + 60]["hashrate_ths"] is None
     assert points[START + 60]["legacy_hashrate_ths"] is None
 

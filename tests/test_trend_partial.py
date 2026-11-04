@@ -118,7 +118,7 @@ def test_legacy_protocol_is_not_promoted_by_a_known_subtotal(conn):
     rows = trend(conn, START + 600)
     for p in (rows[START], rows[START + 300]):
         assert p["hashrate_ths"] is p["partial_hashrate_ths"] is None
-    assert rows[START + 300]["legacy_hashrate_ths"] == 600
+    assert rows[START + 300]["legacy_hashrate_ths"] is None
 
 
 def test_confirmed_full_and_partial_zero_are_valid_measurements(conn):

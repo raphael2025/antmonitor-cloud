@@ -293,6 +293,15 @@ def _site_entry(scfg, latest, last_ok, cust_counts, now):
                          "legacy_unverified" if not snap.get("measurement_time_supported") or any(snap.get(k) is None for k in
                              ("unknown", "hashrate_complete", "power_complete")) else
                          "complete" if d["data_complete"] else "partial")
+    display_complete, display = db.snapshot_display(snap or {})
+    if state not in ("ok", "alert"):
+        display_complete = {key: False for key in display_complete}
+        display = {key: None for key in display}
+    d["display_metrics"] = display
+    d["display_complete"] = display_complete
+    d["display_available"] = {key: value is not None for key, value in display.items()}
+    d["display_scan_ts"] = snap.get("scan_ts") if snap else None
+    d["scanning"] = bool(snap and state in ("ok", "alert") and db.scan_in_progress(snap, now))
     return d
 
 
@@ -315,6 +324,7 @@ def _overview_payload():
               "containers_faulty": "containers_faulty", "containers_offline": "containers_offline",
               "containers_unknown": "containers_unknown"}
     observed, known, complete = {}, {}, {}
+    display, display_known, display_complete = {}, {}, {}
     for output, field in fields.items():
         values = [s["observed_metrics"][field] for s in sites if s["metric_available"][field]]
         known[output] = len(values)
@@ -324,8 +334,19 @@ def _overview_payload():
             value = round(value, 3 if output == "power_kw" else 1)
         observed[output] = value
         tot[output] = value if complete[output] else None
+        display_values = [s["display_metrics"][field] for s in sites if s["display_available"][field]]
+        display_known[output] = len(display_values)
+        display_complete[output] = all(s["display_complete"][field] for s in sites)
+        # Keep the total tied to a complete set of responding sites. Missing
+        # sites do not silently contribute zero to the account's displayed sum.
+        display_value = sum(display_values) if len(display_values) == len(sites) else None
+        if display_value is not None and output in ("hashrate_ths", "power_kw"):
+            display_value = round(display_value, 3 if output == "power_kw" else 1)
+        display[output] = display_value
     return {"ok": True, "ts": now, "totals": tot, "sites": sites,
             "observed_totals": observed, "metric_known_sites": known, "metrics_complete": complete,
+            "display_totals": display, "display_known_sites": display_known,
+            "display_metrics_complete": display_complete,
             "poll_interval": COLLECTOR.interval}
 
 
@@ -336,6 +357,7 @@ def _trend_payload(hours, points):
                        stalled_after=int(CFG.get("poll", {}).get("stalled_after_s", 1200)))
         out.append({"id": s["id"], "name": s["name"], "type": s.get("type", "air"),
                     "points": [[p["ts"], p["hashrate_ths"]] for p in pts],
+                    "display_points": [[p["ts"], p["display_hashrate_ths"]] for p in pts],
                     "partial_points": [{"ts": p["ts"], "value": p["partial_hashrate_ths"],
                                         "coverage": p["hashrate_coverage"]} for p in pts
                                        if p["partial_hashrate_ths"] is not None],
@@ -378,6 +400,11 @@ def _customer_rows(rows):
     stale_after = min(db.MAX_MEASUREMENT_AGE,
                       max(60, int(CFG.get("poll", {}).get("stalled_after_s", 1200))))
     report_after = max(stale_after, 3 * int(CFG.get("poll", {}).get("customer_interval", 600)))
+    latest = db.latest_ok_snapshots(CONN)
+    current_sites = {s["id"] for s in all_sites()
+                     if COLLECTOR.site_state(s["id"], latest.get(s["id"]), s.get("mode", "pull"), now)
+                     in ("ok", "alert") and
+                     any(value is not None for value in db.snapshot_display(latest.get(s["id"], {}))[1].values())}
     for r in rows:
         r = dict(r)
         r["machines"] = validate.num(r.get("machines"), int)
@@ -422,6 +449,14 @@ def _customer_rows(rows):
         if billing_end and billing_end > now + 60:
             r["delivered_th_h"] = r["power_kwh"] = r["uptime_pct"] = None
             r["delivery_unavailable_reason"] = r["power_unavailable_reason"] = "unverified_windows"
+        snapshot_ts = validate.measurement(r.get("hashrate_snapshot_ts"), int)
+        measured = r.get("hashrate_ts")
+        completed = (r.get("hashrate_source") == "summary" and r.get("site_id") in current_sites and
+                     snapshot_ts and measured and measured <= snapshot_ts + 60)
+        normal_report = (r.get("hashrate_source") == "report" and measured and
+                         r["hashrate_age_s"] is not None and not r["hashrate_stale"])
+        r["display_hashrate_ths"] = r["hashrate_ths"] if completed or normal_report else None
+        r["display_scan_ts"] = snapshot_ts if completed else measured if normal_report else None
         out.append(r)
     for r in out:
         missing = "missing_data" if r.get("site_id") in metric_sites else "not_reported"
@@ -488,6 +523,8 @@ def _customers_payload():
                 "legacy_only" if a["billing_source"] == "legacy_only" else "missing_data")
 
         a["current_machines"] = complete_reduce("current_machines", sum)
+        a["display_hashrate_ths"] = complete_reduce("display_hashrate_ths", sum)
+        a["display_scan_ts"] = complete_reduce("display_scan_ts", min)
         a["hashrate_ths"] = complete_reduce("hashrate_ths", sum)
         a["hashrate_ts"] = complete_reduce("hashrate_ts", min)
         a["hashrate_age_s"] = complete_reduce("hashrate_age_s", max)
@@ -765,6 +802,7 @@ def api_ingest_summary(request: Request, body: dict = Body(...)):
     snap.update({"ts": now, "site_id": sid, "ok": 1, "error": None,
                  "measurement_ts": validate.measurement_timestamp(body, stamp),
                  **validate.source_time_fields(body),
+                 **validate.scan_progress_fields(body, now, stamp),
                  "scan_ts": stamp, "scan_age_s": now - stamp if stamp else None})
     with _ingest_write(sid):
         _verify_ingest_credential(request, sid)

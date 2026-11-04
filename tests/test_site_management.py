@@ -96,12 +96,16 @@ def test_tombstone_survives_restart_and_restore_requires_new_binding(cloud):
     new = write(client, "POST", "/api/connect/token", json={
         "target": "st-old", "action": "rotate", "password": "admin-test-password"})
     assert new.status_code == 200
+    now = int(time.time())
     assert client.post("/api/ingest/summary", headers={
         "Authorization": "Bearer " + new.json()["token"]},
         json={"site_id": "st-old", "site": "云海二期", "hashrate_ths": 416360,
-              "online": 1341, "total": 1341}).status_code == 200
+              "online": 1341, "total": 1341, "unknown": 0,
+              "hashrate_complete": True, "power_complete": False,
+              "ts": now, "scan_ts": now, "measurement_ts": now}).status_code == 200
     points = client.get("/api/site/st-old").json()["trend"]
-    assert sum(p["legacy_hashrate_ths"] is not None for p in points) == 1
+    assert sum(p["hashrate_ths"] is not None or p["partial_hashrate_ths"] is not None for p in points) == 1
+    assert all(p["legacy_hashrate_ths"] is None for p in points)
     assert server.CONN.execute("SELECT COUNT(*) FROM snapshots WHERE site_id='st-old'").fetchone()[0] == 1
 
 

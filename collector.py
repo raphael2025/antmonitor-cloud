@@ -161,6 +161,7 @@ class Collector:
                          "scan_ts": scan_ts,
                          "measurement_ts": validate.measurement_timestamp(d, scan_ts),
                          **validate.source_time_fields(d),
+                         **validate.scan_progress_fields(d, now, scan_ts),
                          "scan_age_s": max(0, now - scan_ts) if scan_ts else None})
             stored = db.insert_snapshot(self.conn, snap)
             if stored and customer_snapshot is not None:
@@ -214,7 +215,7 @@ class Collector:
                 return "unreachable"
         stalled_after = int(self.cfg.get("poll", {}).get("stalled_after_s", 1200))
         age = db.scan_age(snap_ok, now)
-        if age is not None and age > stalled_after:
+        if age is not None and age > stalled_after and not db.scan_in_progress(snap_ok, now):
             return "stalled"
         # 告警口径与场地本地完全一致：只看本地活跃告警数。
         # 集装箱真故障/箱体离线在本地会生成告警计入 active_alerts；

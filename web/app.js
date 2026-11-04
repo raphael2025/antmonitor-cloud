@@ -151,7 +151,7 @@ function withGaps(pts) {
   return out;
 }
 
-function trendSeries(label, color, full, partial = [], legacy = [], div = 1) {
+function trendSeries(label, color, full, partial = [], div = 1) {
   const data = withGaps(AntDataQuality.points(full, 0, 1, div));
   const datasets = [{ label, borderColor: color, backgroundColor: color, data,
     pointRadius: c => c.raw?.y != null && data[c.dataIndex - 1]?.y == null &&
@@ -181,11 +181,6 @@ function trendSeries(label, color, full, partial = [], legacy = [], div = 1) {
       return color;
     } },
   });
-  if (legacy.some(p => num(p[1]) != null)) datasets.push({
-    label: label + " · " + t("quality.legacy"), borderColor: "#8b949e",
-    backgroundColor: "#8b949e", borderDash: [5, 4],
-    data: withGaps(AntDataQuality.points(legacy, 0, 1, div)),
-  });
   return datasets;
 }
 
@@ -208,14 +203,6 @@ function trendCoverage(point) {
   return notes;
 }
 
-function trendNotice(id, datasets) {
-  const partial = datasets.filter(d => d.trendPartial);
-  const hasPartial = partial.some(d => d.data.some(p => p.partial));
-  const hasGap = datasets.some(d => d.trendHasGap);
-  const note = $(id);
-  note.textContent = [hasPartial ? t("trend.partial_note") : "", hasGap ? t("trend.gap_note") : ""].filter(Boolean).join(" ");
-  note.classList.toggle("hidden", !note.textContent);
-}
 const endLabels = {  // 多序列时在线尾直接标注场地名(文字用墨色，线端色块即身份)
   id: "endLabels",
   afterDatasetsDraw(chart) {
@@ -277,14 +264,17 @@ async function loadTrend() {
   const hours = Number($("trendRange").value);
   const d = await api(`/api/trend?hours=${hours}`);
   if (seq !== _trendSeq || hours !== Number($("trendRange").value)) return;
-  const maxTh = Math.max(1, ...d.sites.flatMap(s => [
-    ...[...s.points, ...(s.legacy_points || [])].map(p => num(p[1]) || 0),
+  // Display samples are the last completed scan at each received bucket. An
+  // explicit gap must not be filled by older strict or partial measurements.
+  const sites = d.sites.map(s => Object.prototype.hasOwnProperty.call(s, "display_points")
+    ? { ...s, points: Array.isArray(s.display_points) ? s.display_points : [], partial_points: [] } : s);
+  const maxTh = Math.max(1, ...sites.flatMap(s => [
+    ...s.points.map(p => num(p[1]) || 0),
     ...(s.partial_points || []).map(p => num(p.value) || 0),
   ]));
   const u = hashUnit(maxTh);
-  const datasets = d.sites.flatMap((s, i) => trendSeries(s.name, SERIES[i % SERIES.length],
-    s.points, s.partial_points || [], s.legacy_points || [], u.div));
-  trendNotice("trendQuality", datasets);
+  const datasets = sites.flatMap((s, i) => trendSeries(s.name, SERIES[i % SERIES.length],
+    s.points, s.partial_points || [], u.div));
   mkLine("trendChart", datasets, { hours, yUnit: u.unit + "/s", padRight: 70 });
 }
 $("trendRange").onchange = () => {
@@ -296,35 +286,32 @@ if (localStorage.getItem("co_trend_hours")) $("trendRange").value = localStorage
 // ---- 总览渲染 ----
 const pct = (a, b) => (num(a) != null && num(b) > 0 ? ((100 * num(a)) / num(b)).toFixed(1) + "%" : "–");
 
-function siteQuality(s) {
-  // Partial power/hashrate has its own short coverage beside the value.
-  const complete = s.metric_complete || {}, available = s.metric_available || {};
-  if (s.data_quality === "partial" && complete.online && complete.total &&
-      ["hashrate_ths", "power_kw"].every(k => complete[k] || available[k])) return "";
-  const key = { partial: "quality.partial", stale: "quality.stale", legacy_unverified: "quality.legacy_site", missing: "quality.missing" }[s.data_quality];
-  return key ? `<div class="site-warning">${esc(t(key))}</div>` : "";
-}
-
 function siteMetric(s, key) {
+  if (Object.prototype.hasOwnProperty.call(s.display_metrics || {}, key)) return num(s.display_metrics[key]);
   const observed = num((s.observed_metrics || {})[key]);
   return (s.metric_available || {})[key] === true && observed != null ? observed : num(s[key]);
 }
 
-function siteMetricNote(s, key, countKey) {
-  if ((s.metric_available || {})[key] !== true || (s.metric_complete || {})[key] !== false) return "";
+function siteMetricTitle(s, key, countKey) {
+  const display = Object.prototype.hasOwnProperty.call(s.display_metrics || {}, key);
+  if (display && siteMetric(s, key) == null) return t("rate.waiting");
+  if (((display ? s.display_available : s.metric_available) || {})[key] !== true ||
+      ((display ? s.display_complete : s.metric_complete) || {})[key] !== false) return "";
   const known = num(s[countKey]), total = num(s.total);
-  return AntDataQuality.note(known != null && total != null && known < total
-    ? t("quality.counted_machines", { known, total }) : t("quality.partial_readings"), true);
+  return known != null && total != null && known < total
+    ? t("quality.counted_machines", { known, total }) : t("quality.partial_readings");
 }
 
 function siteCard(s, color) {
   const st = STATE[s.state] || STATE.pending;
   const tp = TYPE[s.type] || TYPE.air;
-  const hasData = num(s.total) != null;
+  const total = siteMetric(s, "total"), online = siteMetric(s, "online");
+  const hasData = total != null;
   const hashrate = siteMetric(s, "hashrate_ths");
-  const cf = int0(s.containers_faulty), co = int0(s.containers_offline);
-  const contRow = (s.type === "hydro" || s.type === "mixed" || int0(s.containers) > 0)
-    ? `<div><span class="k">${t("card.containers")}</span><span class="num-tab">${intTxt(s.containers)}${cf || co ? ` <span style="color:#ec835a">${t("card.fault_offline", { cf, co })}</span>` : ""}${s.containers_unknown ? ` · ${esc(t("quality.unknown_count", { n: int0(s.containers_unknown) }))}` : ""}</span></div>`
+  const containers = siteMetric(s, "containers"), containersUnknown = siteMetric(s, "containers_unknown");
+  const cf = int0(siteMetric(s, "containers_faulty")), co = int0(siteMetric(s, "containers_offline"));
+  const contRow = (s.type === "hydro" || s.type === "mixed" || int0(containers) > 0)
+    ? `<div><span class="k">${t("card.containers")}</span><span class="num-tab">${intTxt(containers)}${cf || co ? ` <span style="color:#ec835a">${t("card.fault_offline", { cf, co })}</span>` : ""}${containersUnknown ? ` · ${esc(t("quality.unknown_count", { n: containersUnknown }))}` : ""}</span></div>`
     : "";
   const err = (s.state === "unreachable" || s.state === "stalled") && s.error
     ? `<div class="err">${esc(s.error)}</div>` : "";
@@ -335,13 +322,11 @@ function siteCard(s, color) {
       <span class="pill ${tp.cls}">${tp.txt()}</span>
       <span class="pill ${st.cls}">${st.txt(s)}</span>
     </div>
-    <div class="hr">${hashrate != null ? fmtHash(hashrate).replace(/ (\w+)$/, ' <span class="unit">$1/s</span>') : "–"}</div>
-    ${siteQuality(s)}
-    ${siteMetricNote(s, "hashrate_ths", "hashrate_known_machines")}
+    <div class="hr" title="${esc(siteMetricTitle(s, "hashrate_ths", "hashrate_known_machines"))}">${hashrate != null ? fmtHash(hashrate).replace(/ (\w+)$/, ' <span class="unit">$1/s</span>') : "–"}</div>
     <div class="stats">
-      <div><span class="k">${t("card.online")}</span><span class="num-tab">${hasData ? `${intTxt(s.online)}/${intTxt(s.total)} (${s.unknown ? "–" : pct(s.online, s.total)})` : "–"}</span></div>
-      <div><span class="k">${t("card.power")}</span><span class="num-tab">${fmtPower(siteMetric(s, "power_kw"))}${siteMetricNote(s, "power_kw", "power_known_machines")}</span></div>
-      <div><span class="k">${t("card.alerts")}</span><span class="num-tab">${intTxt(s.active_alerts)}</span></div>
+      <div><span class="k">${t("card.online")}</span><span class="num-tab">${hasData ? `${intTxt(online)}/${intTxt(total)} (${s.unknown ? "–" : pct(online, total)})` : "–"}</span></div>
+      <div><span class="k">${t("card.power")}</span><span class="num-tab" title="${esc(siteMetricTitle(s, "power_kw", "power_known_machines"))}">${fmtPower(siteMetric(s, "power_kw"))}</span></div>
+      <div><span class="k">${t("card.alerts")}</span><span class="num-tab">${intTxt(siteMetric(s, "active_alerts"))}</span></div>
       <div><span class="k">${t("card.customers")}</span><span class="num-tab">${int0(s.customers)}</span></div>
       ${contRow}
     </div>
@@ -358,21 +343,20 @@ function renderOverview(o) {
   const machinesNote = AntDataQuality.totalNote(o, "machines_total", t) || AntDataQuality.totalNote(o, "machines_online", t);
   $("kSites").textContent = `${totals.sites_ok}/${totals.sites}`;
   $("kMachines").textContent = `${intTxt(online)}/${intTxt(machines)}`;
-  $("kMachinesNote").textContent = machinesNote;
+  $("kMachines").title = machinesNote;
   $("kOnlinePct").textContent = pct(online, machines);
-  $("kOnlinePctNote").textContent = machinesNote;
+  $("kOnlinePct").title = machinesNote;
   $("kHashrate").innerHTML = AntDataQuality.total(o, "hashrate_ths", t, n => fmtHash(n, "/s"));
   $("kPower").innerHTML = AntDataQuality.total(o, "power_kw", t, fmtPower);
   $("kAlerts").innerHTML = AntDataQuality.total(o, "active_alerts", t, intTxt);
   $("kAlerts").className = "num" + (AntDataQuality.totalValue(o, "active_alerts") > 0 ? " hot" : "");
-  $("kContainers").innerHTML = `${intTxt(totals.containers)} (${intTxt(totals.containers_faulty)}/${intTxt(totals.containers_offline)})`
-    + (totals.containers_unknown ? AntDataQuality.note(t("quality.unknown_count", { n: int0(totals.containers_unknown) }), true) : "");
-  $("kContainers").className = "num" + (totals.containers_faulty + totals.containers_offline > 0 ? " hot" : "");
+  const containers = AntDataQuality.totalValue(o, "containers"), faulty = AntDataQuality.totalValue(o, "containers_faulty");
+  const offline = AntDataQuality.totalValue(o, "containers_offline"), unknown = AntDataQuality.totalValue(o, "containers_unknown");
+  $("kContainers").innerHTML = `${intTxt(containers)} (${intTxt(faulty)}/${intTxt(offline)})`
+    + (unknown ? AntDataQuality.note(t("quality.unknown_count", { n: unknown }), true) : "");
+  $("kContainers").className = "num" + (faulty + offline > 0 ? " hot" : "");
   $("kCustomers").textContent = totals.customers;
   $("kCustomers").title = t("quality.customer_identity");
-  const affected = o.sites.filter(s => siteQuality(s)).map(s => s.name);
-  $("overviewQuality").textContent = affected.length ? t("quality.overview_help", { sites: affected.join(", ") }) : "";
-  $("overviewQuality").classList.toggle("hidden", !affected.length);
 
   const groups = { air: [], hydro: [], mixed: [] };
   o.sites.forEach((s, i) => {
@@ -391,17 +375,7 @@ function renderOverview(o) {
   $("lastUpdate").textContent = t("overview.updated", { time: new Date(o.ts * 1000).toLocaleTimeString() });
 }
 
-function renderRateNotice(id, rows) {
-  const names = [...new Set((rows || [])
-    .filter(r => r.hashrate_unavailable_reason === "not_reported" || r.avg_unavailable_reason === "not_reported")
-    .map(r => r.site_name || r.site_id).filter(Boolean))];
-  const el = $(id);
-  el.textContent = names.length ? t("rate.missing_sites_help", { sites: names.join(", ") }) : "";
-  el.classList.toggle("hidden", !names.length);
-}
-
 function renderCustomers(d) {
-  renderRateNotice("customerRateNotice", d.rows);
   $("workerAverageHead").textContent = AntCustomerRates.header(d.by_worker, t);
   $("customerAverageHead").textContent = AntCustomerRates.header(d.rows, t);
   $("tblWorkers").querySelector("tbody").innerHTML = d.by_worker.map((w) => `<tr>
@@ -422,7 +396,6 @@ function renderCustomers(d) {
 }
 
 function renderSiteCustomers(rows) {
-  renderRateNotice("siteCustomerRateNotice", rows);
   $("siteAverageHead").textContent = AntCustomerRates.header(rows, t);
   $("tblSiteCustomers").querySelector("tbody").innerHTML = rows.map((r) => `<tr>
     <td>${esc(r.worker)}</td><td>${AntCustomerRates.machines(r, t)}</td>
@@ -597,21 +570,21 @@ async function loadSite() {
   $("siteMeta").innerHTML =
     t("site.meta", { data: fmtAgo(s.data_age_s), scan: fmtAgo(s.scan_age_s) }) +
     (int0(s.fails) ? t("site.fails", { n: int0(s.fails) }) : "") +
-    (s.error ? `<br><span style="color:#f0a0a0">${esc(s.error)}</span>` : "") + siteQuality(s);
+    (s.error ? `<br><span style="color:#f0a0a0">${esc(s.error)}</span>` : "");
   renderSiteAlerts(d.alert_summary);
 
-  const tr = d.trend;
+  const tr = d.trend.map(p => Object.prototype.hasOwnProperty.call(p, "display_hashrate_ths")
+    ? { ...p, hashrate_ths: p.display_hashrate_ths, partial_hashrate_ths: null } : p);
   const maxTh = Math.max(1, ...tr.flatMap(p => [num(p.hashrate_ths) || 0,
-    num(p.partial_hashrate_ths) || 0, num(p.legacy_hashrate_ths) || 0]));
+    num(p.partial_hashrate_ths) || 0]));
   const u = hashUnit(maxTh);
   const series = (key, label, color, div = 1) => trendSeries(t(label), color,
     tr.map(p => [p.ts, p[key]]),
     tr.filter(p => num(p["partial_" + key]) != null).map(p => ({ ts: p.ts,
       value: p["partial_" + key], coverage: p[(key === "hashrate_ths" ? "hashrate" : "power") + "_coverage"] })),
-    tr.map(p => [p.ts, p["legacy_" + key]]), div);
+    div);
   const hashrateSeries = series("hashrate_ths", "chart.hashrate", METRIC.hashrate, u.div);
   const powerSeries = series("power_kw", "chart.power", METRIC.power);
-  trendNotice("siteTrendQuality", [...hashrateSeries, ...powerSeries]);
   mkLine("chHr", hashrateSeries, { hours, yUnit: u.unit + "/s" });
   mkLine("chOnline", series("online", "chart.online", METRIC.online), { hours, yUnit: t("chart.unit_machines") });
   mkLine("chPower", powerSeries, { hours, yUnit: "kW" });
@@ -624,12 +597,11 @@ async function loadSite() {
 async function loadDaily(id, seq = _siteSeq) {
   const d = await api(`/api/daily?site=${encodeURIComponent(id)}&days=14`);
   if (seq !== _siteSeq || curSite !== id) return;
-  $("tblDaily").querySelector("tbody").innerHTML = d.days.map((r) => `<tr>
+  $("tblDaily").querySelector("tbody").innerHTML = d.days.filter(r => r.method === "time_weighted_v2").map((r) => `<tr>
     <td>${esc(r.day)}</td><td>${AntDataQuality.daily(r, "avg_hashrate_ths", "hashrate_ths", t, n => fmtHash(n, "/s"))}</td>
     <td>${AntDataQuality.daily(r, "max_hashrate_ths", "hashrate_ths", t, n => fmtHash(n, "/s"))}</td>
     <td>${AntDataQuality.daily(r, "avg_online", "online", t, n => n.toLocaleString(undefined, { maximumFractionDigits: 1 }))}</td>
-    <td>${AntDataQuality.daily({ ...r, online_pct: num(r.avg_online) != null && num(r.avg_total) > 0 ? r.avg_online / r.avg_total * 100 : null,
-      legacy_online_pct: num(r.legacy_avg_online) != null && num(r.legacy_avg_total) > 0 ? r.legacy_avg_online / r.legacy_avg_total * 100 : null }, "online_pct", "online", t, n => n.toFixed(1) + "%")}</td>
+    <td>${AntDataQuality.daily({ ...r, online_pct: num(r.avg_online) != null && num(r.avg_total) > 0 ? r.avg_online / r.avg_total * 100 : null }, "online_pct", "online", t, n => n.toFixed(1) + "%")}</td>
     <td>${AntDataQuality.daily(r, "power_kwh", "power_kw", t, fmtEnergy)}</td></tr>`).join("")
     || `<tr><td colspan="6" class="muted">${t("empty.daily")}</td></tr>`;
 }

@@ -6,14 +6,16 @@
 - snapshots      分钟级快照(每场地每次拉取/上报一行；拉取失败也记 ok=0 行)
 - site_customers 每场地客户报表最新一份(整表替换，历史对账在场地本地)
 - site_alert_summary 每场地活跃告警摘要最新一份(按类型分组，标客户不带单机IP)
-- daily          日级汇总(永久保留，长期趋势/月度对比用)
+- daily_observed_v2 实测日级汇总(长期趋势/月度对比用)
 - notify_log     告警通知发送记录(排查"为什么没收到")
 - audit_log      安全审计(登录成败/改设置/改密码/触发更新/删场地，保留180天)
 写入由模块级锁串行化(单连接跨线程共享)；旧库(v1, 按场地名)启动时自动迁移。
 """
 import datetime
 import json
+import os
 import sqlite3
+import tempfile
 import threading
 from contextlib import contextmanager
 import time
@@ -32,7 +34,8 @@ CREATE TABLE IF NOT EXISTS snapshots(
   active_alerts INTEGER,
   containers INTEGER, containers_faulty INTEGER, containers_offline INTEGER, containers_unknown INTEGER,
   scan_age_s INTEGER,                  -- 场地本地上次扫描龄期(判「监控停滞」)
-  scan_ts INTEGER,
+  scan_ts INTEGER, scan_started_ts INTEGER,
+  scanning INTEGER, scan_progress_ts INTEGER,
   source_scan_ts INTEGER, source_sent_ts INTEGER,
   measurement_ts INTEGER, measurement_time_supported INTEGER,
   unknown INTEGER,
@@ -117,7 +120,7 @@ CREATE TABLE IF NOT EXISTS site_management(
   notification_epoch INTEGER NOT NULL DEFAULT 0
 );
 
--- 日级汇总(UTC+8 切日, 永久保留)。power_kwh 为 Σ(功率×名义间隔) 估算，精确对账在场地本地。
+-- 保留旧表结构供升级清理；业务读取只使用 daily_observed_v2。
 CREATE TABLE IF NOT EXISTS daily(
   site_id TEXT NOT NULL,
   day TEXT NOT NULL,                   -- 'YYYY-MM-DD'
@@ -128,7 +131,7 @@ CREATE TABLE IF NOT EXISTS daily(
   PRIMARY KEY(site_id, day)
 );
 
--- v2 使用真实观测区间；旧 daily 估算账本保留，不原地改写。
+-- 使用真实观测区间；缺少可验证观测时段的旧账本在升级时清理。
 CREATE TABLE IF NOT EXISTS daily_observed_v2(
   site_id TEXT NOT NULL, day TEXT NOT NULL, samples INTEGER,
   avg_hashrate_ths REAL, max_hashrate_ths REAL,
@@ -187,6 +190,12 @@ CREATE TABLE IF NOT EXISTS audit_log(
   detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+
+CREATE TABLE IF NOT EXISTS schema_migrations(
+  name TEXT PRIMARY KEY,
+  applied_ts INTEGER NOT NULL,
+  details_json TEXT NOT NULL
+);
 """
 
 _SNAP_FIELDS = ("ts", "site_id", "ok", "online", "total", "hashrate_ths", "power_kw",
@@ -196,6 +205,73 @@ _SNAP_FIELDS += ("scan_ts", "unknown", "hashrate_complete", "power_complete")
 _SNAP_FIELDS += ("hashrate_known_machines", "power_known_machines", "known_hashrate_ths", "known_power_kw")
 _SNAP_FIELDS += ("measurement_ts", "measurement_time_supported", "containers_unknown")
 _SNAP_FIELDS += ("source_scan_ts", "source_sent_ts")
+_SNAP_FIELDS += ("scan_started_ts", "scanning", "scan_progress_ts")
+
+_STATISTICS_CLEANUP = "clean_legacy_statistics_v1"
+_UNSUPPORTED_SNAPSHOT = ("ok=1 AND (measurement_time_supported IS NOT 1 OR unknown IS NULL "
+                         "OR hashrate_complete IS NULL OR power_complete IS NULL)")
+_UNSUPPORTED_BILLING = ("COALESCE(billing_source,'')!='observed' OR billing_period_start_ts IS NULL "
+                       "OR billing_period_end_ts IS NULL OR billing_period_end_ts<=billing_period_start_ts")
+_UNSUPPORTED_AVERAGE = ("period_start_ts IS NULL OR period_end_ts IS NULL "
+                       "OR period_end_ts<=period_start_ts OR hashrate_hours IS NULL "
+                       "OR hashrate_hours<=0 OR observed_hours IS NULL")
+
+
+def _backup_before_statistics_cleanup(conn):
+    """Back up a file database before deleting statistics; never touch YAML/JSON settings."""
+    filename = next((r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "")
+    if not filename:  # :memory: has no persistent state to back up.
+        return None
+    fd, path = tempfile.mkstemp(prefix=os.path.basename(filename) + ".before-statistics-cleanup-",
+                                suffix=".sqlite3", dir=os.path.dirname(filename))
+    os.close(fd)  # mkstemp created a private (0600) file; SQLite preserves that mode.
+    try:
+        backup = sqlite3.connect(path)
+        try:
+            conn.backup(backup)
+            backup.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            backup.close()
+        with open(path, "rb+") as stream:
+            os.fsync(stream.fileno())
+        return path
+    except Exception:
+        os.unlink(path)
+        raise
+
+
+def _cleanup_legacy_statistics(conn):
+    """One-time, transactional cleanup of unverified metrics; management data stays intact."""
+    with _lock:
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE name=?", (_STATISTICS_CLEANUP,)).fetchone():
+            return
+        counts = {
+            "snapshots": conn.execute("SELECT COUNT(*) FROM snapshots WHERE " + _UNSUPPORTED_SNAPSHOT).fetchone()[0],
+            "daily": conn.execute("SELECT COUNT(*) FROM daily").fetchone()[0],
+            "customer_legacy": conn.execute("SELECT COUNT(*) FROM site_customers WHERE "
+                "legacy_delivered_th_h IS NOT NULL OR legacy_power_kwh IS NOT NULL OR legacy_uptime_pct IS NOT NULL").fetchone()[0],
+            "customer_billing": conn.execute("SELECT COUNT(*) FROM site_customers WHERE (" + _UNSUPPORTED_BILLING +
+                ") AND (delivered_th_h IS NOT NULL OR power_kwh IS NOT NULL OR uptime_pct IS NOT NULL)").fetchone()[0],
+            "customer_average": conn.execute("SELECT COUNT(*) FROM site_customers WHERE (" + _UNSUPPORTED_AVERAGE +
+                ") AND avg_hashrate_ths IS NOT NULL").fetchone()[0],
+        }
+        # A backup error aborts startup before any statistics are removed. The
+        # SQLite backup API includes committed WAL pages, unlike copying the DB file.
+        backup_path = _backup_before_statistics_cleanup(conn) if any(counts.values()) else None
+        with conn:
+            conn.execute("DELETE FROM snapshots WHERE " + _UNSUPPORTED_SNAPSHOT)
+            conn.execute("DELETE FROM daily")
+            conn.execute("UPDATE site_customers SET legacy_delivered_th_h=NULL,legacy_power_kwh=NULL,legacy_uptime_pct=NULL")
+            conn.execute("UPDATE site_customers SET delivered_th_h=NULL,power_kwh=NULL,uptime_pct=NULL,"
+                         "billing_source='missing',billing_hours=NULL,delivery_observed_hours=NULL,"
+                         "delivery_coverage_pct=NULL,power_observed_hours=NULL,power_coverage_pct=NULL,"
+                         "uptime_observed_hours=NULL,uptime_coverage_pct=NULL WHERE " + _UNSUPPORTED_BILLING)
+            conn.execute("UPDATE site_customers SET avg_hashrate_ths=NULL,hashrate_hours=NULL,"
+                         "observed_hours=NULL,coverage_pct=NULL WHERE " + _UNSUPPORTED_AVERAGE)
+            conn.execute("INSERT INTO schema_migrations VALUES(?,?,?)", (_STATISTICS_CLEANUP, int(time.time()),
+                         json.dumps({"removed": counts, "backup": backup_path}, ensure_ascii=False)))
+        if any(counts.values()):
+            print("[db] 已清理不兼容的历史统计；场地与配置保留。备份: %s" % (backup_path or "内存数据库"))
 
 
 def _migrate_v1(conn):
@@ -243,6 +319,8 @@ def connect(path):
                               ("known_hashrate_ths", "REAL"), ("known_power_kw", "REAL"),
                               ("measurement_ts", "INTEGER"), ("measurement_time_supported", "INTEGER"),
                               ("source_scan_ts", "INTEGER"), ("source_sent_ts", "INTEGER"),
+                              ("scan_started_ts", "INTEGER"), ("scanning", "INTEGER"),
+                              ("scan_progress_ts", "INTEGER"),
                               ("containers_unknown", "INTEGER"))),):
         columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         for column, kind in additions:
@@ -255,6 +333,11 @@ def connect(path):
             conn.execute(f"ALTER TABLE site_customers ADD COLUMN {column} " +
                          ("TEXT" if column in ("billing_source", "machines_source") else "REAL"))
     conn.commit()
+    try:
+        _cleanup_legacy_statistics(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -300,6 +383,7 @@ def latest_ok_snapshots(conn):
 
 MAX_OBSERVATION_GAP = 300
 MAX_MEASUREMENT_AGE = 900
+MAX_SCAN_PROGRESS_AGE = 300
 
 
 def scan_age(snap, now):
@@ -322,9 +406,14 @@ def _snapshot_freshness(snap, now, stalled_after):
     return fresh_scan, fresh
 
 
-def snapshot_quality(snap, now, stalled_after=1200):
-    """完整性与新鲜度分开；缺新协议证据不能默认成完整场地。"""
-    fresh_scan, fresh = _snapshot_freshness(snap, now, stalled_after)
+def scan_in_progress(snap, now):
+    """An actual recent progress heartbeat proves a long scan is still advancing."""
+    progress = validate.measurement(snap.get("scan_progress_ts"), int)
+    return bool(snap.get("scanning") == 1 and progress and
+                0 <= now - progress <= MAX_SCAN_PROGRESS_AGE)
+
+
+def _snapshot_quality(snap, fresh_scan, fresh):
     online = validate.measurement(snap.get("online"))
     total = validate.measurement(snap.get("total"))
     machines = (fresh and snap.get("unknown") == 0 and online is not None and
@@ -353,11 +442,13 @@ def snapshot_quality(snap, now, stalled_after=1200):
     return out
 
 
-def snapshot_observed(snap, now, stalled_after=1200):
-    """当前可用读数；已知小计可展示，但不能冒充完整场地或用于完整耗电账。"""
-    quality = snapshot_quality(snap, now, stalled_after)
+def snapshot_quality(snap, now, stalled_after=1200):
+    """完整性与新鲜度分开；通知和历史积分仍使用原始采样时间。"""
+    return _snapshot_quality(snap, *_snapshot_freshness(snap, now, stalled_after))
+
+
+def _snapshot_observed(snap, quality, fresh):
     out = {key: snap.get(key) if complete else None for key, complete in quality.items()}
-    _fresh_scan, fresh = _snapshot_freshness(snap, now, stalled_after)
     total = validate.measurement(snap.get("total"), int)
     unknown = validate.measurement(snap.get("unknown"), int)
     if not fresh or total is None or unknown is None or unknown > total:
@@ -372,6 +463,26 @@ def snapshot_observed(snap, now, stalled_after=1200):
         if count is not None and 0 < count <= total - unknown and value is not None:
             out[field] = value
     return out
+
+
+def snapshot_observed(snap, now, stalled_after=1200):
+    """当前可用读数；已知小计可展示，但不能冒充完整场地或用于完整耗电账。"""
+    quality = snapshot_quality(snap, now, stalled_after)
+    return _snapshot_observed(snap, quality, _snapshot_freshness(snap, now, stalled_after)[1])
+
+
+def snapshot_display(snap):
+    """Last completed scan for display, without aging individual rows during the next scan.
+
+    The caller still checks site connectivity/stall state. This deliberately
+    does not change snapshot_quality(), notification decisions or energy history.
+    """
+    stamp = validate.measurement(snap.get("scan_ts"), int)
+    measured = validate.measurement(snap.get("measurement_ts"), int)
+    supported = bool(snap.get("ok") and snap.get("measurement_time_supported") == 1 and
+                     stamp and measured and measured <= stamp + 60)
+    quality = _snapshot_quality(snap, supported, supported)
+    return quality, _snapshot_observed(snap, quality, supported)
 
 
 def _observation_intervals(conn, begin, end, site_id=None, stalled_after=1200):
@@ -421,7 +532,17 @@ def trend(conn, site_id, hours=24, points=288, stalled_after=1200):
     bins = {}
     measured_keys = {"hashrate_ths": "hashrate", "power_kw": "power"}
     observed_bins = {}
+    display_bins = {}
     for row, left, right, quality in _observation_intervals(conn, begin, now, site_id, stalled_after):
+        if begin <= row["ts"] <= now:
+            # This is a display sample of the last completed scan, not a time
+            # integral. Never extend it into buckets with no reports. A failed
+            # or stalled report explicitly clears its bucket's display sample.
+            age = scan_age(row, row["ts"])
+            progressing = scan_in_progress(row, row["ts"])
+            available = bool(row.get("ok") and ((age is not None and age <= stalled_after) or progressing))
+            shown = snapshot_display(row)[1]["hashrate_ths"] if available else None
+            display_bins[row["ts"] // bucket * bucket] = (shown, row.get("scan_ts") if shown is not None else None)
         observed = snapshot_observed(row, row["ts"], stalled_after)
         while left <= right:
             stamp = left // bucket * bucket
@@ -435,15 +556,6 @@ def trend(conn, site_id, hours=24, points=288, stalled_after=1200):
                     slot[key][1] += stop - left
                     if stop > left or row["ts"] == left:
                         slot[key][2] = value
-                flag = {"hashrate_ths": "hashrate_complete", "power_kw": "power_complete",
-                        "online": "unknown", "total": "unknown"}.get(key)
-                legacy_evidence = row.get(flag) is None or not row.get("measurement_time_supported")
-                if row.get("ok") and flag and legacy_evidence and value is not None:
-                    legacy = slot["legacy_" + key]
-                    legacy[0] += value * (stop - left)
-                    legacy[1] += stop - left
-                    if stop > left or row["ts"] == left:
-                        legacy[2] = value
             if stop > left or row["ts"] == left:
                 for key, prefix in measured_keys.items():
                     stat = observed_bins.setdefault(stamp, {}).setdefault(key, {
@@ -478,6 +590,7 @@ def trend(conn, site_id, hours=24, points=288, stalled_after=1200):
         slot = bins.get(stamp, {key: [0.0, 0, None] for key in
                                 (*keys, *("legacy_" + k for k in keys))})
         point = {"ts": stamp}
+        point["display_hashrate_ths"], point["display_scan_ts"] = display_bins.get(stamp, (None, None))
         for key, (integral, duration, instant) in slot.items():
             point[key] = round(integral / duration, 1) if duration else instant
         # Clip edge buckets to the requested interval. A point sampled exactly
@@ -627,12 +740,14 @@ def customers(conn, site_id=None):
 
     for key, r in out.items():
         r["hashrate_updated_ts"] = r.get("updated_ts")
+        r["hashrate_snapshot_ts"] = r.get("hashrate_ts")
         r["hashrate_source"] = "report" if r.get("hashrate_ts") else "legacy"
         state = state_map.get(r["site_id"])
         if state and key not in current_keys:
             # 完整新扫描里没有该客户：当前无机器，不能把历史机器/算力当作现在仍在运行。
             r.update(current_machines=0, hashrate_ths=0.0, hashrate_ts=state["scan_ts"],
-                     hashrate_updated_ts=state["updated_ts"], hashrate_source="summary")
+                     hashrate_updated_ts=state["updated_ts"], hashrate_source="summary",
+                     hashrate_snapshot_ts=state["scan_ts"])
     for c in current:
         key = (c["site_id"], c["worker"])
         r = out.setdefault(key, {"site_id": c["site_id"], "worker": c["worker"],
@@ -645,7 +760,7 @@ def customers(conn, site_id=None):
         state = state_map[c["site_id"]]
         r.update(current_machines=c["machines"], hashrate_ths=c["hashrate_ths"],
                  hashrate_ts=c["hashrate_ts"], hashrate_updated_ts=state["updated_ts"],
-                 hashrate_source="summary")
+                 hashrate_source="summary", hashrate_snapshot_ts=state["scan_ts"])
     return sorted(out.values(), key=lambda r: (r["site_name"], -machine_count(r.get("machines"))))
 
 
@@ -774,7 +889,7 @@ _TZ8 = 8 * 3600
 
 
 def rollup_daily(conn, day_offsets=(0, 1), stalled_after=1200):
-    """只写 v2 观测日报，旧 daily 估算账本原样保留。"""
+    """按真实观测时段生成日报，不从无效旧账本补数。"""
     now = int(time.time())
     for off in day_offsets:
         day_start8 = (int((now + _TZ8) // 86400) - off) * 86400
@@ -825,21 +940,11 @@ def rollup_daily(conn, day_offsets=(0, 1), stalled_after=1200):
 def daily_report(conn, site_id, days=14):
     limit = max(1, min(int(days), 3650))
     with _lock:
-        old = {r["day"]: dict(r) for r in conn.execute(
-            "SELECT * FROM daily WHERE site_id=? ORDER BY day DESC LIMIT ?", (site_id, limit))}
         observed = {r["day"]: dict(r) for r in conn.execute(
             "SELECT * FROM daily_observed_v2 WHERE site_id=? ORDER BY day DESC LIMIT ?", (site_id, limit))}
     result = []
-    for day in sorted(set(old) | set(observed), reverse=True)[:limit]:
-        legacy = old.get(day)
-        r = observed.get(day)
-        if r is None:
-            r = dict(legacy, method="legacy_sample_mean", elapsed_hours=None,
-                     observed_hours=None, coverage_pct=None, hashrate_observed_hours=None,
-                     machines_observed_hours=None, power_observed_hours=None)
-        if legacy:
-            for key in ("avg_hashrate_ths", "max_hashrate_ths", "avg_online", "avg_total", "avg_power_kw", "power_kwh"):
-                r["legacy_" + key] = legacy[key]
+    for day in sorted(observed, reverse=True):
+        r = observed[day]
         if r["method"] == "time_weighted_v2":
             # 中断数日后只重算今天/昨天，旧日的分母不能永远停在关机时刻而显示 100%。
             day_begin = int(datetime.datetime.strptime(day, "%Y-%m-%d").replace(

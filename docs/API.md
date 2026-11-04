@@ -30,8 +30,8 @@
 - 新场地首次上报自动注册；`ingest.auto_register: false` 时只收 `ingest.tokens` 里登记过的
   site_id（其它 → `403`）；场地总数达 `ingest.max_sites`（默认 200）后新场地 → `403`
 - 请求体上限 `server.max_body_bytes`（默认 2MB），超出 `413`；必须带 Content-Length
-- **字段一律清洗**：数值字段只接受数字（字符串/NaN/负数 → 0 或钳到上限），文本字段去掉
-  换行等控制字符并截长——场地端数据按不可信处理，脏数据进不了库也到不了面板
+- **字段一律清洗**：算力、功率等测量的缺失、非法、负值、布尔值或越界值为 `null`，合法0保留。
+  文本字段去掉控制字符并截长；字段类型和数值范围由统一校验层处理。
 
 **场地身份**：`site_id`（稳定唯一，本地端自动生成，见 `E:\ip\cloud_report.py`）是数据主键；
 `site` 只是显示名，**随时可改、改名不丢数据**。旧版上报体没有 `site_id` 时回退用名字当 id。
@@ -57,7 +57,10 @@
   "containers": 30,           // 水冷集装箱数(风冷场填0)
   "containers_faulty": 2,
   "containers_offline": 1,
-  "scan_ts": 1783573880,      // 完整扫描的采样时间，随 customer_hashrates 提供
+  "scan_ts": 1783573880,      // 最近完成轮次的完成时间
+  "scan_started_ts": 1783573600, // 该完成轮次的开始时间，可选
+  "scanning": true,          // 是否正在扫描下一轮，可选
+  "scan_progress_ts": 1783573990, // 扫描线程原始进度心跳；停止扫描时null，可选
   "scan_age_s": 120,          // 场地本地上次扫描距现在多少秒(判"监控停滞"用)，可 null
   "customer_hashrates": [    // 可选：该次完整扫描的客户实时合计，不含单机 IP
     {"worker": "Asuna666", "machines": 320, "hashrate_ths": 100000.0,
@@ -444,3 +447,19 @@ curl -s -H "Authorization: Bearer $TOKEN" https://overview.example.com/api/publi
 | 404 | 场地不存在 / ingest.token 未配置（上报接口整体隐藏） |
 | 411 / 413 | 请求体无长度 / 超过 `server.max_body_bytes` |
 | 429 | 登录失败次数过多（锁定 5 分钟）/ 上报或 Agent API 超频 |
+
+## 扫描结果显示字段（2026-11-04）
+
+页面展示最近完成扫描，原始测量时间保留供通知与历史积分核验。
+
+| 位置 | 字段 | 用途 |
+|---|---|---|
+| 全网汇总 | `display_totals` | 各场地完成结果合计；任一所需场地缺失时不补0 |
+| 场地 | `display_metrics` | 同 `observed_metrics` 的指标名，保存可展示的完成结果 |
+| 客户 | `display_hashrate_ths`、`display_scan_ts` | 完成轮次的客户算力及轮次时间 |
+| 总趋势 | `sites[].display_points` | 每时间桶最后收到的可用完成结果，非桶内平均 |
+| 详情趋势 | `display_hashrate_ths`、`display_scan_ts` | 与卡片一致的完成结果曲线 |
+
+字段存在时显式 `null` 与真实0都有效，不得用旧字段覆盖。显示值不更新原始采样时间，
+也不替代 `metric_complete`、严格 `totals`、通知基线或日报耗电的测量判断。
+无报告、实际失败及扫描停滞仍保留缺口。旧口径兼容数值字段仅返回null，不再恢复旧账本。

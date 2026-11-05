@@ -67,6 +67,13 @@ class InstallSourceTests(unittest.TestCase):
         stubs = r'''
 source "$TEST_LIBRARY" "$@"
 as_svc() { "$@"; }
+systemctl() {
+  case "$*" in
+    *EnvironmentFiles*) printf '%s' "${TEST_ENV_FILES:-}" ;;
+    *Environment*) printf '%s' "${TEST_SERVICE_ENV:-}" ;;
+    *) return 0 ;;
+  esac
+}
 prepare_dir() { mkdir -p "$DIR"; }
 give_tmp() { :; }
 git() {
@@ -132,6 +139,7 @@ command() {
             "import json, os, sys\n"
             "def apply(**kwargs):\n"
             "    kwargs['wheels'] = os.environ.get('ANTCLOUD_WHEELHOUSE')\n"
+            "    kwargs['config'] = os.environ.get('CO_CONFIG')\n"
             "    with open(os.environ['TEST_LOG'], 'a') as f: f.write(json.dumps(kwargs) + '\\n')\n"
             "    return {'ok': os.environ.get('TEST_UPDATE_FAIL') != '1', 'msg': 'checked'}\n"
             "def runtime_python(): return sys.executable\n")
@@ -158,6 +166,24 @@ command() {
         record = next(json.loads(line) for line in self.requests().splitlines() if line.startswith('{'))
         self.assertFalse(record["fallback_url"])
         self.assertIn("remote set-url origin " + GITEE, self.requests())
+
+    def test_update_keeps_service_custom_config_path(self):
+        import json
+        self.protected_checkout()
+        config = str(self.root / "custom config.yaml")
+        result = self.run_script('update_code_and_dependencies',
+                                extra_env={"TEST_SERVICE_ENV": '"CO_CONFIG=' + config + '"'})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = next(json.loads(line) for line in self.requests().splitlines() if line.startswith('{'))
+        self.assertEqual(record["config"], config)
+
+    def test_environment_file_update_stops_without_guessing_config(self):
+        self.protected_checkout()
+        result = self.run_script('update_code_and_dependencies',
+                                extra_env={"TEST_ENV_FILES": "/etc/antcloud.env (ignore_errors=no)"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("EnvironmentFile", result.stdout + result.stderr)
+        self.assertNotIn('"restart"', self.requests())
 
     def test_protected_update_failure_cannot_fall_back_to_raw_merge(self):
         self.protected_checkout()

@@ -761,3 +761,11 @@ test("site detail prefers each completed display reading and preserves explicit 
   } finally {chart.destroy();}
   assert.deepEqual(Array.from(h.configs.chPower.data.datasets[0].data,p=>p.y),[2800,null,0,3000]);
 });
+
+
+test("a nonzero offline count never rounds to full availability",()=>{
+  const h=setup();
+  assert.equal(vm.runInContext("pct(1999,2000)",h.ctx),"99.95%");
+  assert.equal(vm.runInContext("pct(2000,2000)",h.ctx),"100.0%");
+  assert.equal(vm.runInContext("pct(99999,100000)",h.ctx),"99.999%");
+});

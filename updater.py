@@ -164,6 +164,47 @@ def runtime_python():
     return interpreter
 
 
+def _normalize_public_remote(url):
+    """Use anonymous HTTPS for this public project instead of requiring SSH keys."""
+    raw = str(url or "").strip()
+    comparable = raw.rstrip("/")
+    if comparable.endswith(".git"):
+        comparable = comparable[:-4]
+    official = {
+        "git@github.com:raphael2025/antmonitor-cloud":
+            "https://github.com/raphael2025/antmonitor-cloud.git",
+        "ssh://git@github.com/raphael2025/antmonitor-cloud":
+            "https://github.com/raphael2025/antmonitor-cloud.git",
+        "https://github.com/raphael2025/antmonitor-cloud":
+            "https://github.com/raphael2025/antmonitor-cloud.git",
+        "git@gitee.com:raphael01/antmonitor-cloud":
+            "https://gitee.com/raphael01/antmonitor-cloud.git",
+        "ssh://git@gitee.com/raphael01/antmonitor-cloud":
+            "https://gitee.com/raphael01/antmonitor-cloud.git",
+        "https://gitee.com/raphael01/antmonitor-cloud":
+            "https://gitee.com/raphael01/antmonitor-cloud.git",
+    }
+    return official.get(comparable, raw)
+
+
+def _fetch_sources(fallback_url=None):
+    """Return read-only fetch sources without rewriting the configured origin."""
+    origin = _git("remote", "get-url", "origin", timeout=15)
+    primary = _normalize_public_remote(origin)
+    sources = [primary]
+    if fallback_url:
+        sources.append(_normalize_public_remote(fallback_url))
+    elif primary == "https://github.com/raphael2025/antmonitor-cloud.git":
+        sources.append("https://gitee.com/raphael01/antmonitor-cloud.git")
+    elif primary == "https://gitee.com/raphael01/antmonitor-cloud.git":
+        sources.append("https://github.com/raphael2025/antmonitor-cloud.git")
+    result = []
+    for source in sources:
+        if source and source not in result:
+            result.append(source)
+    return result
+
+
 def check(branch=None, fallback_url=None):
     """Read update availability. A rejected version is visible but not auto-applied."""
     if not is_git_deployment():
@@ -181,12 +222,17 @@ def check(branch=None, fallback_url=None):
         # shared by all fetches, so each check owns an independent temporary ref.
         fetched_ref = "refs/antcloud/check/" + uuid.uuid4().hex
         try:
-            try:
-                _git("fetch", "--quiet", "origin", branch + ":" + fetched_ref, timeout=120)
-            except Exception:
-                if not fallback_url:
-                    raise
-                _git("fetch", "--quiet", fallback_url, branch + ":" + fetched_ref, timeout=120)
+            errors = []
+            fetched = False
+            for source in _fetch_sources(fallback_url):
+                try:
+                    _git("fetch", "--quiet", source, branch + ":" + fetched_ref, timeout=120)
+                    fetched = True
+                    break
+                except Exception as exc:
+                    errors.append("%s: %s" % (source, str(exc)[-500:]))
+            if not fetched:
+                raise RuntimeError("公开更新源均不可达: " + " | ".join(errors)[-1400:])
             remote = _git("rev-parse", fetched_ref)
         finally:
             _git("update-ref", "-d", fetched_ref)
@@ -332,6 +378,7 @@ def _restart():
 
 def apply(branch=None, restart=True, force=False, fallback_url=None):
     """Prepare -> recheck cleanliness -> persist recovery -> promote -> supervised restart."""
+    import update_guard
     if not is_git_deployment():
         return {"ok": False, "msg": "本目录不是 git 仓库(未用 git 部署)"}
     if not _apply_lock.acquire(blocking=False):
@@ -347,7 +394,9 @@ def apply(branch=None, restart=True, force=False, fallback_url=None):
             return {"ok": False, "msg": "其他进程正在更新，请稍候"}
         state = _load_state()
         if state.get("pending"):
-            return {"ok": False, "msg": "已有更新等待启动健康确认，请先重启并确认服务"}
+            ready = (_git("rev-parse", "HEAD") == state["pending"].get("to") and not _dirty())
+            return {"ok": False, "pending": ready,
+                    "msg": "已有更新等待启动健康确认，请先重启并确认服务"}
         if _dirty():
             return {"ok": False, "msg": "工作区有未提交或暂存改动，请先提交/保存现场改动后再更新"}
         if restart and os.environ.get("CO_LAUNCHER_CHILD") != "1":
@@ -358,6 +407,7 @@ def apply(branch=None, restart=True, force=False, fallback_url=None):
                     "msg": status.get("error") or "已是最新版本", "check": status}
         previous = _git("rev-parse", "HEAD")
         target = status["target"]
+        update_guard.validate_target(BASE, target)
         if target in state.get("bad", []) and not force:
             return {"ok": False, "msg": "该版本上次检查/启动失败，自动更新已跳过；修复后可手动重试"}
         _git("merge-base", "--is-ancestor", previous, target)
@@ -371,12 +421,16 @@ def apply(branch=None, restart=True, force=False, fallback_url=None):
                     candidate_python = _prepare_python(candidate, target)
                     unused_python = candidate_python
                 _preflight(candidate, candidate_python)
+                database_backup = update_guard.database_preflight(
+                    BASE, candidate, candidate_python, "cloud",
+                    os.path.join(_state_dir(), "database-backups"))
             except Exception as exc:
                 _mark_bad(state, target, "候选版本检查失败: %s" % exc)
                 return {"ok": False, "msg": "候选版本检查失败，运行代码及依赖未改变: %s" % str(exc)[-1000:]}
         if _git("rev-parse", "HEAD") != previous or _dirty():
             return {"ok": False, "msg": "检查期间工作区或 HEAD 发生变化，已停止更新并保留现场改动"}
         state["pending"] = {"from": previous, "to": target, "branch": status["branch"],
+                            "database_backup": database_backup,
                             "previous_python": previous_python, "python": candidate_python,
                             "attempts": 0, "phase": "prepared"}
         # Must be durable before the live checkout changes. From this point a
@@ -401,6 +455,7 @@ def apply(branch=None, restart=True, force=False, fallback_url=None):
             timer.start()
             keep_lock = True
         return {"ok": True, "from": previous[:10], "to": target[:10],
+                "database_backup": database_backup,
                 "changes": status.get("changes"), "restarting": restart, "pending": True}
     except Exception as exc:
         return {"ok": False, "msg": "更新未完成，已保留现场/恢复状态: %s" % str(exc)[-1000:]}

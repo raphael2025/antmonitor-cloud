@@ -431,3 +431,33 @@ def test_aborted_candidate_cleanup_cannot_remove_external_or_active_environment(
     monkeypatch.setattr(updater, "_preflight", reject)
     assert not updater.apply(restart=False)["ok"]
     assert interpreter.read_text() == "must remain"
+
+
+def test_official_ssh_remote_uses_anonymous_https_and_public_mirror(repo):
+    deploy, _previous, _push = repo
+    git(deploy, "remote", "set-url", "origin",
+        "git@github.com:raphael2025/antmonitor-cloud.git")
+    assert updater._fetch_sources() == [
+        "https://github.com/raphael2025/antmonitor-cloud.git",
+        "https://gitee.com/raphael01/antmonitor-cloud.git",
+    ]
+    assert git(deploy, "remote", "get-url", "origin") == (
+        "git@github.com:raphael2025/antmonitor-cloud.git"
+    )
+
+
+@pytest.mark.parametrize("origin, expected", [
+    ("ssh://git@github.com/raphael2025/antmonitor-cloud.git",
+     "https://github.com/raphael2025/antmonitor-cloud.git"),
+    ("git@gitee.com:raphael01/antmonitor-cloud.git",
+     "https://gitee.com/raphael01/antmonitor-cloud.git"),
+    ("ssh://git@gitee.com/raphael01/antmonitor-cloud",
+     "https://gitee.com/raphael01/antmonitor-cloud.git"),
+])
+def test_public_ssh_remote_normalization(origin, expected):
+    assert updater._normalize_public_remote(origin) == expected
+
+
+def test_custom_ssh_remote_is_not_rewritten():
+    custom = "git@example.com:operator/private-fork.git"
+    assert updater._normalize_public_remote(custom) == custom

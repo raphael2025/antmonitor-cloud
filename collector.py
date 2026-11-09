@@ -10,6 +10,7 @@
 """
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -27,6 +28,12 @@ class Collector:
         self.customer_interval = int(p.get("customer_interval", 600))
         self.customer_hours = int(p.get("customer_hours", 24))
         self.timeout = float(p.get("timeout", 10))
+        # Fixed worker bound: a large site list must not create unbounded threads.
+        try:
+            configured_workers = int(p.get("max_workers", 8))
+        except (TypeError, ValueError):
+            configured_workers = 8
+        self.max_workers = max(1, min(32, configured_workers))
         self.fail_offline = int(p.get("fail_offline", 3))
         # 拉取场地状态: site_id -> {fails, last_ok_ts, last_err}
         self.status = {s["id"]: {"fails": 0, "last_ok_ts": 0, "last_err": ""}
@@ -130,13 +137,21 @@ class Collector:
         return d
 
     def poll_summaries(self):
-        threads = []
-        for s in self.pull_sites():
-            t = threading.Thread(target=self._poll_site, args=(s,), daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join(self.timeout + 10)
+        """Poll sites with bounded concurrency; do not overlap collector rounds."""
+        sites = self.pull_sites()
+        if not sites:
+            return
+        with ThreadPoolExecutor(
+            max_workers=min(self.max_workers, len(sites)),
+            thread_name_prefix="site-poll",
+        ) as pool:
+            futures = {pool.submit(self._poll_site, site): site for site in sites}
+            for future in as_completed(futures):
+                site = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:  # _poll_site normally records its own errors
+                    print(f"[collector] {site.get('name', site['id'])} 采集任务异常: {exc}")
 
     def _poll_site(self, site):
         sid = site["id"]

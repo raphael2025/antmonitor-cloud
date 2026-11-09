@@ -35,6 +35,7 @@ class Collector:
         self.last_poll_ts = 0
         self._stop = threading.Event()
         self._thread = None
+        self._notify_thread = None
         # 把拉取场地登记进 sites 表(客户表联名、统一注册视图用)
         now = int(time.time())
         for s in self.pull_sites():
@@ -83,9 +84,28 @@ class Collector:
             return
         self._thread = threading.Thread(target=self._loop, name="collector", daemon=True)
         self._thread.start()
+        if not self._notify_thread or not self._notify_thread.is_alive():
+            self._notify_thread = threading.Thread(
+                target=self._notification_loop, name="notification-worker", daemon=True
+            )
+            self._notify_thread.start()
 
     def stop(self):
         self._stop.set()
+
+    def _notification_loop(self):
+        """Run alert evaluation/delivery away from the site polling loop.
+
+        Notifier persists pending deliveries before sending and records each
+        channel receipt. A slow external endpoint can delay this worker, but
+        cannot hold up site polling, daily rollups, or retention cleanup.
+        """
+        while not self._stop.is_set():
+            try:
+                self.notifier.tick(self.all_sites(), self.site_state)
+            except Exception as exc:
+                print(f"[collector] 通知工作线程异常: {exc}")
+            self._stop.wait(max(5.0, self.interval))
 
     def _loop(self):
         last_customers = 0.0
@@ -102,8 +122,6 @@ class Collector:
                     self.poll_customers()
                 except Exception as e:
                     print(f"[collector] 客户报表轮询异常: {e}")
-            # 告警评估(每轮)：失联/停滞/恢复/算力骤降
-            self.notifier.tick(self.all_sites(), self.site_state)
             try:   # 日汇总每轮重算今天+昨天(聚合查询很轻)，日报最多滞后一个轮询周期
                 db.rollup_daily(self.conn, stalled_after=int(self.cfg.get("poll", {}).get("stalled_after_s", 1200)))
             except Exception as e:

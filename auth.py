@@ -85,7 +85,9 @@ def _users(cfg):
         if name in over:
             d["password"] = over[name]
         if d.get("role") not in ROLE_RANK:
-            d["role"] = "viewer"
+            # Unknown/future roles must never inherit the global read-only viewer scope.
+            # Customer accounts remain disabled until tenant-scoped APIs are implemented.
+            d["role"] = "disabled"
         out[name] = d
     return out
 
@@ -140,6 +142,8 @@ def login(cfg, username, password, src=None):
     if not u or not ok:
         _record_fail(src, now)
         return None, "bad"
+    if u.get("role") not in ROLE_RANK:
+        return None, "role_disabled"
     if _is_default(username, stored) and not _allow_default(cfg):
         return None, "default_password"
     token = secrets.token_hex(24)

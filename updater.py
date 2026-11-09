@@ -437,6 +437,13 @@ def apply(branch=None, restart=True, force=False, fallback_url=None):
         # failed save may have an uncertain outcome, so retain its recovery venv.
         retain_candidate = True
         _save_state(state)
+        if database_backup:
+            try:
+                update_guard.prune_database_backups(
+                    os.path.join(_state_dir(), "database-backups"),
+                    keep=10, protected=[database_backup])
+            except Exception as exc:
+                print("[update] 清理旧更新恢复点失败(保留全部备份，不影响本次更新): %s" % exc)
         try:
             _git("merge", "--ff-only", target)
         except Exception:

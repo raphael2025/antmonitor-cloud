@@ -180,6 +180,13 @@ select_origin() {
   info "$(L '已选择代码来源' 'Selected source'): $SOURCE"
 }
 
+copy_release() {
+  tar -C "$1" --exclude=./config.yaml --exclude=./cloud_settings.json --exclude=./settings.json \
+    --exclude='./*.db*' --exclude='./*.sqlite*' --exclude=./certs --exclude=./backups \
+    --exclude=./data --exclude=./logs --exclude=./venv --exclude=./.venv --exclude=./offline \
+    -cf - . | as_svc tar -C "$DIR" --no-same-owner -xf -
+}
+
 fetch_tarball() {
   # Gitee 的公开 archive URL 可能返回登录/下载页面；只使用 Git 获取源码。
   [[ "$SOURCE" != "gitee" ]] \
@@ -195,7 +202,7 @@ fetch_tarball() {
   [[ -f "$tmp/server.py" && -f "$tmp/requirements.txt" ]] || { rm -rf "$tmp"; die 'Downloaded source is incomplete; existing files were preserved.'; }
   prepare_dir
   give_tmp "$tmp"
-  as_svc cp -a "$tmp"/. "$DIR"/      # config.yaml / 数据库 / 证书不在源码包里，不会被覆盖
+  copy_release "$tmp"      # config.yaml / 数据库 / 证书不在源码包里，不会被覆盖
   rm -rf "$tmp"
 }
 
@@ -204,7 +211,7 @@ copy_local_src() {
   [[ ! -e "$DIR/.git" ]] || die "$(L '目标已有 Git 版本信息，不能用本地源码覆盖；请使用 Git 快进更新，或安装到独立目录' 'Destination is a Git checkout; use a fast-forward Git update or a separate installation directory')"
   prepare_dir
   tar -C "$SRC" --exclude=./venv --exclude=./.venv --exclude=./.git --exclude=./config.yaml \
-    --exclude=./cloud_settings.json --exclude='./*.db' --exclude='./*.db-*' --exclude=./certs \
+    --exclude=./cloud_settings.json --exclude='./*.db*' --exclude='./*.sqlite*' --exclude=./certs \
     --exclude=./data --exclude='./__pycache__' --exclude=./.pytest_cache -cf - . \
     | as_svc tar -C "$DIR" --no-same-owner -xf -
 }
@@ -253,7 +260,7 @@ fetch_code() {
     if git clone -q --branch "$BRANCH" "$REPO_URL" "$tmpc/src"; then
       prepare_dir
       give_tmp "$tmpc"
-      as_svc cp -a "$tmpc/src"/. "$DIR"/
+      copy_release "$tmpc/src"
       rm -rf "$tmpc"
       return
     fi
@@ -264,7 +271,7 @@ fetch_code() {
       if git clone -q --branch "$BRANCH" https://gitee.com/raphael01/antmonitor-cloud.git "$tmpc/src"; then
         prepare_dir
         give_tmp "$tmpc"
-        as_svc cp -a "$tmpc/src"/. "$DIR"/
+        copy_release "$tmpc/src"
         rm -rf "$tmpc"
         return
       fi
@@ -297,7 +304,10 @@ protected_git_update() {
   [[ "$SOURCE_EXPLICIT" -ne 0 || -z "$SRC" ]] \
     || die "Destination is a Git checkout; use a fast-forward Git update or a separate directory"
   select_origin
-  local origin alternate="" current wheels="${ANTCLOUD_WHEELHOUSE:-}"
+  local origin alternate="" current wheels="${ANTCLOUD_WHEELHOUSE:-}" service_env environment_files
+  environment_files="$(systemctl show -p EnvironmentFiles --value "$SERVICE" 2>/dev/null || true)"
+  [[ -z "$environment_files" ]] || die "Service uses an EnvironmentFile; update from the running web panel so its actual configuration is used. Existing settings were preserved."
+  service_env="$(systemctl show -p Environment --value "$SERVICE" 2>/dev/null || true)"
   origin="$(git_dir remote get-url origin)"
   current="$(git_dir rev-parse --abbrev-ref HEAD)"
   if [[ "$AUTO_SOURCE" == 1 && "$current" == "$BRANCH" ]] && official_origin "$origin"; then
@@ -307,15 +317,19 @@ protected_git_update() {
   info "$(L '检查候选代码、依赖与启动，保留失败回退点' 'Validating candidate code, dependencies and startup with rollback protection')"
   # The guardian/updater needs only stdlib. The selected application interpreter
   # may live in .git/antcloud-update/envs; never pip-install into the live venv.
-  PY="$(as_svc env ANTCLOUD_WHEELHOUSE="$wheels" "$DIR/venv/bin/python" - "$DIR" "$BRANCH" "$alternate" <<'PY'
-import os, sys
+  PY="$(as_svc env ANTCLOUD_SERVICE_ENV="$service_env" ANTCLOUD_WHEELHOUSE="$wheels" "$DIR/venv/bin/python" - "$DIR" "$BRANCH" "$alternate" <<'PY'
+import os, sys, shlex
+for entry in shlex.split(os.environ.pop('ANTCLOUD_SERVICE_ENV', '')):
+    key, separator, value = entry.partition('=')
+    if separator and (key.startswith(('CO_', 'ANTCLOUD_')) or key in ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY')):
+        os.environ[key] = value
 os.chdir(sys.argv[1])
 sys.path.insert(0, sys.argv[1])
 import updater
 result = updater.apply(branch=sys.argv[2], restart=False, force=True,
                        fallback_url=sys.argv[3] or None)
 print(result.get("msg") or "Update prepared; restarting for HTTP health confirmation", file=sys.stderr)
-if not (result.get("ok") or result.get("unchanged")):
+if not (result.get("ok") or result.get("unchanged") or result.get("pending")):
     sys.exit(1)
 print(updater.runtime_python())
 PY
@@ -682,7 +696,8 @@ do_update() {
   update_code_and_dependencies
   PORT="$(port_of)"
   ensure_perms
-  write_service
+  # Keep custom Environment/EnvironmentFile, service user and startup arguments.
+  if ! systemctl cat "$SERVICE" >/dev/null 2>&1; then write_service; fi
   systemctl restart "$SERVICE"
   wait_healthy && ok "$(L '已更新并重启' 'Updated and restarted')" \
     || warn "journalctl -u ${SERVICE} -n 50 --no-pager"

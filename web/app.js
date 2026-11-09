@@ -284,7 +284,15 @@ $("trendRange").onchange = () => {
 if (localStorage.getItem("co_trend_hours")) $("trendRange").value = localStorage.getItem("co_trend_hours");
 
 // ---- 总览渲染 ----
-const pct = (a, b) => (num(a) != null && num(b) > 0 ? ((100 * num(a)) / num(b)).toFixed(1) + "%" : "–");
+const pct = (a, b) => {
+  const online = num(a), total = num(b);
+  if (online == null || !(total > 0)) return "–";
+  const ratio = 100 * online / total;
+  let digits = 1;
+  // A missing machine must remain visible even when rounding would say 100%.
+  while (online < total && Number(ratio.toFixed(digits)) === 100 && digits < 8) digits++;
+  return ratio.toFixed(digits) + "%";
+};
 
 function siteMetric(s, key) {
   if (Object.prototype.hasOwnProperty.call(s.display_metrics || {}, key)) return num(s.display_metrics[key]);

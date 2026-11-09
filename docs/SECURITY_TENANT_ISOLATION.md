@@ -24,8 +24,8 @@ Add three tables:
 
 Constraints:
 
-- `tenant_members`: unique `(tenant_id, username)`; one customer login belongs to exactly one active tenant unless a later requirement explicitly permits multi-tenant accounts.
-- `tenant_worker_bindings`: unique `(site_id, worker)` across active tenants, preventing one worker from being visible to two customers by accident.
+- `tenant_members`: `username` is globally unique; one customer login belongs to exactly one tenant unless a later requirement explicitly permits multi-tenant accounts.
+- `tenant_worker_bindings`: unique `(site_id, worker)` until an administrator explicitly unbinds it, preventing one worker from being visible to two customers by accident.
 - Foreign keys cascade only when an administrator deliberately removes a tenant or binding.
 - Store exact normalized worker keys; display labels must not be used as authorization keys.
 

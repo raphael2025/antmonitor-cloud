@@ -82,6 +82,21 @@ No automatic mapping by worker prefix, substring, site display name, or fuzzy ma
 - Revoking a binding takes effect on the next request without requiring a process restart.
 - Staff/admin access and existing ingestion/reporting behavior remain unchanged.
 
+## Site identity clone detection
+
+The local reporter currently persists a stable `site_id` in `cloud_site_id.txt`; cloning the whole installation directory also clones that identity. Documentation already tells operators to remove the file when cloning, but that is a manual safeguard.
+
+A safe detection phase should:
+
+1. Send a one-way SHA-256 host fingerprint with ingest reports. Prefer a platform hardware UUID (SMBIOS/DMI UUID on Linux/Windows); use a documented fallback only when unavailable. Never transmit raw hardware identifiers.
+2. Store observations by `(site_id, fingerprint)` with first/last seen timestamps and source IP metadata.
+3. If a second fingerprint reports the same `site_id` within a configurable overlap window, flag an identity conflict in the admin view and audit log.
+4. Keep ingest visible but mark the site's identity as conflicted; do not silently merge, rotate, or discard historical data.
+5. Require an explicit admin rebind action after checking the old host is retired. The action must be audited and should expire the old reporter credential if the credential was cloned.
+6. Treat a normal hardware migration as an explicit rebind, not as an automatic conflict reset.
+
+The overlap window and hardware fingerprint strategy must be tested against Windows reinstalls, Linux image clones, VM clones, NIC changes, and planned hardware replacement. A source-IP-only detector is insufficient because several sites can share NAT and one site can change egress IP.
+
 ## Decision gate
 
 Do not enable customer accounts until the API and dashboard phases are complete. A partially implemented role would create a false sense of isolation.

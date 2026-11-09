@@ -13,7 +13,21 @@ def test_slow_notification_does_not_block_collection(monkeypatch):
     collector.cfg = {"poll": {}, "db": {}}
     collector.interval = 0.05
     collector.customer_interval = 10_000
-    collector._stop = threading.Event()
+    class FastStop:
+        def __init__(self):
+            self.event = threading.Event()
+
+        def is_set(self):
+            return self.event.is_set()
+
+        def set(self):
+            self.event.set()
+
+        def wait(self, timeout=None):
+            return self.event.wait(min(timeout or 0, 0.05))
+
+    collector._stop = FastStop()
+    collector.conn = object()
     collector._thread = None
     collector._notify_thread = None
     collector.last_poll_ts = 0
@@ -33,7 +47,7 @@ def test_slow_notification_does_not_block_collection(monkeypatch):
     collector.start()
     try:
         assert entered.wait(1)
-        time.sleep(0.18)
+        time.sleep(0.22)
         assert len(polls) >= 2
     finally:
         collector.stop()

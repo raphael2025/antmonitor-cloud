@@ -672,7 +672,7 @@ def _check_agent_token(request: Request):
     if not _pub_rate_ok(_client_ip(request)):
         raise HTTPException(429, f"太频繁(每来源每分钟 {_PUB_RATE_MAX} 次)")
     got = request.headers.get("Authorization") or ""
-    got = got[7:].strip() if got.startswith("Bearer ") else (request.query_params.get("token") or "")
+    got = got[7:].strip() if got.lower().startswith("bearer ") else ""
     if not got or not hmac.compare_digest(got.encode(), tok.encode()):
         raise HTTPException(401, "token 错误")
 

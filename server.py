@@ -607,6 +607,21 @@ def api_daily(request: Request, site: str, days: int = 14):
     return _daily_payload(site, days)
 
 
+@app.get("/api/customers/daily")
+def api_customers_daily(request: Request, site: str = "", days: int = 30):
+    """客户日汇总对账（场地本地推送，UTC+8）。"""
+    _require_login(request)
+    days = max(1, min(400, int(days or 30)))
+    sid = None
+    if site:
+        found = _find_site(site)
+        if not found:
+            raise HTTPException(404, "无此场地")
+        sid = found["id"]
+    rows = db.get_customer_daily(CONN, sid, days)
+    return {"ok": True, "ts": int(time.time()), "days": days, "tz": "UTC+8", "customers_daily": rows}
+
+
 @app.get("/api/customers")
 def api_customers(request: Request):
     """跨场地客户明细 + 按矿工名(客户)汇总。"""
@@ -857,12 +872,18 @@ def api_ingest_ping(request: Request, body: dict = Body(...)):
 
 @app.post("/api/ingest/customers")
 def api_ingest_customers(request: Request, body: dict = Body(...)):
-    """场地客户报表上报(默认每10分钟一次，整表替换)。"""
+    """场地客户报表上报(默认每10分钟一次，整表替换)。
+
+    可选 `customers_daily`: 客户日汇总列表（UTC+8），用于云端月底对账。
+    """
     sid, name = _ingest_identity(body)
     _check_ingest_token(request, sid)
     rows = body.get("customers")
     if not isinstance(rows, list) or len(rows) > 5000:
         raise HTTPException(400, "customers 非法")
+    daily = body.get("customers_daily")
+    if daily is not None and (not isinstance(daily, list) or len(daily) > 5000):
+        raise HTTPException(400, "customers_daily 非法")
     try:
         rows = validate.customers(rows, strict=True)
         period = validate.customer_report_period(body, rows, int(time.time()))
@@ -871,10 +892,14 @@ def api_ingest_customers(request: Request, body: dict = Body(...)):
     now = int(time.time())
     with _ingest_write(sid):
         _verify_ingest_credential(request, sid)
-        if not db.replace_customers(CONN, sid, rows, _num(body.get("hours"), int, 24, hi=24 * 90) or 24, period):
+        stored = db.replace_customers(CONN, sid, rows, _num(body.get("hours"), int, 24, hi=24 * 90) or 24, period)
+        if not stored:
             return {"ok": True, "ts": now, "stored": False, "reason": "older_or_unverified_report"}
+        daily_n = 0
+        if isinstance(daily, list):
+            daily_n = db.replace_customer_daily(CONN, sid, daily)
         db.upsert_site(CONN, sid, name if body.get("site") else None, None, now)
-    return {"ok": True, "ts": now, "count": len(rows), "stored": True}
+    return {"ok": True, "ts": now, "count": len(rows), "daily_count": daily_n, "stored": True}
 
 
 @app.delete("/api/site/{key}")

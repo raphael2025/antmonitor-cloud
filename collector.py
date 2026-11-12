@@ -250,9 +250,20 @@ class Collector:
         age = db.scan_age(snap_ok, now)
         if age is not None and age > stalled_after and not db.scan_in_progress(snap_ok, now):
             return "stalled"
+        # 场内自报全场大面积掉线：链路仍通（还能上报），与「云端收不到/扫描停更」分开。
+        if self._local_site_down(site_id):
+            return "site_down"
         # 告警口径与场地本地完全一致：只看本地活跃告警数。
         # 集装箱真故障/箱体离线在本地会生成告警计入 active_alerts；
         # 被本地配置忽略的故障位(如供液流量低)只在卡片显示、不算告警——云端不越权升级。
         if (snap_ok.get("active_alerts") or 0) > 0:
             return "alert"
         return "ok"
+
+    def _local_site_down(self, site_id):
+        try:
+            rows = db.get_alert_summary(self.conn, site_id)
+        except Exception:
+            return False
+        return any((r.get("category") == "site_down" and (r.get("count") or 0) > 0)
+                   for r in (rows or []))

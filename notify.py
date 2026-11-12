@@ -18,6 +18,7 @@ alerts:
   cooldown: 1800            # 同场地同类告警冷却(秒)，恢复通知不受限
   hashrate_drop_pct: 30     # 当前10分钟均值比 45~90 分钟前基线跌超此百分比→告警；0=关
   offline_threshold: 0      # 单场地掉线台数(total-online)达到此值→告警；0=关
+  merge_window_sec: 45      # 建议 45：同一场地短时多事件合并成一条再发；0=立即逐条发
   telegram: {enabled: false, bot_token: "", chat_id: ""}
   webhook:  {enabled: false, url: "", kind: wecom}   # wecom|dingtalk(同构)|raw
   email:    {enabled: false, smtp_host: "", smtp_port: 465, use_ssl: true,
@@ -38,11 +39,13 @@ import requests
 import db
 
 _TYPE_LABEL = {"air": "风冷", "hydro": "水冷", "mixed": "混合"}
+# 健康语义：unreachable=上报过期收不到；stalled=还能报但扫描停更；site_down=场内自报全场掉线
 _NOTICE_GROUPS = (
-    frozenset(("unreachable", "stalled", "recovered")),
+    frozenset(("unreachable", "stalled", "site_down", "recovered")),
     frozenset(("hashrate_drop", "hashrate_recovered")),
     frozenset(("offline_count", "offline_recovered")),
 )
+_FRESH_STATES = frozenset(("ok", "alert", "site_down"))  # 仍有可用快照，可评算力/掉线台数
 
 
 class Notifier:
@@ -182,7 +185,7 @@ class Notifier:
             self.drop_pct = drop_pct
         if self.drop_pct > 0:
             for sid, (state, s) in cur.items():
-                if state in ("ok", "alert") and db.snapshot_quality(last_ok.get(sid) or {}, now,
+                if state in _FRESH_STATES and db.snapshot_quality(last_ok.get(sid) or {}, now,
                         int(self.poll.get("stalled_after_s", 1200)))["hashrate_ths"]:
                     self._check_drop(sid, s, now)
         offline_threshold = int(self.cfg.get("offline_threshold", 0) or 0)   # 现场读
@@ -190,7 +193,7 @@ class Notifier:
             self.offline_threshold = offline_threshold
         if self.offline_threshold > 0:
             for sid, (state, s) in cur.items():
-                if state in ("ok", "alert"):
+                if state in _FRESH_STATES:
                     self._check_offline(sid, s, last_ok.get(sid), now)
         self._retry_pending(cur, last_ok, now)
         self._persist()
@@ -202,14 +205,20 @@ class Notifier:
             age = (now - snap["ts"]) // 60 if snap else None
             tail = (f"，最后在线 {snap['online']}/{snap['total']}"
                     f"（{max(1, age)} 分钟前）" if snap else "，尚无历史数据")
-            self._send(sid, "unreachable", f"⚠ 场地失联: {label} 收不到数据{tail}")
+            self._send(sid, "unreachable", f"⚠ 场地失联: {label} 收不到上报（上报过期）{tail}")
         elif new == "stalled":
             age = db.scan_age(snap or {}, now)
             minutes = str(age // 60) if age is not None else "未知"
             self._send(sid, "stalled",
-                       f"⏸ 监控停滞: {label} 机器可达但本地扫描已 "
-                       f"{minutes} 分钟未更新，请上场地机器检查监控进程")
-        elif old in ("unreachable", "stalled") and new in ("ok", "alert"):
+                       f"⏸ 监控停滞: {label} 上报仍在但本地扫描已 "
+                       f"{minutes} 分钟未更新（心跳/扫描停更），请上场地机器检查监控进程")
+        elif new == "site_down":
+            offline = ""
+            if snap and snap.get("total") is not None and snap.get("online") is not None:
+                offline = f"，在线 {snap['online']}/{snap['total']}"
+            self._send(sid, "site_down",
+                       f"🔴 场内自报全场掉线: {label}{offline}（场地监控可达，问题在场内供电/网络）")
+        elif old in ("unreachable", "stalled", "site_down") and new in ("ok", "alert"):
             tail = (f"，当前在线 {snap['online']}/{snap['total']}" if snap else "")
             self._send(sid, "recovered", f"✅ 场地恢复: {label}{tail}", recovery=True)
 
@@ -292,10 +301,21 @@ class Notifier:
         due = now
         if not recovery and key in self.last_sent:
             due = max(due, self.last_sent[key] + cooldown)
+        # 短窗合并：同一场地多事件先入队，等到 merge_window 再一次发出，避免刷屏。
+        merge = int(self.cfg.get("merge_window_sec", 0) or 0)
+        if not recovery and merge > 0:
+            due = max(due, now + merge)
         self.pending[key] = {"msg": msg, "remaining": set(channels), "delivered": set(),
                              "attempts": 0, "due": due, "created": now}
         self._persist(sid)   # 事件/活动状态必须在任何外部请求之前落地，包括暂停和冷却中的事件。
-        self._attempt_pending(key, now)
+        if recovery or merge <= 0:
+            self._attempt_pending(key, now)
+
+    def _due_keys_for_site(self, sid, now):
+        return sorted(
+            (k for k, n in self.pending.items() if k[0] == sid and now >= n["due"]),
+            key=lambda k: (self.pending[k]["created"], k[1]),
+        )
 
     def _attempt_pending(self, key, now):
         notice = self.pending.get(key)
@@ -307,16 +327,28 @@ class Notifier:
             return
         if key[1] in _NOTICE_GROUPS[2] and not int(self.cfg.get("offline_threshold", 0) or 0):
             return
+        # 同一场地到期事件合并成一条外发，避免短时多跳变刷屏。
+        keys = self._due_keys_for_site(key[0], now)
+        if not keys or key != keys[0]:
+            return
         channels = self._channels()
-        ready = notice["remaining"].intersection(channels)
+        ready = set(channels)
+        for k in keys:
+            ready &= self.pending[k]["remaining"]
         if not ready:
             return  # 通道关闭只暂停，不丢失失败状态，也不占用成功冷却。
         if self._delivery_budget is not None and self._delivery_budget <= 0:
             return
-        msg = notice["msg"]
-        if now > notice["created"]:
-            created = datetime.fromtimestamp(notice["created"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            msg = f"⏳ 补发通知（事件时间 {created}）\n{msg}"
+        parts = []
+        for k in keys:
+            n = self.pending[k]
+            part = n["msg"]
+            if now > n["created"]:
+                created = datetime.fromtimestamp(n["created"], timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S UTC")
+                part = f"⏳ 补发通知（事件时间 {created}）\n{part}"
+            parts.append(part)
+        msg = "\n".join(parts) if len(parts) > 1 else parts[0]
         self._persist(key[0])
         failed = False
         for channel in sorted(ready):
@@ -336,16 +368,21 @@ class Notifier:
             except Exception:
                 ok = False  # 不打印可能带 URL/token 的异常；其它通道继续尝试。
             if ok:
-                notice["remaining"].remove(channel)
-                notice["delivered"].add(channel)
-                if not notice["remaining"]:
-                    self.last_sent[key] = now
-                    self.pending.pop(key, None)
+                for k in list(keys):
+                    n = self.pending.get(k)
+                    if not n:
+                        continue
+                    n["remaining"].discard(channel)
+                    n["delivered"].add(channel)
+                    if not n["remaining"]:
+                        self.last_sent[k] = now
+                        self.pending.pop(k, None)
                 self._persist(key[0])  # webhook/email 失败或进程随后退出，也不能重发已送达 Telegram。
             else:
                 failed = True
             logged = f"[{channel}] {msg}"
             try:
+                # 合并发送时按首条类型记日志；细节已在正文。
                 db.notify_log_add(self.conn, now, key[0], key[1], logged, ok)
             except Exception:
                 pass
@@ -353,9 +390,13 @@ class Notifier:
                 print(f"[notify] {'OK' if ok else 'FAIL'} {logged}")
             except Exception:
                 pass
-        if key in self.pending and failed:
-            notice["attempts"] = min(notice["attempts"] + 1, 5)
-            notice["due"] = now + min(900, 60 * 2 ** (notice["attempts"] - 1))
+        if failed:
+            for k in keys:
+                n = self.pending.get(k)
+                if not n:
+                    continue
+                n["attempts"] = min(n["attempts"] + 1, 5)
+                n["due"] = now + min(900, 60 * 2 ** (n["attempts"] - 1))
             self._persist(key[0])
 
     def _retry_pending(self, cur, last_ok, now):
@@ -366,7 +407,7 @@ class Notifier:
                 continue
             state = cur[sid][0]
             if ntype in _NOTICE_GROUPS[0]:
-                current = state if state in ("unreachable", "stalled") else "recovered"
+                current = state if state in ("unreachable", "stalled", "site_down") else "recovered"
                 if state == "pending" or ntype != current:
                     self.pending.pop(key, None)
                     continue
@@ -376,7 +417,7 @@ class Notifier:
                 if float(self.cfg.get(setting, 30 if is_drop else 0) or 0) <= 0:
                     continue
                 # 缺测/失联不是恢复：保留当前故障，但没有新证据时暂停补发测量类消息。
-                if state not in ("ok", "alert"):
+                if state not in _FRESH_STATES:
                     continue
                 quality = db.snapshot_quality(last_ok.get(sid) or {}, now,
                                               int(self.poll.get("stalled_after_s", 1200)))

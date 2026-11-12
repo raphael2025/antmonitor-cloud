@@ -267,7 +267,7 @@ def _site_entry(scfg, latest, last_ok, cust_counts, now):
          "reported_name": scfg.get("reported_name", scfg["name"]),
          "name_override": scfg.get("name_override", ""),
          "duplicate_name": bool(scfg.get("duplicate_name")),
-         "state": state,                                   # ok|alert|stalled|unreachable|pending
+         "state": state,                                   # ok|alert|site_down|stalled|unreachable|pending
          "fails": fails, "error": err,
          "data_ts": snap["ts"] if snap else None,
          "data_age_s": (now - snap["ts"]) if snap else None,
@@ -282,19 +282,19 @@ def _site_entry(scfg, latest, last_ok, cust_counts, now):
     stalled_after = int(CFG.get("poll", {}).get("stalled_after_s", 1200))
     quality = db.snapshot_quality(snap or {}, now, stalled_after)
     observed = db.snapshot_observed(snap or {}, now, stalled_after)
-    if state not in ("ok", "alert"):
+    if state not in ("ok", "alert", "site_down"):
         quality = {k: False for k in quality}
         observed = {k: None for k in observed}
     d["metric_complete"] = quality
     d["observed_metrics"] = observed
     d["metric_available"] = {k: value is not None for k, value in observed.items()}
     d["data_complete"] = all(quality[k] for k in ("online", "total", "hashrate_ths", "power_kw"))
-    d["data_quality"] = ("missing" if not snap else "stale" if state not in ("ok", "alert") else
+    d["data_quality"] = ("missing" if not snap else "stale" if state not in ("ok", "alert", "site_down") else
                          "legacy_unverified" if not snap.get("measurement_time_supported") or any(snap.get(k) is None for k in
                              ("unknown", "hashrate_complete", "power_complete")) else
                          "complete" if d["data_complete"] else "partial")
     display_complete, display = db.snapshot_display(snap or {})
-    if state not in ("ok", "alert"):
+    if state not in ("ok", "alert", "site_down"):
         display_complete = {key: False for key in display_complete}
         display = {key: None for key in display}
     d["display_metrics"] = display

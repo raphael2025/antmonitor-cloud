@@ -39,6 +39,7 @@ alerts:                   # 云端告警通知：场地失联/监控停滞/恢�
   cooldown: 1800          # 同场地同类告警冷却(秒)；恢复通知不受限
   hashrate_drop_pct: 30   # 当前10分钟均值比 45~90 分钟前基线跌超此百分比→告警；0=关
   offline_threshold: 0    # 单场地掉线台数(total-online)达到此值→告警；0=关
+  merge_window_sec: 45    # 同一场地短时多事件合并成一条再发；0=立即逐条
   telegram:
     enabled: false
     bot_token: ""

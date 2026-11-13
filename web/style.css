@@ -83,6 +83,7 @@ select {
 .pill.mixed { background: #2a2230; color: #d2a8ff; }
 .pill.st-ok          { background: #16331f; color: #0ca30c; }
 .pill.st-alert       { background: #33260f; color: #fab219; }
+.pill.st-site-down   { background: #3a1520; color: #ff6b7a; font-weight: 700; }
 .pill.st-stalled     { background: #33200f; color: #ec835a; }
 .pill.st-unreachable { background: #33181a; color: #d03b3b; font-weight: 700; }
 .pill.st-pending     { background: #21262d; color: #9aa4af; }

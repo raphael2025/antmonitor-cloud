@@ -142,6 +142,21 @@ CREATE TABLE IF NOT EXISTS daily_observed_v2(
   PRIMARY KEY(site_id, day)
 );
 
+-- 场地推送的客户日汇总（UTC+8），服务跨场月底对账。
+CREATE TABLE IF NOT EXISTS site_customer_daily(
+  site_id TEXT NOT NULL,
+  day TEXT NOT NULL,
+  worker TEXT NOT NULL,
+  machines INTEGER DEFAULT 0,
+  delivered_th_h REAL,
+  power_kwh REAL,
+  uptime_pct REAL,
+  observed_s REAL,
+  updated_ts INTEGER,
+  PRIMARY KEY(site_id, day, worker)
+);
+CREATE INDEX IF NOT EXISTS idx_scd_site_day ON site_customer_daily(site_id, day);
+
 CREATE TABLE IF NOT EXISTS notify_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -716,6 +731,52 @@ def get_alert_summary(conn, site_id):
     return out
 
 
+def replace_customer_daily(conn, site_id, rows):
+    """整表替换该场近窗客户日汇总（场地本地已按 UTC+8 切日）。"""
+    now = int(time.time())
+    cleaned = []
+    for r in (rows or [])[:5000]:
+        if not isinstance(r, dict):
+            continue
+        day = str(r.get("day") or "")[:10]
+        worker = str(r.get("worker") or "")[:128]
+        if not day or not worker:
+            continue
+        cleaned.append((site_id, day, worker, int(r.get("machines") or 0),
+                        r.get("delivered_th_h"), r.get("power_kwh"), r.get("uptime_pct"),
+                        r.get("observed_s"), now))
+    with _lock:
+        days = sorted({c[1] for c in cleaned})
+        if days:
+            conn.execute(
+                f"DELETE FROM site_customer_daily WHERE site_id=? AND day IN ({','.join('?' * len(days))})",
+                (site_id, *days))
+        if cleaned:
+            conn.executemany(
+                "INSERT OR REPLACE INTO site_customer_daily"
+                "(site_id,day,worker,machines,delivered_th_h,power_kwh,uptime_pct,observed_s,updated_ts)"
+                " VALUES(?,?,?,?,?,?,?,?,?)", cleaned)
+        conn.commit()
+    return len(cleaned)
+
+
+def get_customer_daily(conn, site_id=None, days=30):
+    """客户日汇总；site_id 空则全场。days 按 day 字符串近窗过滤。"""
+    days = max(1, min(400, int(days or 30)))
+    # 用日历近似：取最近 days 天的 day 键下限
+    cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600 - (days - 1) * 86400))
+    q = ("SELECT site_id,day,worker,machines,delivered_th_h,power_kwh,uptime_pct,observed_s "
+         "FROM site_customer_daily WHERE day>=?")
+    args = [cutoff]
+    if site_id:
+        q += " AND site_id=?"
+        args.append(site_id)
+    q += " ORDER BY day DESC, machines DESC"
+    with _lock:
+        rows = conn.execute(q, args).fetchall()
+    return [dict(r) for r in rows]
+
+
 def customers(conn, site_id=None):
     """历史报表叠加独立完整扫描；首份历史报表到达前也能看到实时客户。"""
     q = ("SELECT c.*, COALESCE(NULLIF(m.name_override, ''), s.name, c.site_id) AS site_name"
@@ -861,6 +922,7 @@ def delete_site(conn, site_id, name=None):
                      (site_id, name or site_id, int(time.time())))
         for t in ("sites", "snapshots", "site_customers", "site_customer_current",
                   "site_customer_current_state", "site_customer_report_state", "site_alert_summary",
+                  "site_customer_daily",
                   "daily", "daily_observed_v2", "notify_log", "notification_state",
                   "notification_outbox", "notification_cooldown"):
             conn.execute(f"DELETE FROM {t} WHERE {'id' if t == 'sites' else 'site_id'}=?",

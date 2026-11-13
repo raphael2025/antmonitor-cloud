@@ -59,6 +59,7 @@ const fmtFull = (ts) => { const d = new Date(ts * 1000);
 const STATE = {
   ok:          { cls: "st-ok",          txt: () => t("state.ok") },
   alert:       { cls: "st-alert",       txt: (s) => t("state.alert", { n: int0(s.active_alerts) }) },
+  site_down:   { cls: "st-site-down",   txt: () => t("state.site_down") },
   stalled:     { cls: "st-stalled",     txt: () => t("state.stalled") },
   unreachable: { cls: "st-unreachable", txt: () => t("state.unreachable") },
   pending:     { cls: "st-pending",     txt: () => t("state.pending") },

@@ -51,7 +51,7 @@ header { gap: 12px; flex-wrap: wrap; }
 [data-theme="light"] :is(.rmbtn, .sec-banner, .seccheck.high, #cmdBody .warn-box) { background: #ffebed; color: #a81f2e; border-color: #e6a3ac; }
 [data-theme="light"] :is(.rmbtn:hover, .mini-btn.danger:hover) { background: #ffdce1; }
 [data-theme="light"] :is(.pill.online, .pill.st-ok, .pump.on, .chbadge.ok, .seccheck.ok) { background: #e1f4e7; color: #19713a; }
-[data-theme="light"] :is(.pill.offline, .pill.st-unreachable, .fbadge.crit, .chbadge.fail) { background: #ffe5e9; color: #b42330; }
+[data-theme="light"] :is(.pill.offline, .pill.st-unreachable, .pill.st-site-down, .fbadge.crit, .chbadge.fail) { background: #ffe5e9; color: #b42330; }
 [data-theme="light"] :is(.pill.repair, .pill.st-alert, .fbadge.warn, .alertrow, .seccheck.warn, .upd-body .upd-note, .conn-result) { background: #fff2d8; color: #80510a; }
 [data-theme="light"] .alertrow b { color: #744606; }
 [data-theme="light"] .pill.st-stalled { background: #ffeadc; color: #a74716; }

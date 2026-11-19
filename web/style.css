@@ -201,3 +201,6 @@ table.mini td { font-size: 13px; }
 /* Short notes are reserved for operational state, such as unresolved faults. */
 .card .rate-note { font-size: 11px; font-weight: normal; }
 .site .rate-note { font-size: 11px; }
+
+.site .site-panel { display: inline-block; margin-top: 8px; font-size: 12px; color: #58a6ff; text-decoration: none; border: 1px solid #30363d; border-radius: 6px; padding: 3px 10px; }
+.site .site-panel:hover { background: #1f2a37; }

@@ -50,6 +50,7 @@ I18N.register('zh', {
   "kind.inventory": "名册变更",
 
   "site.deleted": "已删除场地",
+  "site.open_panel": "打开本地面板",
   "site.duplicate": "名称重复，请核对场地",
   "site.duplicate_help": "有其他场地使用同一名称。重新安装会生成新 ID，请核对 ID 和上报时间后删除旧记录，避免删到正在上报的新环境。",
   "site.identity": "场地 ID：{id} ｜ 本地上报名称：{name}",

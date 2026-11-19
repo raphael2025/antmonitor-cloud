@@ -342,6 +342,7 @@ function siteCard(s, color) {
     ${err}
     ${s.duplicate_name ? `<div class="site-warning">${esc(t("site.duplicate"))} · ${esc(s.id)}</div>` : ""}
     <div class="foot"><span>${t("card.updated", { ago: fmtAgo(s.data_age_s) })}</span><span>${t("card.click_trend")}</span></div>
+    ${curRole === "admin" && s.panel_online ? `<a class="site-panel" href="/p/${encodeURIComponent(s.id)}/" target="_blank" rel="noopener">${esc(t("site.open_panel"))} ↗</a>` : ""}
   </div>`;
 }
 
@@ -514,6 +515,7 @@ $("deletedSitesList").addEventListener("click", async (e) => {
 });
 // 事件委托：卡片每30s重建DOM，绑在document上点击永远有效
 document.addEventListener("click", (e) => {
+  if (e.target.closest("a.site-panel")) return;   // 「打开本地面板」是链接，不触发趋势弹窗
   const card = e.target.closest(".site[data-site-id]");
   if (card) openSite(card.dataset.siteId);
 });

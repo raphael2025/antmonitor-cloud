@@ -50,6 +50,7 @@ I18N.register('en', {
   "kind.inventory": "Inventory change",
 
   "site.deleted": "Deleted sites",
+  "site.open_panel": "Open local panel",
   "site.duplicate": "Duplicate name — verify the site",
   "site.duplicate_help": "Another site uses this name. Reinstallation creates a new ID. Check the ID and last report before deleting the old record.",
   "site.identity": "Site ID: {id} | Reported name: {name}",

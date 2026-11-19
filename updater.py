@@ -25,6 +25,11 @@ import urllib.error
 import urllib.request
 import uuid
 
+try:   # 更新源探测；缺失/出错时退回旧的固定顺序，绝不能让自更新器本身起不来
+    import update_source
+except Exception:  # noqa: BLE001
+    update_source = None
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 MAX_BOOT_ATTEMPTS = 3
 HEALTHY_AFTER_SEC = 60
@@ -202,6 +207,16 @@ def _fetch_sources(fallback_url=None):
     for source in sources:
         if source and source not in result:
             result.append(source)
+    # 先探测哪个源真的通：通的排前面(都通时保持当前 origin 优先)，不通的排最后。
+    # 否则 GitHub 被墙时 fetch 要先卡满超时才会换 Gitee。
+    if update_source is not None and len(result) > 1:
+        try:
+            ranked = update_source.ordered(result, preferred=primary)
+            if ranked and ranked[0] != result[0]:
+                print("[updater] 更新源 %s 当前连不上，改用 %s" % (result[0], ranked[0]), flush=True)
+            result = ranked
+        except Exception:  # noqa: BLE001 - 探测出错就用原顺序
+            pass
     return result
 
 

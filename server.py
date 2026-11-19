@@ -8,6 +8,7 @@
 配置文件默认取同目录 config.yaml，可用环境变量 CO_CONFIG 指定其他路径(测试用)。
 启动：python server.py    (默认 0.0.0.0:8900)
 """
+import asyncio
 import copy
 import hmac
 import ipaddress
@@ -25,7 +26,7 @@ if __name__ == "__main__":
 
 import yaml
 from fastapi import Body, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from web_assets import index_html
 import uvicorn
@@ -35,6 +36,7 @@ import auth
 import connect
 import db
 import seccheck
+import tunnel
 import validate
 from collector import Collector
 
@@ -271,7 +273,8 @@ def _site_entry(scfg, latest, last_ok, cust_counts, now):
          "fails": fails, "error": err,
          "data_ts": snap["ts"] if snap else None,
          "data_age_s": (now - snap["ts"]) if snap else None,
-         "customers": cust_counts.get(sid, 0)}
+         "customers": cust_counts.get(sid, 0),
+         "panel_online": BROKER.online(sid, now)}      # 场地本地面板转发通道是否在线
     for k in ("online", "total", "hashrate_ths", "power_kw", "active_alerts",
               "containers", "containers_faulty", "containers_offline", "containers_unknown", "scan_age_s",
               "unknown", "hashrate_complete", "power_complete", "hashrate_known_machines",
@@ -1540,6 +1543,150 @@ def api_sessions_revoke(request: Request):
     return {"ok": True, "revoked": n}
 
 
+# ---------- 场地本地面板转发(管理员点开 NAT 后面的场地面板) ----------
+BROKER = tunnel.Broker()
+_tunnel_rate = {}   # 场地端取活/回传很频繁(打开一个页面十几个请求)，单独限速表，上限高于普通上报
+
+
+def _tunnel_auth(request: Request, site_id):
+    """场地端取活/回传的鉴权：与上报共用 token 规则，但不自动注册新场地(只服务已登记场地)。"""
+    icfg = CFG.get("ingest") or {}
+    per, shared = _ingest_tokens()
+    if not shared and not any(per.values()):
+        raise HTTPException(404)
+    if not _rate_ok(_tunnel_rate, _client_ip(request), int(icfg.get("tunnel_rate_per_min") or 1200)):
+        raise HTTPException(429, "请求太频繁")
+    _verify_ingest_credential(request, site_id)
+    if db.site_management(CONN).get(site_id, {}).get("deleted_ts"):
+        raise HTTPException(410, "场地已删除")
+    if not db.site_exists(CONN, site_id):
+        raise HTTPException(404, "场地未登记，请先正常上报一次")
+
+
+@app.post("/api/ingest/tunnel/poll")
+async def api_tunnel_poll(request: Request, body: dict = Body(...)):
+    sid = str(body.get("site_id") or "")
+    if not tunnel.valid_site(sid):
+        raise HTTPException(400, "site_id 非法")
+    _tunnel_auth(request, sid)
+    job = await BROKER.next_job(sid)
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/ingest/tunnel/respond")
+async def api_tunnel_respond(request: Request, body: dict = Body(...)):
+    sid = str(body.get("site_id") or "")
+    if not tunnel.valid_site(sid):
+        raise HTTPException(400, "site_id 非法")
+    _tunnel_auth(request, sid)
+    resp = {"status": int(body.get("status") or 502),
+            "headers": body.get("headers") if isinstance(body.get("headers"), list) else [],
+            "body_b64": str(body.get("body_b64") or "")}
+    return {"ok": tunnel_respond_ok(sid, str(body.get("id") or ""), resp)}
+
+
+def tunnel_respond_ok(sid, jid, resp):
+    return BROKER.respond(sid, jid, resp)
+
+
+def _panel_page(status, title, msg):
+    html = (f'<!doctype html><meta charset="utf-8"><title>{title}</title>'
+            '<body style="font:16px system-ui;max-width:32em;margin:12vh auto;padding:0 16px">'
+            f'<h2>{title}</h2><p>{msg}</p><p><a href="/">← 返回云端总览</a></p></body>')
+    return HTMLResponse(html, status_code=status)
+
+
+_PANEL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+
+
+@app.get("/p/{site_id}")
+def panel_root(site_id: str):
+    from urllib.parse import quote
+    return Response(status_code=307, headers={"Location": f"/p/{quote(site_id, safe='')}/"})
+
+
+@app.api_route("/p/{site_id}/{path:path}", methods=_PANEL_METHODS, include_in_schema=False)
+async def panel_proxy(request: Request, site_id: str, path: str = ""):
+    from urllib.parse import quote, urlsplit
+    prefix = f"/p/{quote(site_id, safe='')}/"
+    if path == "__co_shim.js":
+        return Response(tunnel.shim_js(prefix), media_type="application/javascript")
+    sess = auth.current(CFG, request.cookies.get(auth.COOKIE) or "")
+    if not sess:
+        return _panel_page(401, "请先登录云端", "打开场地本地面板需要先登录云端总览(管理员)。")
+    if sess.get("role") != "admin":
+        return _panel_page(403, "需要管理员", "只有云端管理员账号能打开场地本地面板。")
+    if not tunnel.valid_site(site_id) or not db.site_exists(CONN, site_id):
+        return _panel_page(404, "场地不存在", "找不到这个场地。")
+    if not BROKER.online(site_id):
+        return _panel_page(503, "该场地的本地面板暂时连不上",
+                           "场地端没有开启「远程面板」，或场地离线/版本过旧。"
+                           "场地端需升级到支持版本，并在设置里开启云端远程面板。")
+    method = request.method
+    if method not in ("GET", "HEAD"):     # 写请求必须同源(防别的网站借管理员会话发请求)
+        origin = request.headers.get("origin")
+        host = request.headers.get("host", "")
+        if not origin or urlsplit(origin).netloc.lower() != host.lower():
+            return _panel_page(403, "跨站请求已拒绝", "来源与云端地址不一致。")
+    if any(ord(c) < 32 for c in path):
+        return _panel_page(400, "路径非法", "请求路径含非法字符。")
+    target = "/" + path + (("?" + request.url.query) if request.url.query else "")
+    body = await request.body() if method not in ("GET", "HEAD") else b""
+    if len(body) > tunnel.MAX_REQ_BODY:
+        return _panel_page(413, "请求体过大", "请求体超过上限。")
+    hdrs = tunnel.clean_request_headers(dict(request.headers))
+    ck = tunnel.forward_cookies(request.headers.get("cookie", ""), {auth.COOKIE})
+    if ck:
+        hdrs["cookie"] = ck
+    hdrs["x-co-client-ip"] = (_client_ip(request) or "")[:64]
+    if method != "GET" or path in ("", "index.html"):
+        _audit(request, sess["user"], "panel_proxy", f"{site_id} {method} /{path}"[:200])
+    try:
+        resp = await BROKER.submit(site_id, method, target, hdrs, body)
+    except OverflowError:
+        return _panel_page(429, "场地端忙", "排队的请求太多，请稍后重试。")
+    except (asyncio.TimeoutError, TimeoutError):
+        return _panel_page(504, "场地端响应超时", "场地没有在 30 秒内应答，可能刚离线。")
+    import base64
+    try:
+        raw = base64.b64decode(resp.get("body_b64") or "", validate=False)
+    except Exception:
+        return _panel_page(502, "场地端回包异常", "回包无法解码。")
+    if len(raw) > tunnel.MAX_RESP_BODY:
+        return _panel_page(502, "场地端回包过大", "回包超过上限。")
+    status = int(resp.get("status") or 502)
+    if not 100 <= status <= 599:
+        status = 502
+    out = Response(status_code=status)
+    ctype = ""
+    cookies = []
+    for k, v in tunnel.clean_response_headers([(k, v) for k, v in resp.get("headers", [])
+                                               if isinstance(k, str)]):
+        lk = k.lower()
+        if lk == "content-type":
+            ctype = v
+            out.headers["content-type"] = v
+        elif lk == "location":
+            loc = str(v)
+            if loc.startswith("/") and not loc.startswith("//"):
+                loc = prefix[:-1] + loc
+            out.headers["location"] = loc
+        else:
+            out.headers[k] = v
+    for k, v in resp.get("headers", []):
+        if isinstance(k, str) and k.lower() == "set-cookie":
+            c = tunnel.rewrite_cookie(v, prefix)
+            if c:
+                cookies.append(c)
+    for c in cookies:
+        out.headers.append("set-cookie", c)
+    if "text/html" in ctype.lower():
+        raw = tunnel.rewrite_html(raw.decode("utf-8", errors="replace"), prefix).encode("utf-8")
+    out.body = b"" if method == "HEAD" or status in (204, 304) else raw
+    out.headers["content-length"] = str(len(out.body))
+    return out
+
+
 @app.get("/api/health")
 def api_health():
     """云端服务自身心跳(免登录、不含业务数据)：外部看门狗探活用。"""
@@ -1555,6 +1702,10 @@ def api_health():
 _CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; "
         "base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+# 场地本地面板(经 /p/ 转发)的 CSP：脚本仍只许本站(shim 是外链)，图片多允许 blob
+_PANEL_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+              "img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; "
+              "base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
 _STATE_CHANGING = ("POST", "PUT", "PATCH", "DELETE")
 CSRF_HEADER = "x-co-csrf"
 
@@ -1572,14 +1723,14 @@ async def _security_mw(request: Request, call_next):
         return JSONResponse({"detail": "缺少 X-CO-CSRF 请求头(防跨站请求伪造)"}, status_code=403)
     resp = await call_next(request)
     h = resp.headers
-    h["Content-Security-Policy"] = _CSP
+    h["Content-Security-Policy"] = _PANEL_CSP if path.startswith("/p/") else _CSP
     h["X-Frame-Options"] = "DENY"
     h["X-Content-Type-Options"] = "nosniff"
     h["Referrer-Policy"] = "no-referrer"
     h["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if _is_https(request):
         h["Strict-Transport-Security"] = "max-age=31536000"
-    if path.startswith("/api/"):
+    if path.startswith("/api/") or path.startswith("/p/"):
         h["Cache-Control"] = "no-store"
     elif path in ("/", "/web/index.html"):
         h["Cache-Control"] = "no-store"
@@ -1604,17 +1755,20 @@ class _BodyLimit:
             hdr = dict(scope.get("headers") or [])
             cl = hdr.get(b"content-length")
             status = None
+            limit = self.limit
+            if scope.get("path") == "/api/ingest/tunnel/respond":
+                limit = max(limit, tunnel.MAX_RESP_BODY * 4 // 3 + 65536)   # 场地回传的页面/文件(base64)
             if cl is None:
                 if b"chunked" in (hdr.get(b"transfer-encoding") or b"").lower():
                     status = 411
             else:
                 try:
-                    if int(cl) > self.limit:
+                    if int(cl) > limit:
                         status = 413
                 except ValueError:
                     status = 400
             if status:
-                resp = JSONResponse({"detail": f"请求体过大或缺少长度(上限 {self.limit} 字节)"},
+                resp = JSONResponse({"detail": f"请求体过大或缺少长度(上限 {limit} 字节)"},
                                     status_code=status)
                 return await resp(scope, receive, send)
         return await self.app(scope, receive, send)

@@ -1639,6 +1639,10 @@ async def panel_proxy(request: Request, site_id: str, path: str = ""):
     if ck:
         hdrs["cookie"] = ck
     hdrs["x-co-client-ip"] = (_client_ip(request) or "")[:64]
+    # 告诉场地端是哪个云端管理员：场地端(cloud.tunnel_login 默认开)据此免登录、按管理员处理，
+    # 审计里记成 云端:<用户名>。一律覆盖浏览器自带的同名头，浏览器伪造不了。
+    # 百分号编码：中文用户名放进 HTTP 头会出错
+    hdrs["x-co-user"] = quote(str(sess["user"])[:64], safe="")
     if method != "GET" or path in ("", "index.html"):
         _audit(request, sess["user"], "panel_proxy", f"{site_id} {method} /{path}"[:200])
     try:

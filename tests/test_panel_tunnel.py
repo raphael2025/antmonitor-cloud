@@ -32,9 +32,9 @@ def _page(job):
     if p == "/redir":
         return 302, [["location", "/login"]], b""
     return 200, [["content-type", "application/json"]], \
-        ('{"echo":"%s","cookie":"%s","origin":"%s","ip":"%s"}' % (
+        ('{"echo":"%s","cookie":"%s","origin":"%s","ip":"%s","user":"%s"}' % (
             job["method"], job["headers"].get("cookie", ""), job["headers"].get("origin", ""),
-            job["headers"].get("x-co-client-ip", ""))).encode()
+            job["headers"].get("x-co-client-ip", ""), job["headers"].get("x-co-user", ""))).encode()
 
 
 def _run(cloud, fn):
@@ -92,6 +92,9 @@ def test_proxy_roundtrip_rewrites_html_cookie_and_strips_cloud_session(cloud):
         r = client.get(f"/p/{SITE}/api/x")
         data = r.json()
         assert "co_token" not in data["cookie"] and "mm_token=abc" in data["cookie"]
+        # 告诉场地端是哪个云端管理员(场地端据此免登录)；浏览器伪造的同名头被覆盖
+        r = client.get(f"/p/{SITE}/api/x", headers={"x-co-user": "hacker"})
+        assert r.json()["user"] == "test-admin"
         # 重定向被改写进前缀
         r = client.get(f"/p/{SITE}/redir", follow_redirects=False)
         assert r.status_code == 302 and r.headers["location"] == f"/p/{SITE}/login"
